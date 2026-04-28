@@ -66,24 +66,27 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
             })
             .collect();
 
-        // Collect tool results.
-        let tool_result = msg.content.iter().find_map(|b| {
+        // Collect ALL tool results — each becomes a separate "tool" role message in OpenAI format.
+        let tool_results: Vec<_> = msg.content.iter().filter_map(|b| {
             if let ContentBlock::ToolResult(tr) = b {
                 Some(tr)
             } else {
                 None
             }
-        });
+        }).collect();
 
-        if let Some(tr) = tool_result {
-            let text_content = extract_text_from_tool_result(&tr.content);
-            messages.push(MsgOut {
-                role: role.to_string(),
-                content: Some(serde_json::Value::String(text_content)),
-                name: msg.name.clone(),
-                tool_calls: None,
-                tool_call_id: Some(tr.tool_call_id.0.clone()),
-            });
+        if !tool_results.is_empty() {
+            // Emit each tool result as its own message.
+            for tr in &tool_results {
+                let text_content = extract_text_from_tool_result(&tr.content);
+                messages.push(MsgOut {
+                    role: "tool".to_string(),
+                    content: Some(serde_json::Value::String(text_content)),
+                    name: msg.name.clone(),
+                    tool_calls: None,
+                    tool_call_id: Some(tr.tool_call_id.0.clone()),
+                });
+            }
         } else if !tool_calls.is_empty() {
             // Assistant message with tool calls — content may also have text.
             let text_content = build_text_content_value(&msg.content);
