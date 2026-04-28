@@ -11,6 +11,8 @@ pub mod content;
 pub mod message;
 pub mod usage;
 pub mod stream;
+pub mod request;
+pub mod response;
 
 pub use ids::{RequestId, ResponseId, ToolCallId};
 pub use extensions::ExtensionMap;
@@ -23,3 +25,5 @@ pub use content::*;
 pub use message::*;
 pub use usage::*;
 pub use stream::*;
+pub use request::{CanonicalRequest, GenerationOptions, RequestMetadata, ResponseFormat};
+pub use response::CanonicalResponse;
