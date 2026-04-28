@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core"]
+members = ["crates/core", "crates/config", "crates/observability", "crates/gateway"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +18,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 proptest = "1"
 base64 = "0.22"
 futures-core = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs", "time"] }
+axum = { version = "0.7", features = ["macros", "tokio", "http1"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "request-id", "cors"] }
+hyper = { version = "1", features = ["server"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+clap = { version = "4", features = ["derive", "env"] }
+figment = { version = "0.10", features = ["yaml", "env"] }
+anyhow = "1"
+async-trait = "0.1"
