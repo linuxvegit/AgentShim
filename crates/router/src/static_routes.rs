@@ -12,14 +12,25 @@ struct RouteKey {
     model: String,
 }
 
+/// A wildcard route entry: `model: "*"` matches any model not handled by a
+/// specific route. The `upstream_model` field controls what's sent upstream:
+/// - `"*"` means pass the original model name through
+/// - anything else is used as a literal override
+struct WildcardTarget {
+    provider: String,
+    upstream_model: String,
+}
+
 /// A static router built from `GatewayConfig.routes`.
 pub struct StaticRouter {
     routes: HashMap<RouteKey, BackendTarget>,
+    wildcards: HashMap<FrontendKind, WildcardTarget>,
 }
 
 impl StaticRouter {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
         let mut routes = HashMap::new();
+        let mut wildcards = HashMap::new();
         for entry in &cfg.routes {
             let frontend = match entry.frontend.as_str() {
                 "anthropic_messages" | "anthropic" => FrontendKind::AnthropicMessages,
@@ -29,6 +40,13 @@ impl StaticRouter {
                     continue;
                 }
             };
+            if entry.model == "*" {
+                wildcards.insert(frontend, WildcardTarget {
+                    provider: entry.upstream.clone(),
+                    upstream_model: entry.upstream_model.clone(),
+                });
+                continue;
+            }
             let key = RouteKey {
                 frontend,
                 model: entry.model.clone(),
@@ -39,7 +57,7 @@ impl StaticRouter {
             };
             routes.insert(key, target);
         }
-        Self { routes }
+        Self { routes, wildcards }
     }
 }
 
@@ -49,7 +67,21 @@ impl Router for StaticRouter {
             frontend,
             model: model.to_string(),
         };
-        self.routes.get(&key).cloned().ok_or_else(|| RouteError::NoRoute {
+        if let Some(target) = self.routes.get(&key) {
+            return Ok(target.clone());
+        }
+        if let Some(wc) = self.wildcards.get(&frontend) {
+            let upstream_model = if wc.upstream_model == "*" {
+                model.to_string()
+            } else {
+                wc.upstream_model.clone()
+            };
+            return Ok(BackendTarget {
+                provider: wc.provider.clone(),
+                model: upstream_model,
+            });
+        }
+        Err(RouteError::NoRoute {
             frontend,
             model: model.to_string(),
         })
@@ -99,5 +131,24 @@ mod tests {
         let router = StaticRouter::from_config(&cfg);
         let target = router.resolve(FrontendKind::AnthropicMessages, "claude-3-5-sonnet").unwrap();
         assert_eq!(target.provider, "upstream-a");
+    }
+
+    #[test]
+    fn wildcard_route_passes_model_through() {
+        let mut cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
+        cfg.routes.push(RouteEntry {
+            frontend: "anthropic_messages".to_string(),
+            model: "override".to_string(),
+            upstream: "other".to_string(),
+            upstream_model: "other-model".to_string(),
+        });
+        let router = StaticRouter::from_config(&cfg);
+        // Specific route wins
+        let t = router.resolve(FrontendKind::AnthropicMessages, "override").unwrap();
+        assert_eq!(t.provider, "other");
+        // Wildcard catches anything else, passes model name through
+        let t = router.resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7").unwrap();
+        assert_eq!(t.provider, "copilot");
+        assert_eq!(t.model, "claude-opus-4-7");
     }
 }
