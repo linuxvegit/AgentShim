@@ -8,6 +8,7 @@ pub mod target;
 pub mod media;
 pub mod tool;
 pub mod content;
+pub mod message;
 
 pub use ids::{RequestId, ResponseId, ToolCallId};
 pub use extensions::ExtensionMap;
@@ -17,3 +18,4 @@ pub use target::{BackendTarget, FrontendInfo, FrontendKind, FrontendModel};
 pub use media::BinarySource;
 pub use tool::*;
 pub use content::*;
+pub use message::*;
