@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/anthropics/agent-shim"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
+thiserror = "1"
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+proptest = "1"
