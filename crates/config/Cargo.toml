@@ -1,0 +1,20 @@
+[package]
+name = "agent-shim-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agent_shim_config"
+path = "src/lib.rs"
+
+[dependencies]
+agent-shim-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+figment.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_yaml = "0.9"
