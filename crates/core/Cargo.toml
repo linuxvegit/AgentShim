@@ -15,6 +15,7 @@ thiserror.workspace = true
 bytes.workspace = true
 uuid.workspace = true
 base64.workspace = true
+futures-core.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -10,6 +10,7 @@ pub mod tool;
 pub mod content;
 pub mod message;
 pub mod usage;
+pub mod stream;
 
 pub use ids::{RequestId, ResponseId, ToolCallId};
 pub use extensions::ExtensionMap;
@@ -21,3 +22,4 @@ pub use tool::*;
 pub use content::*;
 pub use message::*;
 pub use usage::*;
+pub use stream::*;

@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoreError {
     #[error("invalid model: {0}")]
     InvalidModel(String),
@@ -12,7 +13,7 @@ pub enum CoreError {
     InvalidRequest(String),
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamError {
     #[error("upstream error: {0}")]
     Upstream(String),
