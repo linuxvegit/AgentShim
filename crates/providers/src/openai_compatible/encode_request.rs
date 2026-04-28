@@ -76,9 +76,10 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
         });
 
         if let Some(tr) = tool_result {
+            let text_content = extract_text_from_tool_result(&tr.content);
             messages.push(MsgOut {
                 role: role.to_string(),
-                content: Some(tr.content.clone()),
+                content: Some(serde_json::Value::String(text_content)),
                 name: msg.name.clone(),
                 tool_calls: None,
                 tool_call_id: Some(tr.tool_call_id.0.clone()),
@@ -248,6 +249,7 @@ fn build_content_value(blocks: &[ContentBlock]) -> Option<serde_json::Value> {
                     _ => None,
                 }
             }
+            // Skip tool_call/tool_result blocks — handled separately above
             _ => None,
         })
         .collect();
@@ -256,5 +258,31 @@ fn build_content_value(blocks: &[ContentBlock]) -> Option<serde_json::Value> {
         None
     } else {
         Some(serde_json::Value::Array(parts))
+    }
+}
+
+/// Extract text from a tool result's content value.
+/// The content may be a plain string, an array of Anthropic-shaped blocks,
+/// or a JSON value. We flatten it to a string for OpenAI-compatible APIs.
+fn extract_text_from_tool_result(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => {
+            arr.iter()
+                .filter_map(|item| {
+                    // Anthropic blocks: {"type":"text","text":"..."}
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        Some(text.to_string())
+                    } else if let Some(s) = item.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        Some(item.to_string())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
