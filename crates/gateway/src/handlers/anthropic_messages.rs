@@ -57,7 +57,7 @@ pub async fn handle(
     let stream = provider
         .complete(canonical, target)
         .await
-        .map_err(HandlerError::Provider)?;
+        .map_err(|e| { tracing::error!(error = %e, "provider.complete failed"); HandlerError::Provider(e) })?;
 
     // Encode response
     if is_stream {

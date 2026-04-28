@@ -39,11 +39,12 @@ impl AppState {
                     let credential_path = config
                         .copilot
                         .as_ref()
-                        .map(|c| PathBuf::from(&c.credential_path))
+                        .map(|c| expand_tilde(&c.credential_path))
                         .unwrap_or_else(|| {
                             credential_store::default_path()
                                 .unwrap_or_else(|_| PathBuf::from("./copilot.json"))
                         });
+                    tracing::info!(path = %credential_path.display(), "copilot credential path");
                     match github_copilot::CopilotProvider::spawn(credential_path) {
                         Ok(p) => registry.register(name.clone(), Arc::new(p)),
                         Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
@@ -62,4 +63,13 @@ impl AppState {
             router,
         }
     }
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
 }

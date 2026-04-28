@@ -24,6 +24,7 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "dirs",
  "futures",
  "futures-util",
  "hyper",
