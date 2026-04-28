@@ -3,9 +3,7 @@
 use futures::stream;
 
 use agent_shim_core::{
-    ContentBlock, ContentBlockKind, ResponseId, StopReason, StreamError, StreamEvent,
-    TextBlock, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
-    ExtensionMap,
+    ContentBlockKind, ResponseId, StopReason, StreamError, StreamEvent, ToolCallId, Usage,
 };
 
 pub(crate) fn parse(body: &[u8]) -> agent_shim_core::CanonicalStream {
@@ -58,7 +56,7 @@ fn parse_inner(body: &[u8]) -> Result<Vec<StreamEvent>, String> {
         .ok_or_else(|| "missing choices".to_string())?;
 
     let mut stop_reason = StopReason::EndTurn;
-    let mut stop_sequence: Option<String> = None;
+    let stop_sequence: Option<String> = None;
     let mut block_index: u32 = 0;
 
     for choice in choices {
@@ -107,7 +105,7 @@ fn parse_inner(body: &[u8]) -> Result<Vec<StreamEvent>, String> {
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}")
                     .to_string();
-                let args_value: serde_json::Value =
+                let _args_value: serde_json::Value =
                     serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
 
                 events.push(StreamEvent::ContentBlockStart {

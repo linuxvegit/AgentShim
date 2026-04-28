@@ -6,7 +6,7 @@ pub(crate) mod wire;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use tracing::{debug, warn};
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
@@ -18,7 +18,7 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     default_headers: HeaderMap,
-    timeout: Duration,
+    _timeout: Duration,
     client: reqwest::Client,
     capabilities: ProviderCapabilities,
 }
@@ -50,7 +50,7 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             default_headers: headers,
-            timeout: Duration::from_secs(timeout_secs),
+            _timeout: Duration::from_secs(timeout_secs),
             client,
             capabilities: ProviderCapabilities {
                 streaming: true,

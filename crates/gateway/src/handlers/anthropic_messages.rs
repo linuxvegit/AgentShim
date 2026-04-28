@@ -2,13 +2,13 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use bytes::Bytes;
 use futures::StreamExt;
 
 use agent_shim_core::{
-    CanonicalResponse, ContentBlock, FrontendKind, MessageRole, ResponseId, StopReason,
+    CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason,
     StreamEvent, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
@@ -20,7 +20,7 @@ use super::HandlerError;
 
 pub async fn handle(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HandlerError> {
     // Decode request using Anthropic frontend

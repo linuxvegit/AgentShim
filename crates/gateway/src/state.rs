@@ -6,7 +6,7 @@ use agent_shim_config::{GatewayConfig, UpstreamConfig};
 use agent_shim_frontends::{anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat};
 use agent_shim_providers::{
     github_copilot::{self, credential_store},
-    openai_compatible::{self, OpenAiCompatibleProvider},
+    openai_compatible::{self},
     ProviderRegistry,
 };
 use agent_shim_router::StaticRouter;

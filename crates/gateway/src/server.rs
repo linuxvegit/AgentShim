@@ -40,7 +40,7 @@ pub async fn run(state: AppState) -> Result<()> {
     Ok(())
 }
 
-/// Start the server on an already-bound listener (useful for tests with port 0).
+#[allow(dead_code)]
 pub async fn run_on_listener(
     listener: tokio::net::TcpListener,
     state: AppState,

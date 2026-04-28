@@ -17,8 +17,6 @@ pub enum HandlerError {
     Provider(#[from] ProviderError),
     #[error("frontend error: {0}")]
     Frontend(#[from] FrontendError),
-    #[error("body read error: {0}")]
-    BodyRead(String),
 }
 
 impl IntoResponse for HandlerError {
