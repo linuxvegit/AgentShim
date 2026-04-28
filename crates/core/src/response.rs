@@ -24,9 +24,15 @@ mod tests {
         let resp = CanonicalResponse {
             id: ResponseId::new(),
             model: "claude-3-5-sonnet-20241022".into(),
-            content: vec![ContentBlock::Text(TextBlock { text: "Hello!".into() })],
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "Hello!".into(),
+            })],
             stop_reason: StopReason::EndTurn,
-            usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&json).unwrap();

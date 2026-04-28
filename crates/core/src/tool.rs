@@ -94,7 +94,9 @@ mod tests {
 
     #[test]
     fn tool_choice_specific_round_trips() {
-        let choice = ToolChoice::Specific { name: "get_weather".into() };
+        let choice = ToolChoice::Specific {
+            name: "get_weather".into(),
+        };
         let json = serde_json::to_string(&choice).unwrap();
         let back: ToolChoice = serde_json::from_str(&json).unwrap();
         assert_eq!(back, choice);

@@ -92,7 +92,9 @@ mod tests {
 
     #[test]
     fn text_block_round_trips() {
-        let block = ContentBlock::Text(TextBlock { text: "hello world".into() });
+        let block = ContentBlock::Text(TextBlock {
+            text: "hello world".into(),
+        });
         let json = serde_json::to_string(&block).unwrap();
         assert!(json.contains("\"type\":\"text\""));
         let back: ContentBlock = serde_json::from_str(&json).unwrap();

@@ -65,7 +65,10 @@ pub enum StreamEvent {
     ContentBlockStop { index: usize },
 
     /// Final usage statistics and stop reason.
-    MessageDelta { stop_reason: StopReason, usage: Usage },
+    MessageDelta {
+        stop_reason: StopReason,
+        usage: Usage,
+    },
 
     /// The entire message stream has completed.
     MessageStop,
@@ -107,7 +110,10 @@ mod tests {
 
     #[test]
     fn text_delta_round_trips() {
-        let ev = StreamEvent::TextDelta { index: 0, text: "hello".into() };
+        let ev = StreamEvent::TextDelta {
+            index: 0,
+            text: "hello".into(),
+        };
         let json = serde_json::to_string(&ev).unwrap();
         let back: StreamEvent = serde_json::from_str(&json).unwrap();
         if let StreamEvent::TextDelta { text, .. } = back {

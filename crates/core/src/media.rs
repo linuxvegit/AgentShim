@@ -41,7 +41,9 @@ mod tests {
 
     #[test]
     fn url_variant_round_trips() {
-        let src = BinarySource::Url { url: "https://example.com/img.png".into() };
+        let src = BinarySource::Url {
+            url: "https://example.com/img.png".into(),
+        };
         let json = serde_json::to_string(&src).unwrap();
         let back: BinarySource = serde_json::from_str(&json).unwrap();
         assert_eq!(src, back);
@@ -50,7 +52,10 @@ mod tests {
     #[test]
     fn base64_variant_round_trips() {
         let data = Bytes::from_static(b"\x89PNG\r\n");
-        let src = BinarySource::Base64 { media_type: "image/png".into(), data };
+        let src = BinarySource::Base64 {
+            media_type: "image/png".into(),
+            data,
+        };
         let json = serde_json::to_string(&src).unwrap();
         assert!(json.contains("\"type\":\"base64\""));
         let back: BinarySource = serde_json::from_str(&json).unwrap();
@@ -59,7 +64,9 @@ mod tests {
 
     #[test]
     fn provider_file_id_round_trips() {
-        let src = BinarySource::ProviderFileId { file_id: "file-abc123".into() };
+        let src = BinarySource::ProviderFileId {
+            file_id: "file-abc123".into(),
+        };
         let json = serde_json::to_string(&src).unwrap();
         let back: BinarySource = serde_json::from_str(&json).unwrap();
         assert_eq!(src, back);

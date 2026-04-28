@@ -57,15 +57,28 @@ mod tests {
 
     #[test]
     fn usage_total_tokens() {
-        let u = Usage { input_tokens: 100, output_tokens: 50, ..Default::default() };
+        let u = Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
         assert_eq!(u.total_tokens(), 150);
     }
 
     #[test]
     fn stop_reason_normalisation() {
-        assert_eq!(StopReason::from_provider_string("stop"), StopReason::EndTurn);
-        assert_eq!(StopReason::from_provider_string("length"), StopReason::MaxTokens);
-        assert_eq!(StopReason::from_provider_string("tool_calls"), StopReason::ToolUse);
+        assert_eq!(
+            StopReason::from_provider_string("stop"),
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            StopReason::from_provider_string("length"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            StopReason::from_provider_string("tool_calls"),
+            StopReason::ToolUse
+        );
         assert_eq!(
             StopReason::from_provider_string("unknown_xyz"),
             StopReason::Other("unknown_xyz".into())

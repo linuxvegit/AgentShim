@@ -21,11 +21,17 @@ pub struct Message {
 
 impl Message {
     pub fn user(content: Vec<ContentBlock>) -> Self {
-        Self { role: MessageRole::User, content }
+        Self {
+            role: MessageRole::User,
+            content,
+        }
     }
 
     pub fn assistant(content: Vec<ContentBlock>) -> Self {
-        Self { role: MessageRole::Assistant, content }
+        Self {
+            role: MessageRole::Assistant,
+            content,
+        }
     }
 }
 
