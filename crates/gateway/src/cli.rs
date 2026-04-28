@@ -37,4 +37,10 @@ pub enum CopilotCommand {
         #[arg(long)]
         credential_path: Option<PathBuf>,
     },
+    /// List available models from Copilot
+    Models {
+        /// Path to credentials file
+        #[arg(long)]
+        credential_path: Option<PathBuf>,
+    },
 }
