@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/config", "crates/observability", "crates/gateway"]
+members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +18,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 proptest = "1"
 base64 = "0.22"
 futures-core = "0.3"
+futures = "0.3"
+futures-util = "0.3"
+parking_lot = "0.12"
+tokio-stream = { version = "0.1", features = ["time"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs", "time"] }
 axum = { version = "0.7", features = ["macros", "tokio", "http1"] }
 tower = { version = "0.5", features = ["util"] }

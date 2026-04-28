@@ -1,0 +1,1 @@
+// OpenAI Chat mapping — stub
