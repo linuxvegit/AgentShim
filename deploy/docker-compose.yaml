@@ -1,0 +1,12 @@
+services:
+  agent-shim:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      AGENT_SHIM_CONFIG: /etc/agent-shim/gateway.yaml
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+    volumes:
+      - ../config/gateway.example.yaml:/etc/agent-shim/gateway.yaml:ro
