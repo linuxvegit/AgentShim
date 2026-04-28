@@ -1,0 +1,22 @@
+server:
+  bind: 127.0.0.1
+  port: 8787
+  keepalive_secs: 15
+logging:
+  format: pretty
+  filter: info,agent_shim=debug
+upstreams:
+  deepseek:
+    type: open_ai_compatible
+    base_url: https://api.deepseek.com/v1
+    api_key: "sk-your-deepseek-api-key-here"
+    request_timeout_secs: 60
+routes:
+  - frontend: openai_chat
+    model: deepseek-chat
+    upstream: deepseek
+    upstream_model: deepseek-chat
+  - frontend: openai_chat
+    model: deepseek-reasoner
+    upstream: deepseek
+    upstream_model: deepseek-reasoner
