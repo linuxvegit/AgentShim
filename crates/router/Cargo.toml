@@ -1,0 +1,16 @@
+[package]
+name = "agent-shim-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agent_shim_router"
+path = "src/lib.rs"
+
+[dependencies]
+agent-shim-core = { path = "../core" }
+agent-shim-config = { path = "../config" }
+thiserror.workspace = true
+serde.workspace = true
+tracing.workspace = true
