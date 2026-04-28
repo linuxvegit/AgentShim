@@ -14,6 +14,7 @@ async fn healthz() -> &'static str {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(healthz))
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handlers::anthropic_messages::handle))
         .route("/v1/chat/completions", post(handlers::openai_chat::handle))

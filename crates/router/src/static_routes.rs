@@ -61,29 +61,18 @@ impl StaticRouter {
     }
 }
 
-/// Strip context-window suffixes like `[1m]` from model names.
-/// Claude Code sends e.g. `claude-opus-4-6[1m]` but upstreams expect `claude-opus-4-6`.
-fn normalize_model(model: &str) -> &str {
-    match model.find('[') {
-        Some(i) => &model[..i],
-        None => model,
-    }
-}
-
 impl Router for StaticRouter {
     fn resolve(&self, frontend: FrontendKind, model: &str) -> Result<BackendTarget, RouteError> {
-        let normalized = normalize_model(model);
-
         let key = RouteKey {
             frontend,
-            model: normalized.to_string(),
+            model: model.to_string(),
         };
         if let Some(target) = self.routes.get(&key) {
             return Ok(target.clone());
         }
         if let Some(wc) = self.wildcards.get(&frontend) {
             let upstream_model = if wc.upstream_model == "*" {
-                normalized.to_string()
+                model.to_string()
             } else {
                 wc.upstream_model.clone()
             };
@@ -94,7 +83,7 @@ impl Router for StaticRouter {
         }
         Err(RouteError::NoRoute {
             frontend,
-            model: normalized.to_string(),
+            model: model.to_string(),
         })
     }
 }
@@ -161,21 +150,5 @@ mod tests {
         let t = router.resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7").unwrap();
         assert_eq!(t.provider, "copilot");
         assert_eq!(t.model, "claude-opus-4-7");
-    }
-
-    #[test]
-    fn strips_context_window_suffix() {
-        let cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
-        let router = StaticRouter::from_config(&cfg);
-        let t = router.resolve(FrontendKind::AnthropicMessages, "claude-opus-4-6[1m]").unwrap();
-        assert_eq!(t.model, "claude-opus-4-6");
-    }
-
-    #[test]
-    fn strips_suffix_for_specific_route_match() {
-        let cfg = cfg_with_route("anthropic_messages", "claude-opus-4-6", "copilot", "claude-opus-4-6");
-        let router = StaticRouter::from_config(&cfg);
-        let t = router.resolve(FrontendKind::AnthropicMessages, "claude-opus-4-6[1m]").unwrap();
-        assert_eq!(t.provider, "copilot");
     }
 }
