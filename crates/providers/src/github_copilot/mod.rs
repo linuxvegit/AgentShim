@@ -34,12 +34,25 @@ pub struct CopilotProvider {
 
 impl CopilotProvider {
     /// Create and start a `CopilotProvider` using credentials stored at `credential_path`.
+    /// Credentials are loaded lazily on first request, so the file doesn't need to exist at startup.
     pub fn spawn(credential_path: PathBuf) -> Result<Self, ProviderError> {
-        let creds = credential_store::load(&credential_path)?;
-        Self::spawn_with_creds(
-            creds,
-            "https://api.githubcopilot.com".to_string(),
-        )
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        let manager = CopilotTokenManager::new_lazy(http.clone(), credential_path);
+
+        Ok(Self {
+            manager,
+            http,
+            capabilities: ProviderCapabilities {
+                streaming: true,
+                tool_use: true,
+                vision: false,
+                json_mode: true,
+            },
+        })
     }
 
     /// Internal constructor, also used in tests.

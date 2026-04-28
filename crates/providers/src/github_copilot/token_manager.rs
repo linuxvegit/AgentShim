@@ -1,10 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::ProviderError;
-use super::{credential_store::StoredCredentials, endpoint::TokenExchangeResponse};
+use super::{credential_store::{self, StoredCredentials}, endpoint::TokenExchangeResponse};
 
 #[derive(Debug, Clone)]
 pub struct CopilotToken {
@@ -31,7 +32,19 @@ impl CopilotTokenManager {
         base_url: String,
     ) -> Self {
         let (tx, rx) = mpsc::channel(16);
-        tokio::spawn(actor(rx, http, creds, base_url));
+        tokio::spawn(actor(rx, http, CredentialSource::Preloaded(creds), base_url));
+        Self { tx: Arc::new(tx) }
+    }
+
+    /// Create a token manager that loads credentials lazily from disk on first request.
+    pub fn new_lazy(http: reqwest::Client, credential_path: PathBuf) -> Self {
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(actor(
+            rx,
+            http,
+            CredentialSource::Lazy(credential_path),
+            "https://api.github.com".to_string(),
+        ));
         Self { tx: Arc::new(tx) }
     }
 
@@ -51,10 +64,24 @@ impl CopilotTokenManager {
     }
 }
 
+enum CredentialSource {
+    Preloaded(StoredCredentials),
+    Lazy(PathBuf),
+}
+
+impl CredentialSource {
+    fn load(&self) -> Result<StoredCredentials, ProviderError> {
+        match self {
+            Self::Preloaded(c) => Ok(c.clone()),
+            Self::Lazy(path) => credential_store::load(path),
+        }
+    }
+}
+
 async fn actor(
     mut rx: mpsc::Receiver<ActorMsg>,
     http: reqwest::Client,
-    creds: StoredCredentials,
+    cred_source: CredentialSource,
     base_url: String,
 ) {
     let mut cached: Option<CopilotToken> = None;
@@ -67,14 +94,21 @@ async fn actor(
             }
             ActorMsg::Get(reply) => {
                 let now = chrono::Utc::now().timestamp();
-                // Use cached token if it has >60s before expiry.
                 if let Some(ref t) = cached {
                     if t.expires_at_unix - now > 60 {
                         let _ = reply.send(Ok(t.clone()));
                         continue;
                     }
                 }
-                // Refresh.
+                let creds = match cred_source.load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = reply.send(Err(ProviderError::Network(
+                            format!("load credentials: {e} — run `agent-shim copilot login` first"),
+                        )));
+                        continue;
+                    }
+                };
                 let result = exchange_with_base(&http, &creds, &base_url).await;
                 match result {
                     Ok(ref t) => {
