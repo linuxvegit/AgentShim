@@ -1,0 +1,23 @@
+[package]
+name = "agent-shim-protocol-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "agent_shim_protocol_tests"
+path = "src/lib.rs"
+
+[dependencies]
+agent-shim-core = { path = "../core" }
+agent-shim-frontends = { path = "../frontends" }
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "fs"] }
+
+[dev-dependencies]
+pretty_assertions = "1"

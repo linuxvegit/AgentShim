@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends"]
+members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends", "crates/protocol-tests"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,3 +33,4 @@ clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["yaml", "env"] }
 anyhow = "1"
 async-trait = "0.1"
+pretty_assertions = "1"
