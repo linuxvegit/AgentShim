@@ -1,0 +1,21 @@
+[package]
+name = "agent-shim-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agent_shim_observability"
+path = "src/lib.rs"
+
+[dependencies]
+agent-shim-config = { path = "../config" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower-http.workspace = true
+tower.workspace = true
+http = "1"
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
