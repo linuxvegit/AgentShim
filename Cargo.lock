@@ -29,6 +29,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "mockito",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

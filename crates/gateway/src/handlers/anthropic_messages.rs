@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::State,
@@ -6,6 +8,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
+use parking_lot::Mutex;
 
 use agent_shim_core::{
     CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason,
@@ -23,24 +26,30 @@ pub async fn handle(
     _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HandlerError> {
-    // Decode request using Anthropic frontend
+    let body_bytes = body.len();
+    let started = std::time::Instant::now();
+
     let canonical = state
         .anthropic
         .decode_request(&body)
         .map_err(|e| { tracing::warn!(error = %e, "anthropic decode failed"); HandlerError::Frontend(e) })?;
 
     let model_alias = canonical.model.as_str().to_string();
-    tracing::info!(model = %model_alias, "anthropic request received");
+    let is_stream = canonical.stream;
+    let max_tokens = canonical.generation.max_tokens;
 
-    // Route
     let target = state
         .router
         .resolve(FrontendKind::AnthropicMessages, &model_alias)
         .map_err(|e| { tracing::warn!(model = %model_alias, error = %e, "no route"); HandlerError::Route(e) })?;
 
-    tracing::info!(provider = %target.provider, upstream_model = %target.model, "resolved route");
+    let upstream_model = target.model.clone();
 
-    // Get provider
+    tracing::info!(
+        "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {}",
+        model_alias, upstream_model, body_bytes, max_tokens.unwrap_or(0)
+    );
+
     let provider = state
         .providers
         .get(&target.provider)
@@ -51,55 +60,100 @@ pub async fn handle(
             ))
         })?;
 
-    let is_stream = canonical.stream;
-
-    // Call backend
     let stream = provider
         .complete(canonical, target)
         .await
         .map_err(|e| { tracing::error!(error = %e, "provider.complete failed"); HandlerError::Provider(e) })?;
 
-    // Encode response
     if is_stream {
-        let frontend_response = state.anthropic.encode_stream(stream);
-        Ok(frontend_response_to_axum(frontend_response))
+        let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
+        let usage_for_log = usage_capture.clone();
+        let model_alias_log = model_alias.clone();
+        let upstream_model_log = upstream_model.clone();
+
+        let logging_stream = stream.map(move |event| {
+            if let Ok(ref ev) = event {
+                match ev {
+                    StreamEvent::UsageDelta { usage } => {
+                        *usage_capture.lock() = Some(usage.clone());
+                    }
+                    StreamEvent::ResponseStop { usage: Some(u) } => {
+                        *usage_capture.lock() = Some(u.clone());
+                    }
+                    _ => {}
+                }
+            }
+            event
+        });
+
+        let canonical_stream: agent_shim_core::CanonicalStream = Box::pin(logging_stream);
+        let frontend_response = state.anthropic.encode_stream(canonical_stream);
+
+        match frontend_response {
+            FrontendResponse::Stream { content_type, stream: sse_stream } => {
+                let logged_stream = sse_stream.chain(futures::stream::once(async move {
+                    let elapsed = started.elapsed();
+                    let u = usage_for_log.lock().clone();
+                    let (input, output) = match u {
+                        Some(ref usage) => (
+                            usage.input_tokens.unwrap_or(0),
+                            usage.output_tokens.unwrap_or(0),
+                        ),
+                        None => (0, 0),
+                    };
+                    tracing::info!(
+                        "← /v1/messages (stream) | model: {} → {} | input: {} | output: {} | {:.1}s",
+                        model_alias_log, upstream_model_log, input, output,
+                        elapsed.as_secs_f64()
+                    );
+                    // Yield nothing — this is just for the side-effect log
+                    Err(agent_shim_frontends::FrontendError::Encode("__log_sentinel__".into()))
+                }).filter(|_| futures::future::ready(false)));
+
+                let body = Body::from_stream(logged_stream.map(|r| r.map_err(|e| e.to_string())));
+                let mut r = Response::new(body);
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
+                        HeaderValue::from_static("text/event-stream")
+                    }),
+                );
+                Ok(r)
+            }
+            _ => unreachable!(),
+        }
     } else {
         let response = collect_stream(stream).await?;
+        let (input, output) = match &response.usage {
+            Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
+            None => (0, 0),
+        };
+        let elapsed = started.elapsed();
+        tracing::info!(
+            "← /v1/messages (unary) | model: {} → {} | input: {} | output: {} | {:.1}s",
+            model_alias, upstream_model, input, output, elapsed.as_secs_f64()
+        );
         let frontend_response = state
             .anthropic
             .encode_unary(response)
             .map_err(HandlerError::Frontend)?;
-        Ok(frontend_response_to_axum(frontend_response))
-    }
-}
-
-fn frontend_response_to_axum(resp: FrontendResponse) -> Response {
-    match resp {
-        FrontendResponse::Unary { content_type, body } => {
-            let mut r = Response::new(Body::from(body));
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
-                    HeaderValue::from_static("application/json")
-                }),
-            );
-            r
-        }
-        FrontendResponse::Stream { content_type, stream } => {
-            let body = Body::from_stream(stream.map(|r| r.map_err(|e| e.to_string())));
-            let mut r = Response::new(body);
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
-                    HeaderValue::from_static("text/event-stream")
-                }),
-            );
-            r
+        match frontend_response {
+            FrontendResponse::Unary { content_type, body } => {
+                let mut r = Response::new(Body::from(body));
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
+                        HeaderValue::from_static("application/json")
+                    }),
+                );
+                Ok(r)
+            }
+            _ => unreachable!(),
         }
     }
 }
 
-async fn collect_stream(
+pub(crate) async fn collect_stream(
     mut stream: agent_shim_core::CanonicalStream,
 ) -> Result<CanonicalResponse, HandlerError> {
     let mut id = ResponseId::new();
@@ -109,7 +163,6 @@ async fn collect_stream(
     let mut stop_sequence: Option<String> = None;
     let mut usage: Option<Usage> = None;
 
-    // Accumulators for in-progress tool calls (index → partial data)
     let mut tool_names: std::collections::HashMap<u32, (ToolCallId, String)> =
         std::collections::HashMap::new();
     let mut tool_args: std::collections::HashMap<u32, String> =
