@@ -31,7 +31,7 @@ impl AppState {
             match upstream {
                 UpstreamConfig::OpenAiCompatible(cfg) => {
                     match openai_compatible::from_config(name, cfg) {
-                        Ok(p) => registry.register(Arc::new(p)),
+                        Ok(p) => registry.register(name.clone(), Arc::new(p)),
                         Err(e) => tracing::error!("failed to build provider {name}: {e}"),
                     }
                 }
@@ -45,7 +45,7 @@ impl AppState {
                                 .unwrap_or_else(|_| PathBuf::from("./copilot.json"))
                         });
                     match github_copilot::CopilotProvider::spawn(credential_path) {
-                        Ok(p) => registry.register(Arc::new(p)),
+                        Ok(p) => registry.register(name.clone(), Arc::new(p)),
                         Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
                     }
                 }

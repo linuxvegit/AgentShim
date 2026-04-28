@@ -56,8 +56,8 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, provider: Arc<dyn BackendProvider>) {
-        self.providers.insert(provider.name().to_string(), provider);
+    pub fn register(&mut self, name: String, provider: Arc<dyn BackendProvider>) {
+        self.providers.insert(name, provider);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn BackendProvider>> {
