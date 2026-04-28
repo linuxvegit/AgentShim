@@ -21,3 +21,4 @@ tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
