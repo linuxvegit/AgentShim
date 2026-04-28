@@ -42,3 +42,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 mockito.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "gateway_overhead"
+harness = false
