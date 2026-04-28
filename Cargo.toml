@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends", "crates/protocol-tests"]
+members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends", "crates/protocol-tests", "crates/providers", "crates/router"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,3 +34,6 @@ figment = { version = "0.10", features = ["yaml", "env"] }
 anyhow = "1"
 async-trait = "0.1"
 pretty_assertions = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip"] }
+eventsource-stream = "0.2"
+mockito = "1"

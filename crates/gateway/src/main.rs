@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod handlers;
 mod server;
 mod shutdown;
 mod state;

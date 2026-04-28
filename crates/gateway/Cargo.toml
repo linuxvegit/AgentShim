@@ -17,6 +17,9 @@ path = "src/main.rs"
 agent-shim-core = { path = "../core" }
 agent-shim-config = { path = "../config" }
 agent-shim-observability = { path = "../observability" }
+agent-shim-frontends = { path = "../frontends" }
+agent-shim-providers = { path = "../providers" }
+agent-shim-router = { path = "../router" }
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -27,7 +30,15 @@ clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+mockito.workspace = true
+serde_json.workspace = true
+futures.workspace = true

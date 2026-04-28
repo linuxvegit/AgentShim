@@ -1,9 +1,10 @@
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::{routing::{get, post}, Router};
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use agent_shim_observability::RequestIdLayer;
+use crate::handlers;
 use crate::state::AppState;
 use crate::shutdown::shutdown_signal;
 
@@ -14,6 +15,8 @@ async fn healthz() -> &'static str {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/messages", post(handlers::anthropic_messages::handle))
+        .route("/v1/chat/completions", post(handlers::openai_chat::handle))
         .layer(TraceLayer::new_for_http())
         .layer(RequestIdLayer)
         .with_state(state)
@@ -38,7 +41,6 @@ pub async fn run(state: AppState) -> Result<()> {
 }
 
 /// Start the server on an already-bound listener (useful for tests with port 0).
-#[allow(dead_code)]
 pub async fn run_on_listener(
     listener: tokio::net::TcpListener,
     state: AppState,
