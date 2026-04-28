@@ -30,7 +30,7 @@ pub async fn handle(
         .map_err(|e| { tracing::warn!(error = %e, "anthropic decode failed"); HandlerError::Frontend(e) })?;
 
     let model_alias = canonical.model.as_str().to_string();
-    tracing::debug!(model = %model_alias, "routing anthropic request");
+    tracing::info!(model = %model_alias, "anthropic request received");
 
     // Route
     let target = state
@@ -38,7 +38,7 @@ pub async fn handle(
         .resolve(FrontendKind::AnthropicMessages, &model_alias)
         .map_err(|e| { tracing::warn!(model = %model_alias, error = %e, "no route"); HandlerError::Route(e) })?;
 
-    tracing::debug!(provider = %target.provider, upstream_model = %target.model, "resolved route");
+    tracing::info!(provider = %target.provider, upstream_model = %target.model, "resolved route");
 
     // Get provider
     let provider = state
