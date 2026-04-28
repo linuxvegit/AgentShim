@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_shim_providers::github_copilot::{credential_store, models, token_manager, CopilotProvider};
+use agent_shim_providers::github_copilot::{credential_store, models, token_manager};
 
 pub async fn run(credential_path: Option<PathBuf>) -> anyhow::Result<()> {
     let path = match credential_path {
