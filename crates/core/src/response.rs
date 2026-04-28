@@ -26,6 +26,7 @@ mod tests {
             model: "claude-3-5-sonnet-20241022".into(),
             content: vec![ContentBlock::Text(TextBlock {
                 text: "Hello!".into(),
+                extensions: Default::default(),
             })],
             stop_reason: StopReason::EndTurn,
             usage: Usage {

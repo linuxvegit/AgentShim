@@ -6,7 +6,7 @@ use agent_shim_core::{
 use proptest::prelude::*;
 
 fn arb_text_block() -> impl Strategy<Value = TextBlock> {
-    ".*".prop_map(|text| TextBlock { text })
+    ".*".prop_map(|text| TextBlock { text, extensions: ExtensionMap::new() })
 }
 
 fn arb_content_block() -> impl Strategy<Value = ContentBlock> {
@@ -16,7 +16,7 @@ fn arb_content_block() -> impl Strategy<Value = ContentBlock> {
 fn arb_message() -> impl Strategy<Value = Message> {
     let role = prop_oneof![Just(MessageRole::User), Just(MessageRole::Assistant)];
     let content = prop::collection::vec(arb_content_block(), 0..4);
-    (role, content).prop_map(|(role, content)| Message { role, content })
+    (role, content).prop_map(|(role, content)| Message { role, content, extensions: ExtensionMap::new() })
 }
 
 fn arb_system_instruction() -> impl Strategy<Value = SystemInstruction> {

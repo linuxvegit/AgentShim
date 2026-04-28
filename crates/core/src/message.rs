@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::content::ContentBlock;
+use crate::extensions::ExtensionMap;
 
 /// The role of a message participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -17,6 +18,8 @@ pub enum MessageRole {
 pub struct Message {
     pub role: MessageRole,
     pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 impl Message {
@@ -24,6 +27,7 @@ impl Message {
         Self {
             role: MessageRole::User,
             content,
+            extensions: ExtensionMap::new(),
         }
     }
 
@@ -31,6 +35,7 @@ impl Message {
         Self {
             role: MessageRole::Assistant,
             content,
+            extensions: ExtensionMap::new(),
         }
     }
 }
@@ -67,7 +72,7 @@ mod tests {
 
     #[test]
     fn message_round_trips() {
-        let msg = Message::user(vec![ContentBlock::Text(TextBlock { text: "hi".into() })]);
+        let msg = Message::user(vec![ContentBlock::Text(TextBlock { text: "hi".into(), extensions: ExtensionMap::new() })]);
         let json = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);

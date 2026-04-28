@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::extensions::ExtensionMap;
 use crate::media::BinarySource;
 use crate::tool::{ToolCallBlock, ToolResultBlock};
 
@@ -7,6 +8,8 @@ use crate::tool::{ToolCallBlock, ToolResultBlock};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextBlock {
     pub text: String,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 /// An image content block.
@@ -14,6 +17,8 @@ pub struct TextBlock {
 pub struct ImageBlock {
     pub source: BinarySource,
     pub alt_text: Option<String>,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 /// An audio content block.
@@ -21,6 +26,8 @@ pub struct ImageBlock {
 pub struct AudioBlock {
     pub source: BinarySource,
     pub transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 /// A file content block.
@@ -29,6 +36,8 @@ pub struct FileBlock {
     pub source: BinarySource,
     pub filename: Option<String>,
     pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 /// A chain-of-thought reasoning block (Anthropic extended thinking).
@@ -36,12 +45,16 @@ pub struct FileBlock {
 pub struct ReasoningBlock {
     pub thinking: String,
     pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 /// A redacted reasoning block (opaque to the caller).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactedReasoningBlock {
     pub data: String,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 /// A block with a content type that this version of the gateway does not recognise.
@@ -94,6 +107,7 @@ mod tests {
     fn text_block_round_trips() {
         let block = ContentBlock::Text(TextBlock {
             text: "hello world".into(),
+            extensions: ExtensionMap::new(),
         });
         let json = serde_json::to_string(&block).unwrap();
         assert!(json.contains("\"type\":\"text\""));

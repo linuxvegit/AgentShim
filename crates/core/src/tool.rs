@@ -1,113 +1,91 @@
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 
+use crate::extensions::ExtensionMap;
 use crate::ids::ToolCallId;
 
-/// A tool/function definition exposed to the model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
-    /// The tool name the model will use when calling it.
     pub name: String,
-    /// Human-readable description of what the tool does.
     pub description: Option<String>,
-    /// JSON Schema object describing the input parameters.
     pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
-/// How the model should select tools.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolChoice {
-    /// Let the model decide.
     Auto,
-    /// The model must not call any tool.
     None,
-    /// The model must call at least one tool.
     Required,
-    /// The model must call this specific tool.
     Specific { name: String },
 }
 
-/// Arguments to a tool call — either a completed JSON value or a streaming raw fragment.
-///
-/// The `Complete` variant stores the JSON as a plain `String` so that serde's externally-tagged
-/// enum layout works without restriction. Use [`ToolCallArguments::complete`] to validate and
-/// construct it, and [`ToolCallArguments::as_raw_str`] to access it as a raw JSON slice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolCallArguments {
-    /// Fully accumulated arguments as a raw JSON string (preserves key order).
-    Complete { json: String },
-    /// Partial JSON accumulated so far during streaming.
-    Streaming { partial_json: String },
+impl Default for ToolChoice {
+    fn default() -> Self { Self::Auto }
 }
 
-impl ToolCallArguments {
-    /// Return the raw JSON string if this is the `Complete` variant.
-    pub fn as_raw_str(&self) -> Option<&str> {
-        match self {
-            ToolCallArguments::Complete { json } => Some(json.as_str()),
-            _ => None,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolCallArguments {
+    Complete { value: serde_json::Value },
+    Streaming { data: String },
+}
+
+impl PartialEq for ToolCallArguments {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Complete { value: a }, Self::Complete { value: b }) => a == b,
+            (Self::Streaming { data: a }, Self::Streaming { data: b }) => a == b,
+            _ => false,
         }
     }
-
-    /// Construct a `Complete` variant from a string, validating that it is valid JSON.
-    pub fn complete(json: impl Into<String>) -> Result<Self, serde_json::Error> {
-        let s = json.into();
-        let _: Box<RawValue> = RawValue::from_string(s.clone())?;
-        Ok(ToolCallArguments::Complete { json: s })
-    }
 }
 
-/// A single tool call emitted by the model.
+impl Eq for ToolCallArguments {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallBlock {
     pub id: ToolCallId,
     pub name: String,
     pub arguments: ToolCallArguments,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
-/// The result of executing a tool, returned to the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultBlock {
     pub tool_call_id: ToolCallId,
-    pub content: String,
-    /// Whether the tool execution produced an error.
+    pub content: serde_json::Value,
+    #[serde(default)]
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
+    pub extensions: ExtensionMap,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn tool_definition_round_trips() {
-        let def = ToolDefinition {
-            name: "get_weather".into(),
-            description: Some("Returns current weather.".into()),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-        };
-        let json = serde_json::to_string(&def).unwrap();
-        let back: ToolDefinition = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, def);
+    fn tool_choice_default_is_auto() {
+        assert_eq!(ToolChoice::default(), ToolChoice::Auto);
     }
 
     #[test]
     fn tool_choice_specific_round_trips() {
-        let choice = ToolChoice::Specific {
-            name: "get_weather".into(),
-        };
-        let json = serde_json::to_string(&choice).unwrap();
-        let back: ToolChoice = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, choice);
+        let c = ToolChoice::Specific { name: "search".into() };
+        let s = serde_json::to_string(&c).unwrap();
+        let back: ToolChoice = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, c);
     }
 
     #[test]
-    fn tool_call_arguments_complete_preserves_raw_json() {
-        let raw = r#"{"location":"Paris","unit":"celsius"}"#;
-        let args = ToolCallArguments::complete(raw).unwrap();
-        let serialized = serde_json::to_string(&args).unwrap();
-        let back: ToolCallArguments = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(back.as_raw_str(), Some(raw));
+    fn complete_args_round_trip() {
+        let args = ToolCallArguments::Complete { value: json!({"q": "test"}) };
+        let s = serde_json::to_string(&args).unwrap();
+        let back: ToolCallArguments = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, args);
     }
 }
