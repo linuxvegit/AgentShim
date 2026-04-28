@@ -22,4 +22,19 @@ pub enum Commands {
         #[arg(short, long, env = "AGENT_SHIM_CONFIG")]
         config: PathBuf,
     },
+    /// GitHub Copilot authentication commands
+    Copilot {
+        #[command(subcommand)]
+        sub: CopilotCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CopilotCommand {
+    /// Authenticate with GitHub Copilot via device flow
+    Login {
+        /// Path to store credentials (default: platform config dir)
+        #[arg(long)]
+        credential_path: Option<PathBuf>,
+    },
 }

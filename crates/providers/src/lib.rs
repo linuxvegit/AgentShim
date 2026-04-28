@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod openai_compatible;
+pub mod github_copilot;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

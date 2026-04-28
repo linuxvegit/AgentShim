@@ -1,9 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_shim_config::{GatewayConfig, UpstreamConfig};
 use agent_shim_frontends::{anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat};
 use agent_shim_providers::{
+    github_copilot::{self, credential_store},
     openai_compatible::{self, OpenAiCompatibleProvider},
     ProviderRegistry,
 };
@@ -34,7 +36,18 @@ impl AppState {
                     }
                 }
                 UpstreamConfig::GithubCopilot => {
-                    tracing::warn!("GithubCopilot provider not yet implemented, skipping {name}");
+                    let credential_path = config
+                        .copilot
+                        .as_ref()
+                        .map(|c| PathBuf::from(&c.credential_path))
+                        .unwrap_or_else(|| {
+                            credential_store::default_path()
+                                .unwrap_or_else(|_| PathBuf::from("./copilot.json"))
+                        });
+                    match github_copilot::CopilotProvider::spawn(credential_path) {
+                        Ok(p) => registry.register(Arc::new(p)),
+                        Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
+                    }
                 }
             }
         }
