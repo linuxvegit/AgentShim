@@ -7,6 +7,7 @@ pub mod capabilities;
 pub mod target;
 pub mod media;
 pub mod tool;
+pub mod content;
 
 pub use ids::{RequestId, ResponseId, ToolCallId};
 pub use extensions::ExtensionMap;
@@ -15,3 +16,4 @@ pub use capabilities::ProviderCapabilities;
 pub use target::{BackendTarget, FrontendInfo, FrontendKind, FrontendModel};
 pub use media::BinarySource;
 pub use tool::*;
+pub use content::*;
