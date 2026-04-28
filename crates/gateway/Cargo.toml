@@ -1,0 +1,25 @@
+[package]
+name = "agent-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "agent-shim"
+
+[[bin]]
+name = "agent-shim"
+path = "src/main.rs"
+
+[dependencies]
+agent-shim-core = { path = "../core" }
+agent-shim-config = { path = "../config" }
+agent-shim-observability = { path = "../observability" }
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+tracing.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
