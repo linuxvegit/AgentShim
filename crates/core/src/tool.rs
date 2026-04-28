@@ -12,17 +12,14 @@ pub struct ToolDefinition {
     pub extensions: ExtensionMap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolChoice {
+    #[default]
     Auto,
     None,
     Required,
     Specific { name: String },
-}
-
-impl Default for ToolChoice {
-    fn default() -> Self { Self::Auto }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

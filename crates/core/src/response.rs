@@ -11,7 +11,8 @@ pub struct CanonicalResponse {
     pub model: String,
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
-    pub usage: Usage,
+    pub stop_sequence: Option<String>,
+    pub usage: Option<Usage>,
 }
 
 #[cfg(test)]
@@ -29,11 +30,12 @@ mod tests {
                 extensions: Default::default(),
             })],
             stop_reason: StopReason::EndTurn,
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
+            stop_sequence: None,
+            usage: Some(Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
                 ..Default::default()
-            },
+            }),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: CanonicalResponse = serde_json::from_str(&json).unwrap();

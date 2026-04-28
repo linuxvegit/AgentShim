@@ -14,10 +14,12 @@ pub enum MessageRole {
 }
 
 /// A single conversation turn.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: MessageRole,
     pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
     pub extensions: ExtensionMap,
 }
@@ -27,6 +29,7 @@ impl Message {
         Self {
             role: MessageRole::User,
             content,
+            name: None,
             extensions: ExtensionMap::new(),
         }
     }
@@ -35,6 +38,7 @@ impl Message {
         Self {
             role: MessageRole::Assistant,
             content,
+            name: None,
             extensions: ExtensionMap::new(),
         }
     }
@@ -53,10 +57,10 @@ pub enum SystemSource {
 }
 
 /// A system / developer prompt extracted from the request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SystemInstruction {
     pub source: SystemSource,
-    pub text: String,
+    pub content: Vec<ContentBlock>,
 }
 
 #[cfg(test)]
@@ -79,10 +83,20 @@ mod tests {
     }
 
     #[test]
+    fn message_name_field_round_trips() {
+        let mut msg = Message::user(vec![ContentBlock::text("hi")]);
+        msg.name = Some("alice".into());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"name\":\"alice\""));
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, Some("alice".into()));
+    }
+
+    #[test]
     fn system_instruction_round_trips() {
         let si = SystemInstruction {
             source: SystemSource::AnthropicSystem,
-            text: "You are helpful.".into(),
+            content: vec![ContentBlock::text("You are helpful.")],
         };
         let json = serde_json::to_string(&si).unwrap();
         let back: SystemInstruction = serde_json::from_str(&json).unwrap();

@@ -1,22 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 /// Token usage for a single request/response pair.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    /// Cache read tokens (Anthropic prompt caching).
-    pub cache_read_tokens: Option<u32>,
-    /// Cache write tokens (Anthropic prompt caching).
-    pub cache_write_tokens: Option<u32>,
-    /// Reasoning tokens consumed (o-series / extended thinking).
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub cache_creation_input_tokens: Option<u32>,
+    pub cache_read_input_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,
-}
-
-impl Usage {
-    pub fn total_tokens(&self) -> u32 {
-        self.input_tokens + self.output_tokens
-    }
+    #[serde(default)]
+    pub estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_raw: Option<serde_json::Value>,
 }
 
 /// Why the model stopped generating.
@@ -56,16 +51,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usage_total_tokens() {
-        let u = Usage {
-            input_tokens: 100,
-            output_tokens: 50,
-            ..Default::default()
-        };
-        assert_eq!(u.total_tokens(), 150);
-    }
-
-    #[test]
     fn stop_reason_normalisation() {
         assert_eq!(
             StopReason::from_provider_string("stop"),
@@ -92,5 +77,17 @@ mod tests {
         assert_eq!(json, "\"end_turn\"");
         let back: StopReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn usage_optional_fields() {
+        let u = Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        let back: Usage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, u);
     }
 }

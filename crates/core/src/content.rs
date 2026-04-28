@@ -16,7 +16,6 @@ pub struct TextBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageBlock {
     pub source: BinarySource,
-    pub alt_text: Option<String>,
     #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
     pub extensions: ExtensionMap,
 }
@@ -25,7 +24,6 @@ pub struct ImageBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioBlock {
     pub source: BinarySource,
-    pub transcript: Option<String>,
     #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
     pub extensions: ExtensionMap,
 }
@@ -34,8 +32,6 @@ pub struct AudioBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileBlock {
     pub source: BinarySource,
-    pub filename: Option<String>,
-    pub media_type: Option<String>,
     #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
     pub extensions: ExtensionMap,
 }
@@ -43,8 +39,7 @@ pub struct FileBlock {
 /// A chain-of-thought reasoning block (Anthropic extended thinking).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningBlock {
-    pub thinking: String,
-    pub signature: Option<String>,
+    pub text: String,
     #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
     pub extensions: ExtensionMap,
 }
@@ -60,8 +55,8 @@ pub struct RedactedReasoningBlock {
 /// A block with a content type that this version of the gateway does not recognise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedBlock {
-    /// The raw `type` string from the provider.
-    pub type_name: String,
+    /// Where this block originated (provider name or adapter name).
+    pub origin: String,
     /// Full raw JSON of the original block, preserved for pass-through.
     pub raw: serde_json::Value,
 }
@@ -74,11 +69,21 @@ pub enum ContentBlock {
     Image(ImageBlock),
     Audio(AudioBlock),
     File(FileBlock),
-    ToolUse(ToolCallBlock),
+    ToolCall(ToolCallBlock),
     ToolResult(ToolResultBlock),
     Reasoning(ReasoningBlock),
     RedactedReasoning(RedactedReasoningBlock),
     Unsupported(UnsupportedBlock),
+}
+
+impl ContentBlock {
+    /// Convenience constructor for a plain text block.
+    pub fn text(s: impl Into<String>) -> Self {
+        ContentBlock::Text(TextBlock {
+            text: s.into(),
+            extensions: ExtensionMap::new(),
+        })
+    }
 }
 
 impl From<TextBlock> for ContentBlock {
@@ -89,7 +94,7 @@ impl From<TextBlock> for ContentBlock {
 
 impl From<ToolCallBlock> for ContentBlock {
     fn from(b: ToolCallBlock) -> Self {
-        ContentBlock::ToolUse(b)
+        ContentBlock::ToolCall(b)
     }
 }
 
@@ -116,9 +121,18 @@ mod tests {
     }
 
     #[test]
+    fn text_convenience_constructor() {
+        let block = ContentBlock::text("hello");
+        match &block {
+            ContentBlock::Text(t) => assert_eq!(t.text, "hello"),
+            _ => panic!("expected Text variant"),
+        }
+    }
+
+    #[test]
     fn unsupported_block_preserves_raw() {
         let block = ContentBlock::Unsupported(UnsupportedBlock {
-            type_name: "exotic_type".into(),
+            origin: "exotic_provider".into(),
             raw: serde_json::json!({"type": "exotic_type", "data": 42}),
         });
         let json = serde_json::to_string(&block).unwrap();

@@ -50,17 +50,12 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogFormat {
+    #[default]
     Pretty,
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        LogFormat::Pretty
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
