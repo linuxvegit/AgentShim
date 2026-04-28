@@ -140,6 +140,9 @@ pub async fn exchange_with_base(
             reqwest::header::AUTHORIZATION,
             format!("token {}", creds.github_oauth_token),
         )
+        .header(reqwest::header::USER_AGENT, super::headers::USER_AGENT)
+        .header("Editor-Version", super::headers::EDITOR_VERSION)
+        .header("Accept", "application/json")
         .send()
         .await
         .map_err(|e| ProviderError::Network(e.to_string()))?;
