@@ -28,10 +28,13 @@ fn score(
         return 1.0;
     }
 
-    if req_norm.starts_with(cand_norm) || cand_norm.starts_with(req_norm) {
-        let shorter = req_norm.len().min(cand_norm.len()) as f64;
-        let longer = req_norm.len().max(cand_norm.len()) as f64;
-        return 0.8 + 0.2 * (shorter / longer);
+    if cand_norm.starts_with(req_norm) {
+        let ratio = req_norm.len() as f64 / cand_norm.len() as f64;
+        return 0.8 + 0.2 * ratio;
+    }
+    if req_norm.starts_with(cand_norm) {
+        let ratio = cand_norm.len() as f64 / req_norm.len() as f64;
+        return 0.8 + 0.2 * ratio;
     }
 
     let max_len = requested_tokens.len().max(candidate_tokens.len());
@@ -60,7 +63,7 @@ fn score(
     weighted_matches / total_weight
 }
 
-const THRESHOLD: f64 = 0.4;
+const THRESHOLD: f64 = 0.5;
 
 impl ModelIndex {
     pub fn new(discovered: HashMap<String, BTreeSet<String>>) -> Self {
@@ -96,29 +99,28 @@ impl ModelIndex {
         let req_norm = requested.to_lowercase();
         let req_tokens = tokenize(requested);
 
-        let mut best_score = 0.0_f64;
+        let mut best_score = THRESHOLD - f64::EPSILON;
         let mut best: Option<&ModelEntry> = None;
 
         for entry in entries {
             let s = score(&req_tokens, &entry.tokens, &req_norm, &entry.normalized);
-            if s > best_score
-                || (s == best_score
-                    && best.map_or(true, |b| {
-                        entry.original.len() < b.original.len()
-                            || (entry.original.len() == b.original.len()
-                                && entry.original < b.original)
-                    }))
-            {
+            let dominated = match best {
+                None => s >= THRESHOLD,
+                Some(b) => {
+                    s > best_score
+                        || (s == best_score
+                            && (entry.original.len() < b.original.len()
+                                || (entry.original.len() == b.original.len()
+                                    && entry.original < b.original)))
+                }
+            };
+            if dominated {
                 best_score = s;
                 best = Some(entry);
             }
         }
 
-        if best_score >= THRESHOLD {
-            best.map(|e| e.original.as_str())
-        } else {
-            None
-        }
+        best.map(|e| e.original.as_str())
     }
 }
 
@@ -209,6 +211,22 @@ mod tests {
     fn tie_breaking_prefers_shorter_then_alphabetical() {
         let idx = index_with("p", &["model-b", "model-a"]);
         assert_eq!(idx.resolve("p", "model"), Some("model-a"));
+    }
+
+    #[test]
+    fn prefix_match_prefers_more_specific() {
+        let idx = index_with(
+            "p",
+            &[
+                "claude-sonnet-4",
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5-20250514",
+            ],
+        );
+        assert_eq!(
+            idx.resolve("p", "claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5")
+        );
     }
 
     proptest! {

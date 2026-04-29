@@ -95,7 +95,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
         let mut request_builder = self
             .client
-            .post(&self.chat_url())
+            .post(self.chat_url())
             .bearer_auth(&self.api_key)
             .header(CONTENT_TYPE, "application/json")
             .json(&body);
