@@ -139,7 +139,43 @@ impl BackendProvider for OpenAiCompatibleProvider {
             Ok(parse_unary::parse(&bytes))
         }
     }
+
+    async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
+        let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        let resp = self.client
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        let models = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                    .collect::<BTreeSet<String>>()
+            })
+            .unwrap_or_default();
+
+        if models.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(models))
+    }
 }
+
+use std::collections::BTreeSet;
 
 /// Build an `OpenAiCompatibleProvider` from gateway config upstreams.
 pub fn from_config(
@@ -156,4 +192,62 @@ pub fn from_config(
         cfg.default_headers.clone(),
         cfg.request_timeout_secs,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_models_returns_discovered_models() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/v1/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "object": "list",
+                "data": [
+                    {"id": "gpt-4o", "object": "model"},
+                    {"id": "gpt-4o-mini", "object": "model"},
+                    {"id": "deepseek-chat", "object": "model"}
+                ]
+            }"#)
+            .create_async().await;
+
+        let provider = OpenAiCompatibleProvider::new(
+            "test",
+            server.url(),
+            "test-key",
+            Default::default(),
+            30,
+        ).unwrap();
+
+        let result = provider.list_models().await.unwrap().unwrap();
+        assert!(result.contains("gpt-4o"));
+        assert!(result.contains("gpt-4o-mini"));
+        assert!(result.contains("deepseek-chat"));
+        assert_eq!(result.len(), 3);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/v1/models")
+            .with_status(404)
+            .with_body("not found")
+            .create_async().await;
+
+        let provider = OpenAiCompatibleProvider::new(
+            "test",
+            server.url(),
+            "test-key",
+            Default::default(),
+            30,
+        ).unwrap();
+
+        let result = provider.list_models().await.unwrap();
+        assert!(result.is_none());
+        mock.assert_async().await;
+    }
 }
