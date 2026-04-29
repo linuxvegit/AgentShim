@@ -62,21 +62,6 @@ pub fn encode(
     let done = Arc::new(AtomicBool::new(false));
     let done_for_flat_map = Arc::clone(&done);
 
-    // Stop consuming canonical events after MessageStop. We use take_while on
-    // the canonical stream so that flat_map never sees events after MessageStop.
-    // MessageStop itself passes through (take_while checks BEFORE the item is
-    // yielded, so we use a "seen" flag that triggers on the NEXT item).
-    let seen_message_stop = AtomicBool::new(false);
-    let canonical = canonical.take_while(move |item| {
-        if seen_message_stop.load(Ordering::SeqCst) {
-            return futures::future::ready(false);
-        }
-        if let Ok(StreamEvent::MessageStop { .. }) = item {
-            seen_message_stop.store(true, Ordering::SeqCst);
-        }
-        futures::future::ready(true)
-    });
-
     let event_stream = canonical.flat_map(move |item| {
         let state = Arc::clone(&state);
         let done = Arc::clone(&done_for_flat_map);
@@ -256,6 +241,7 @@ pub fn encode(
                     chunks.push(Ok(b));
                 }
                 done.store(true, Ordering::SeqCst);
+                chunks.push(Ok(Bytes::new()));
             }
 
             StreamEvent::ResponseStop { usage } => {
@@ -290,10 +276,27 @@ pub fn encode(
         futures_util::stream::iter(chunks)
     });
 
-    // Optionally interleave keepalive pings — stop once message_stop is emitted
+    // Terminate the output stream after message_stop. The flat_map emits an
+    // empty Bytes sentinel after the message_stop SSE event. scan() yields all
+    // items up to (but not including) the sentinel, then returns None to end.
+    let terminate_on_sentinel =
+        |stream: BoxStream<'static, Result<Bytes, crate::FrontendError>>| -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+            stream
+                .scan((), |(), item| {
+                    let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
+                    if is_sentinel {
+                        futures::future::ready(None)
+                    } else {
+                        futures::future::ready(Some(item))
+                    }
+                })
+                .boxed()
+        };
+
+    // Optionally interleave keepalive pings
     if let Some(interval) = keepalive {
         use tokio_stream::wrappers::IntervalStream;
-        let done2 = done;
+        let done2 = Arc::clone(&done);
         let ping_stream = IntervalStream::new(tokio::time::interval(interval))
             .take_while(move |_| {
                 let is_done = done2.load(std::sync::atomic::Ordering::SeqCst);
@@ -301,9 +304,9 @@ pub fn encode(
             })
             .map(|_| Ok::<Bytes, crate::FrontendError>(sse::comment("ping")));
 
-        let merged = futures_util::stream::select(event_stream, ping_stream);
-        merged.boxed()
+        let merged = futures_util::stream::select(event_stream.boxed(), ping_stream.boxed());
+        terminate_on_sentinel(merged.boxed())
     } else {
-        event_stream.boxed()
+        terminate_on_sentinel(event_stream.boxed())
     }
 }
