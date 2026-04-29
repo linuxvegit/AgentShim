@@ -44,12 +44,8 @@ impl FrontendProtocol for OpenAiResponses {
         decode::decode(body)
     }
 
-    fn encode_unary(
-        &self,
-        response: CanonicalResponse,
-    ) -> Result<FrontendResponse, FrontendError> {
-        let body =
-            encode_unary::encode_with_clock(response, self.clock_override)?;
+    fn encode_unary(&self, response: CanonicalResponse) -> Result<FrontendResponse, FrontendError> {
+        let body = encode_unary::encode_with_clock(response, self.clock_override)?;
         Ok(FrontendResponse::Unary {
             content_type: "application/json".into(),
             body,
@@ -57,11 +53,7 @@ impl FrontendProtocol for OpenAiResponses {
     }
 
     fn encode_stream(&self, stream: CanonicalStream) -> FrontendResponse {
-        let sse_stream = encode_stream::encode(
-            stream,
-            self.keepalive,
-            self.clock_override,
-        );
+        let sse_stream = encode_stream::encode(stream, self.keepalive, self.clock_override);
         FrontendResponse::Stream {
             content_type: "text/event-stream".into(),
             stream: sse_stream.boxed(),

@@ -80,13 +80,10 @@ pub async fn handle(
         );
         Ok(frontend_response_to_axum(frontend_response))
     } else {
-        let stream = provider
-            .complete(canonical, target)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "provider.complete failed");
-                HandlerError::Provider(e)
-            })?;
+        let stream = provider.complete(canonical, target).await.map_err(|e| {
+            tracing::error!(error = %e, "provider.complete failed");
+            HandlerError::Provider(e)
+        })?;
         let response = collect_stream(stream).await?;
         let (input, output) = match &response.usage {
             Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),

@@ -8,9 +8,9 @@ use parking_lot::Mutex;
 
 use super::mapping::status_from_stop_reason;
 use super::wire::{
-    ContentPartAdded, ContentPartDone, FunctionCallArgsDelta, FunctionCallArgsDone,
-    OutputContent, OutputItem, OutputItemAdded, OutputItemDone, ResponseObject,
-    TextDeltaPayload, TextDonePayload, UsageOut,
+    ContentPartAdded, ContentPartDone, FunctionCallArgsDelta, FunctionCallArgsDone, OutputContent,
+    OutputItem, OutputItemAdded, OutputItemDone, ResponseObject, TextDeltaPayload, TextDonePayload,
+    UsageOut,
 };
 use crate::sse;
 
@@ -27,6 +27,9 @@ struct EncoderState {
     item_ids: std::collections::HashMap<u32, String>,
     /// Tool call metadata per output_index (call_id, name)
     tool_meta: std::collections::HashMap<u32, (String, String)>,
+    /// Mapping from canonical content block indexes to Responses output indexes.
+    canonical_to_output: std::collections::HashMap<u32, u32>,
+    final_status: Option<&'static str>,
     input_tokens: u32,
     output_tokens: u32,
 }
@@ -42,6 +45,8 @@ impl EncoderState {
             tool_args_buf: std::collections::HashMap::new(),
             item_ids: std::collections::HashMap::new(),
             tool_meta: std::collections::HashMap::new(),
+            canonical_to_output: std::collections::HashMap::new(),
+            final_status: None,
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -119,11 +124,12 @@ pub fn encode(
                 }
             }
 
-            StreamEvent::ContentBlockStart { index: _, kind } => {
+            StreamEvent::ContentBlockStart { index, kind } => {
                 if kind == ContentBlockKind::Text {
                     let mut s = state.lock();
                     let oi = s.next_output_index();
                     let item_id = format!("msg_{oi}");
+                    s.canonical_to_output.insert(index, oi);
                     s.item_ids.insert(oi, item_id.clone());
                     s.text_buf.insert(oi, String::new());
 
@@ -159,16 +165,18 @@ pub fn encode(
                 }
             }
 
-            StreamEvent::TextDelta { index: _, text } => {
-                let s = state.lock();
-                // Find the current text output_index (last message item)
-                let oi = s.output_index.saturating_sub(1);
-                let item_id = s
-                    .item_ids
-                    .get(&oi)
-                    .cloned()
-                    .unwrap_or_default();
-                drop(s);
+            StreamEvent::TextDelta { index, text } => {
+                let (oi, item_id) = {
+                    let s = state.lock();
+                    let Some(oi) = s.canonical_to_output.get(&index).copied() else {
+                        chunks.push(Err(crate::FrontendError::Encode(format!(
+                            "text delta for unknown content block index: {index}"
+                        ))));
+                        return futures_util::stream::iter(chunks);
+                    };
+                    let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
+                    (oi, item_id)
+                };
 
                 if let Some(b) = emit(
                     "response.output_text.delta",
@@ -184,10 +192,11 @@ pub fn encode(
                 state.lock().text_buf.entry(oi).or_default().push_str(&text);
             }
 
-            StreamEvent::ToolCallStart { index: _, id, name } => {
+            StreamEvent::ToolCallStart { index, id, name } => {
                 let mut s = state.lock();
                 let oi = s.next_output_index();
                 let item_id = format!("fc_{oi}");
+                s.canonical_to_output.insert(index, oi);
                 s.item_ids.insert(oi, item_id.clone());
                 s.tool_args_buf.insert(oi, String::new());
                 s.tool_meta.insert(oi, (id.0.clone(), name.clone()));
@@ -211,13 +220,20 @@ pub fn encode(
             }
 
             StreamEvent::ToolCallArgumentsDelta {
-                index: _,
+                index,
                 json_fragment,
             } => {
-                let s = state.lock();
-                let oi = s.output_index.saturating_sub(1);
-                let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
-                drop(s);
+                let (oi, item_id) = {
+                    let s = state.lock();
+                    let Some(oi) = s.canonical_to_output.get(&index).copied() else {
+                        chunks.push(Err(crate::FrontendError::Encode(format!(
+                            "tool call argument delta for unknown content block index: {index}"
+                        ))));
+                        return futures_util::stream::iter(chunks);
+                    };
+                    let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
+                    (oi, item_id)
+                };
 
                 if let Some(b) = emit(
                     "response.function_call_arguments.delta",
@@ -237,9 +253,11 @@ pub fn encode(
                     .push_str(&json_fragment);
             }
 
-            StreamEvent::ContentBlockStop { index: _ } => {
+            StreamEvent::ContentBlockStop { index } => {
                 let mut s = state.lock();
-                let oi = s.output_index.saturating_sub(1);
+                let Some(oi) = s.canonical_to_output.remove(&index) else {
+                    return futures_util::stream::iter(chunks);
+                };
                 let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
 
                 if let Some(text) = s.text_buf.remove(&oi) {
@@ -289,15 +307,17 @@ pub fn encode(
                 }
             }
 
-            StreamEvent::ToolCallStop { index: _ } => {
+            StreamEvent::ToolCallStop { index } => {
                 let mut s = state.lock();
-                let oi = s.output_index.saturating_sub(1);
+                let Some(oi) = s.canonical_to_output.get(&index).copied() else {
+                    chunks.push(Err(crate::FrontendError::Encode(format!(
+                        "tool call stop for unknown content block index: {index}"
+                    ))));
+                    return futures_util::stream::iter(chunks);
+                };
                 let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
                 let args = s.tool_args_buf.remove(&oi).unwrap_or_default();
-                let (call_id, name) = s
-                    .tool_meta
-                    .remove(&oi)
-                    .unwrap_or_default();
+                let (call_id, name) = s.tool_meta.remove(&oi).unwrap_or_default();
 
                 if let Some(b) = emit(
                     "response.function_call_arguments.done",
@@ -334,27 +354,8 @@ pub fn encode(
             }
 
             StreamEvent::MessageStop { stop_reason, .. } => {
-                let s = state.lock();
                 let status = status_from_stop_reason(&stop_reason);
-                let resp = ResponseObject {
-                    id: s.response_id.clone(),
-                    object: "response",
-                    status,
-                    model: s.model.clone(),
-                    created_at: s.created_at,
-                    output: vec![],
-                    usage: Some(UsageOut {
-                        input_tokens: s.input_tokens,
-                        output_tokens: s.output_tokens,
-                        total_tokens: s.input_tokens + s.output_tokens,
-                    }),
-                };
-                drop(s);
-                if let Some(b) = emit("response.completed", &resp) {
-                    chunks.push(Ok(b));
-                }
-                done.store(true, Ordering::SeqCst);
-                chunks.push(Ok(Bytes::new()));
+                state.lock().final_status = Some(status);
             }
 
             StreamEvent::ResponseStop { usage } => {
@@ -369,10 +370,11 @@ pub fn encode(
                 }
                 if !done.load(Ordering::SeqCst) {
                     let s = state.lock();
+                    let status = s.final_status.unwrap_or("completed");
                     let resp = ResponseObject {
                         id: s.response_id.clone(),
                         object: "response",
-                        status: "completed",
+                        status,
                         model: s.model.clone(),
                         created_at: s.created_at,
                         output: vec![],
@@ -413,19 +415,22 @@ pub fn encode(
     // Terminate the stream after response.completed. The flat_map emits an
     // empty Bytes sentinel; scan() yields all items up to the sentinel, then
     // returns None to end.
-    let terminate_on_sentinel =
-        |stream: BoxStream<'static, Result<Bytes, crate::FrontendError>>| -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-            stream
-                .scan((), |(), item| {
-                    let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
-                    if is_sentinel {
-                        futures::future::ready(None)
-                    } else {
-                        futures::future::ready(Some(item))
-                    }
-                })
-                .boxed()
-        };
+    let terminate_on_sentinel = |stream: BoxStream<
+        'static,
+        Result<Bytes, crate::FrontendError>,
+    >|
+     -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+        stream
+            .scan((), |(), item| {
+                let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
+                if is_sentinel {
+                    futures::future::ready(None)
+                } else {
+                    futures::future::ready(Some(item))
+                }
+            })
+            .boxed()
+    };
 
     if let Some(interval) = keepalive {
         use tokio_stream::wrappers::IntervalStream;
@@ -440,5 +445,87 @@ pub fn encode(
         terminate_on_sentinel(merged.boxed())
     } else {
         terminate_on_sentinel(event_stream.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_shim_core::{
+        ids::{ResponseId, ToolCallId},
+        message::MessageRole,
+        stream::CanonicalStream,
+        StopReason, StreamError,
+    };
+    use futures::stream;
+
+    async fn collect_stream(stream: CanonicalStream) -> String {
+        let bytes = encode(stream, None, Some(1))
+            .fold(Vec::new(), |mut out, item| async move {
+                out.extend_from_slice(&item.expect("stream item"));
+                out
+            })
+            .await;
+        String::from_utf8(bytes).expect("utf8 stream")
+    }
+
+    #[tokio::test]
+    async fn deltas_follow_their_canonical_indexes() {
+        let events: Vec<Result<StreamEvent, StreamError>> = vec![
+            Ok(StreamEvent::ResponseStart {
+                id: ResponseId("resp_1".to_string()),
+                model: "gpt-test".to_string(),
+                created_at_unix: 1,
+            }),
+            Ok(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 3,
+                kind: ContentBlockKind::Text,
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 3,
+                text: "A".to_string(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 8,
+                kind: ContentBlockKind::ToolCall,
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                index: 8,
+                id: ToolCallId::from_provider("call_1"),
+                name: "search".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallArgumentsDelta {
+                index: 8,
+                json_fragment: "{}".to_string(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 3,
+                text: "B".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallStop { index: 8 }),
+            Ok(StreamEvent::ContentBlockStop { index: 8 }),
+            Ok(StreamEvent::ContentBlockStop { index: 3 }),
+            Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+                stop_sequence: None,
+            }),
+            Ok(StreamEvent::ResponseStop {
+                usage: Some(agent_shim_core::Usage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(9),
+                    ..Default::default()
+                }),
+            }),
+        ];
+
+        let body = collect_stream(Box::pin(stream::iter(events))).await;
+
+        assert!(body.contains(r#""output_index":0,"content_index":0,"delta":"A""#));
+        assert!(body.contains(r#""output_index":0,"content_index":0,"delta":"B""#));
+        assert!(body.contains(r#""output_index":1,"delta":"{}""#));
+        assert!(body.contains(r#""usage":{"input_tokens":7,"output_tokens":9,"total_tokens":16}"#));
     }
 }

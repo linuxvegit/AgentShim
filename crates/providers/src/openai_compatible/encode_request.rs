@@ -74,6 +74,23 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
             .collect();
 
         if !tool_results.is_empty() {
+            let non_tool_result_blocks = msg
+                .content
+                .iter()
+                .filter(|b| !matches!(b, ContentBlock::ToolResult(_)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if msg.role != MessageRole::Tool {
+                if let Some(content) = build_content_value(&non_tool_result_blocks) {
+                    messages.push(MsgOut {
+                        role: role.to_string(),
+                        content: Some(content),
+                        name: msg.name.clone(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+            }
             // Emit each tool result as its own message.
             for tr in &tool_results {
                 let text_content = extract_text_from_tool_result(&tr.content);
@@ -274,14 +291,14 @@ fn extract_text_from_tool_result(content: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(arr) => {
             arr.iter()
-                .filter_map(|item| {
+                .map(|item| {
                     // Anthropic blocks: {"type":"text","text":"..."}
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        Some(text.to_string())
+                        text.to_string()
                     } else if let Some(s) = item.as_str() {
-                        Some(s.to_string())
+                        s.to_string()
                     } else {
-                        Some(item.to_string())
+                        item.to_string()
                     }
                 })
                 .collect::<Vec<_>>()
@@ -289,5 +306,59 @@ fn extract_text_from_tool_result(content: &serde_json::Value) -> String {
         }
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_shim_core::{
+        ExtensionMap, FrontendInfo, FrontendKind, FrontendModel, GenerationOptions, Message,
+        RequestId, ToolCallId, ToolResultBlock,
+    };
+
+    fn request_with_messages(messages: Vec<Message>) -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::AnthropicMessages,
+                requested_model: FrontendModel::from("claude-test"),
+            },
+            model: FrontendModel::from("claude-test"),
+            system: vec![],
+            messages,
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: Default::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
+
+    #[test]
+    fn mixed_text_and_tool_result_preserves_user_text() {
+        let req = request_with_messages(vec![Message::user(vec![
+            ContentBlock::text("The tool returned this:"),
+            ContentBlock::ToolResult(ToolResultBlock {
+                tool_call_id: ToolCallId::from_provider("call_1"),
+                content: serde_json::json!("weather"),
+                is_error: false,
+                extensions: ExtensionMap::new(),
+            }),
+        ])]);
+
+        let body = build(&req, "gpt-test");
+
+        assert_eq!(body.messages.len(), 2);
+        assert_eq!(body.messages[0].role, "user");
+        assert_eq!(
+            body.messages[0].content,
+            Some(serde_json::json!("The tool returned this:"))
+        );
+        assert_eq!(body.messages[1].role, "tool");
+        assert_eq!(body.messages[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(body.messages[1].content, Some(serde_json::json!("weather")));
     }
 }

@@ -41,9 +41,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
             "required" => ToolChoice::Required,
             _ => ToolChoice::Auto,
         },
-        Some(InboundToolChoice::Specific { name, .. }) => {
-            ToolChoice::Specific { name }
-        }
+        Some(InboundToolChoice::Specific { name, .. }) => ToolChoice::Specific { name },
     };
 
     let generation = GenerationOptions {
@@ -67,10 +65,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
 
     let mut extensions = ExtensionMap::new();
     if !builtin_tools.is_empty() {
-        extensions.insert(
-            "builtin_tools",
-            serde_json::Value::Array(builtin_tools),
-        );
+        extensions.insert("builtin_tools", serde_json::Value::Array(builtin_tools));
     }
 
     Ok(CanonicalRequest {
@@ -157,55 +152,51 @@ fn decode_items(
     let mut out = Vec::new();
     for item in items {
         match item {
-            InputItem::Message { role, content } => {
-                match role.as_str() {
-                    "system" => {
-                        system.push(SystemInstruction {
-                            source: SystemSource::OpenAiSystem,
-                            content: decode_message_content(content),
-                        });
-                    }
-                    "developer" => {
-                        system.push(SystemInstruction {
-                            source: SystemSource::OpenAiDeveloper,
-                            content: decode_message_content(content),
-                        });
-                    }
-                    "user" | "assistant" => {
-                        let msg_role = if role == "user" {
-                            MessageRole::User
-                        } else {
-                            MessageRole::Assistant
-                        };
-                        let blocks = decode_message_content(content);
-                        out.push(Message {
-                            role: msg_role,
-                            content: blocks,
-                            name: None,
-                            extensions: ExtensionMap::new(),
-                        });
-                    }
-                    other => {
-                        return Err(FrontendError::InvalidBody(format!(
-                            "unknown role in input item: {other}"
-                        )));
-                    }
+            InputItem::Message { role, content } => match role.as_str() {
+                "system" => {
+                    system.push(SystemInstruction {
+                        source: SystemSource::OpenAiSystem,
+                        content: decode_message_content(content),
+                    });
                 }
-            }
+                "developer" => {
+                    system.push(SystemInstruction {
+                        source: SystemSource::OpenAiDeveloper,
+                        content: decode_message_content(content),
+                    });
+                }
+                "user" | "assistant" => {
+                    let msg_role = if role == "user" {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    };
+                    let blocks = decode_message_content(content);
+                    out.push(Message {
+                        role: msg_role,
+                        content: blocks,
+                        name: None,
+                        extensions: ExtensionMap::new(),
+                    });
+                }
+                other => {
+                    return Err(FrontendError::InvalidBody(format!(
+                        "unknown role in input item: {other}"
+                    )));
+                }
+            },
             InputItem::FunctionCall {
                 id,
                 call_id,
                 name,
                 arguments,
             } => {
-                let args: Value = serde_json::from_str(&arguments)
-                    .unwrap_or(Value::String(arguments));
+                let args: Value =
+                    serde_json::from_str(&arguments).unwrap_or(Value::String(arguments));
                 out.push(Message {
                     role: MessageRole::Assistant,
                     content: vec![ContentBlock::ToolCall(ToolCallBlock {
-                        id: ToolCallId::from_provider(
-                            id.unwrap_or_else(|| call_id.clone()),
-                        ),
+                        id: ToolCallId::from_provider(id.unwrap_or_else(|| call_id.clone())),
                         name,
                         arguments: ToolCallArguments::Complete { value: args },
                         extensions: ExtensionMap::new(),
@@ -346,8 +337,7 @@ mod tests {
 
     #[test]
     fn decode_instructions_become_system() {
-        let body =
-            br#"{"model":"gpt-4o","input":"Hi","instructions":"Be helpful"}"#;
+        let body = br#"{"model":"gpt-4o","input":"Hi","instructions":"Be helpful"}"#;
         let req = decode(body).unwrap();
         assert_eq!(req.system.len(), 1);
     }
@@ -379,8 +369,7 @@ mod tests {
 
     #[test]
     fn decode_max_output_tokens() {
-        let body =
-            br#"{"model":"gpt-4o","input":"Hi","max_output_tokens":1024}"#;
+        let body = br#"{"model":"gpt-4o","input":"Hi","max_output_tokens":1024}"#;
         let req = decode(body).unwrap();
         assert_eq!(req.generation.max_tokens, Some(1024));
     }

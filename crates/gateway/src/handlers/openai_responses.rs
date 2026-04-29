@@ -20,10 +20,11 @@ fn extract_model(body: &[u8]) -> Result<String, super::HandlerError> {
     struct Minimal {
         model: String,
     }
-    let m: Minimal = serde_json::from_slice(body)
-        .map_err(|e| HandlerError::Frontend(agent_shim_frontends::FrontendError::InvalidBody(
-            format!("cannot extract model: {e}"),
-        )))?;
+    let m: Minimal = serde_json::from_slice(body).map_err(|e| {
+        HandlerError::Frontend(agent_shim_frontends::FrontendError::InvalidBody(format!(
+            "cannot extract model: {e}"
+        )))
+    })?;
     Ok(m.model)
 }
 
@@ -46,8 +47,7 @@ pub async fn handle(
         })?;
 
     let mut target = target;
-    if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model)
-    {
+    if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model) {
         if resolved != target.model {
             tracing::info!(
                 requested = %target.model,
@@ -112,13 +112,9 @@ pub async fn handle(
     let is_stream = canonical.stream;
 
     if is_stream {
-        let upstream_stream = super::anthropic_messages::spawn_provider_stream(
-            provider.clone(),
-            canonical,
-            target,
-        );
-        let frontend_response =
-            state.openai_responses.encode_stream(upstream_stream);
+        let upstream_stream =
+            super::anthropic_messages::spawn_provider_stream(provider.clone(), canonical, target);
+        let frontend_response = state.openai_responses.encode_stream(upstream_stream);
         tracing::info!(
             "← /v1/responses (stream) | model: {} → {} | {:.1}s",
             model_alias,
@@ -127,13 +123,10 @@ pub async fn handle(
         );
         Ok(frontend_response_to_axum(frontend_response))
     } else {
-        let stream = provider
-            .complete(canonical, target)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "provider.complete failed");
-                HandlerError::Provider(e)
-            })?;
+        let stream = provider.complete(canonical, target).await.map_err(|e| {
+            tracing::error!(error = %e, "provider.complete failed");
+            HandlerError::Provider(e)
+        })?;
         let response = collect_stream(stream).await?;
         let (input, output) = match &response.usage {
             Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),

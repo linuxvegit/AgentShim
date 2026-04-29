@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
-use crate::{BackendProvider, ProviderCapabilities, ProviderError};
+use crate::{BackendProvider, ProviderCapabilities, ProviderError, RawByteStream};
 
 pub struct OpenAiCompatibleProvider {
     name: &'static str,
@@ -66,6 +66,32 @@ impl OpenAiCompatibleProvider {
     fn chat_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         format!("{}/v1/chat/completions", base)
+    }
+
+    /// Build the upstream URL for the Responses API.
+    fn responses_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        format!("{}/v1/responses", base)
+    }
+
+    fn rewrite_model(
+        body: bytes::Bytes,
+        upstream_model: &str,
+    ) -> Result<bytes::Bytes, ProviderError> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let Some(object) = value.as_object_mut() else {
+            return Err(ProviderError::Decode(
+                "Responses request body must be a JSON object".to_string(),
+            ));
+        };
+        object.insert(
+            "model".to_string(),
+            serde_json::Value::String(upstream_model.to_string()),
+        );
+        serde_json::to_vec(&value)
+            .map(bytes::Bytes::from)
+            .map_err(|e| ProviderError::Encode(e.to_string()))
     }
 }
 
@@ -174,6 +200,56 @@ impl BackendProvider for OpenAiCompatibleProvider {
             return Ok(None);
         }
         Ok(Some(models))
+    }
+
+    async fn proxy_raw(
+        &self,
+        body: bytes::Bytes,
+        target: BackendTarget,
+    ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
+        let body = Self::rewrite_model(body, &target.model)?;
+        let mut request_builder = self
+            .client
+            .post(self.responses_url())
+            .bearer_auth(&self.api_key)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body);
+
+        for (k, v) in &self.default_headers {
+            request_builder = request_builder.header(k, v);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            warn!(
+                provider = self.name,
+                status = status.as_u16(),
+                body = %body_text,
+                "upstream returned error"
+            );
+            return Err(ProviderError::Upstream {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_string();
+
+        Ok(Some((content_type, Box::pin(response.bytes_stream()))))
     }
 }
 

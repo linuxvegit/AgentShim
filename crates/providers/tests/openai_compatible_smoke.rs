@@ -1,13 +1,8 @@
-/// Smoke tests for the OpenAI-compatible provider using mockito.
-use std::sync::Arc;
-
 use agent_shim_core::{
     BackendTarget, CanonicalRequest, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
-    GenerationOptions, MessageRole, RequestId, StreamEvent,
+    GenerationOptions, RequestId, StreamEvent,
 };
-use agent_shim_providers::{
-    openai_compatible::OpenAiCompatibleProvider, BackendProvider, ProviderRegistry,
-};
+use agent_shim_providers::{openai_compatible::OpenAiCompatibleProvider, BackendProvider};
 use futures::StreamExt;
 
 fn make_req(stream: bool) -> CanonicalRequest {
@@ -99,6 +94,51 @@ async fn unary_returns_correct_event_sequence() {
         .iter()
         .any(|e| matches!(e, StreamEvent::ResponseStop { .. })));
 
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn proxy_raw_responses_posts_to_responses_and_rewrites_model() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/responses")
+        .match_header("authorization", "Bearer test-key")
+        .match_body(r#"{"model":"gpt-upstream","input":"Hello","stream":true}"#)
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("event: response.completed\ndata: {\"id\":\"resp_1\"}\n\n")
+        .create_async()
+        .await;
+
+    let provider =
+        OpenAiCompatibleProvider::new("openai", server.url(), "test-key", Default::default(), 30)
+            .unwrap();
+    let target = BackendTarget {
+        provider: "openai".to_string(),
+        model: "gpt-upstream".to_string(),
+    };
+
+    let Some((content_type, mut stream)) = provider
+        .proxy_raw(
+            bytes::Bytes::from_static(br#"{"model":"alias","input":"Hello","stream":true}"#),
+            target,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected raw proxy support");
+    };
+
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk.unwrap());
+    }
+
+    assert_eq!(content_type, "text/event-stream");
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        "event: response.completed\ndata: {\"id\":\"resp_1\"}\n\n"
+    );
     mock.assert_async().await;
 }
 

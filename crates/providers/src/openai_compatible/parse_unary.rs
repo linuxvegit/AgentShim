@@ -128,18 +128,16 @@ fn parse_inner(body: &[u8]) -> Result<Vec<StreamEvent>, String> {
     }
 
     // Usage
-    let usage = v.get("usage").and_then(|u| {
-        Some(Usage {
-            input_tokens: u
-                .get("prompt_tokens")
-                .and_then(|x| x.as_u64())
-                .map(|x| x as u32),
-            output_tokens: u
-                .get("completion_tokens")
-                .and_then(|x| x.as_u64())
-                .map(|x| x as u32),
-            ..Default::default()
-        })
+    let usage = v.get("usage").map(|u| Usage {
+        input_tokens: u
+            .get("prompt_tokens")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32),
+        output_tokens: u
+            .get("completion_tokens")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32),
+        ..Default::default()
     });
 
     events.push(StreamEvent::MessageStop {

@@ -12,7 +12,9 @@ pub static SENSITIVE_HEADERS: &[&str] = &[
 
 /// Returns true if the header name is considered sensitive (case-insensitive).
 pub fn is_sensitive(header: &str) -> bool {
-    SENSITIVE_HEADERS.iter().any(|&s| s.eq_ignore_ascii_case(header))
+    SENSITIVE_HEADERS
+        .iter()
+        .any(|&s| s.eq_ignore_ascii_case(header))
 }
 
 #[cfg(test)]

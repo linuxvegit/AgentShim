@@ -27,9 +27,9 @@ where
                 let parsed: serde_json::Value = match serde_json::from_str(data) {
                     Ok(v) => v,
                     Err(e) => {
-                        return futures::stream::iter(vec![Err(StreamError::Decode(
-                            format!("json parse for {event_type}: {e}"),
-                        ))]);
+                        return futures::stream::iter(vec![Err(StreamError::Decode(format!(
+                            "json parse for {event_type}: {e}"
+                        )))]);
                     }
                 };
 
@@ -56,35 +56,25 @@ fn parse_event(
     let mut events = Vec::new();
 
     match event_type {
-        "response.created" | "response.in_progress" => {
-            if !*emitted_response_start {
-                *emitted_response_start = true;
-                let id = data
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let model = data
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let created = data
-                    .get("created_at")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                events.push(Ok(StreamEvent::ResponseStart {
-                    id: ResponseId(id.to_string()),
-                    model: model.to_string(),
-                    created_at_unix: created,
-                }));
-            }
+        "response.created" | "response.in_progress" if !*emitted_response_start => {
+            *emitted_response_start = true;
+            let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let model = data
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let created = data.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            events.push(Ok(StreamEvent::ResponseStart {
+                id: ResponseId(id.to_string()),
+                model: model.to_string(),
+                created_at_unix: created,
+            }));
         }
+        "response.created" | "response.in_progress" => {}
 
         "response.output_item.added" => {
             let item = data.get("item").unwrap_or(data);
-            let item_type = item
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let output_index = data
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -105,14 +95,8 @@ fn parse_event(
                     }));
                 }
                 "function_call" => {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let name = item
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     events.push(Ok(StreamEvent::ContentBlockStart {
                         index: output_index,
                         kind: ContentBlockKind::ToolCall,
@@ -128,10 +112,7 @@ fn parse_event(
         }
 
         "response.output_text.delta" => {
-            let delta = data
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let delta = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             let output_index = data
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -145,10 +126,7 @@ fn parse_event(
         }
 
         "response.function_call_arguments.delta" => {
-            let delta = data
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let delta = data.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             let output_index = data
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -171,10 +149,7 @@ fn parse_event(
 
         "response.output_item.done" => {
             let item = data.get("item").unwrap_or(data);
-            let item_type = item
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let output_index = data
                 .get("output_index")
                 .and_then(|v| v.as_u64())
@@ -214,18 +189,16 @@ fn parse_event(
             }));
 
             // Extract usage
-            let usage = data.get("usage").and_then(|u| {
-                Some(Usage {
-                    input_tokens: u
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                    output_tokens: u
-                        .get("output_tokens")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as u32),
-                    ..Default::default()
-                })
+            let usage = data.get("usage").map(|u| Usage {
+                input_tokens: u
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32),
+                output_tokens: u
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32),
+                ..Default::default()
             });
             events.push(Ok(StreamEvent::ResponseStop { usage }));
         }

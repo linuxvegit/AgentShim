@@ -115,41 +115,34 @@ pub fn encode(
                 }
                 s.block_kinds[idx] = kind;
 
-                let payload = match kind {
-                    ContentBlockKind::Text => ContentBlockStartPayload::Text {
-                        text: String::new(),
-                    },
-                    ContentBlockKind::ToolCall => {
-                        // We don't know id/name until ToolCallStart; emit a placeholder
-                        ContentBlockStartPayload::ToolUse {
-                            id: String::new(),
-                            name: String::new(),
-                            input: String::new(),
+                if kind != ContentBlockKind::ToolCall {
+                    let payload = match kind {
+                        ContentBlockKind::Text => ContentBlockStartPayload::Text {
+                            text: String::new(),
+                        },
+                        ContentBlockKind::Reasoning => ContentBlockStartPayload::Thinking {
+                            thinking: String::new(),
+                        },
+                        ContentBlockKind::RedactedReasoning => {
+                            ContentBlockStartPayload::RedactedThinking {
+                                data: String::new(),
+                            }
                         }
+                        _ => ContentBlockStartPayload::Text {
+                            text: String::new(),
+                        },
+                    };
+                    let ev = OutboundEvent::ContentBlockStart {
+                        index,
+                        content_block: payload,
+                    };
+                    if let Some(b) = serialize_event(&ev) {
+                        chunks.push(Ok(b));
                     }
-                    ContentBlockKind::Reasoning => ContentBlockStartPayload::Thinking {
-                        thinking: String::new(),
-                    },
-                    ContentBlockKind::RedactedReasoning => {
-                        ContentBlockStartPayload::RedactedThinking {
-                            data: String::new(),
-                        }
-                    }
-                    _ => ContentBlockStartPayload::Text {
-                        text: String::new(),
-                    },
-                };
-                let ev = OutboundEvent::ContentBlockStart {
-                    index,
-                    content_block: payload,
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
                 }
             }
 
             StreamEvent::ToolCallStart { index, id, name } => {
-                // Emit a content_block_start for the tool_use block with real id/name
                 let ev = OutboundEvent::ContentBlockStart {
                     index,
                     content_block: ContentBlockStartPayload::ToolUse {
@@ -279,19 +272,22 @@ pub fn encode(
     // Terminate the output stream after message_stop. The flat_map emits an
     // empty Bytes sentinel after the message_stop SSE event. scan() yields all
     // items up to (but not including) the sentinel, then returns None to end.
-    let terminate_on_sentinel =
-        |stream: BoxStream<'static, Result<Bytes, crate::FrontendError>>| -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-            stream
-                .scan((), |(), item| {
-                    let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
-                    if is_sentinel {
-                        futures::future::ready(None)
-                    } else {
-                        futures::future::ready(Some(item))
-                    }
-                })
-                .boxed()
-        };
+    let terminate_on_sentinel = |stream: BoxStream<
+        'static,
+        Result<Bytes, crate::FrontendError>,
+    >|
+     -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+        stream
+            .scan((), |(), item| {
+                let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
+                if is_sentinel {
+                    futures::future::ready(None)
+                } else {
+                    futures::future::ready(Some(item))
+                }
+            })
+            .boxed()
+    };
 
     // Optionally interleave keepalive pings
     if let Some(interval) = keepalive {
@@ -308,5 +304,67 @@ pub fn encode(
         terminate_on_sentinel(merged.boxed())
     } else {
         terminate_on_sentinel(event_stream.boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_shim_core::{
+        ids::{ResponseId, ToolCallId},
+        message::MessageRole,
+        stream::CanonicalStream,
+        StopReason, StreamError,
+    };
+    use futures::stream;
+
+    async fn collect_stream(stream: CanonicalStream) -> String {
+        let bytes = encode(stream, None)
+            .fold(Vec::new(), |mut out, item| async move {
+                out.extend_from_slice(&item.expect("stream item"));
+                out
+            })
+            .await;
+        String::from_utf8(bytes).expect("utf8 stream")
+    }
+
+    #[tokio::test]
+    async fn tool_call_start_emits_single_content_block_start() {
+        let events: Vec<Result<StreamEvent, StreamError>> = vec![
+            Ok(StreamEvent::ResponseStart {
+                id: ResponseId("msg_1".to_string()),
+                model: "claude-test".to_string(),
+                created_at_unix: 1,
+            }),
+            Ok(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                kind: ContentBlockKind::ToolCall,
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                index: 0,
+                id: ToolCallId::from_provider("call_1"),
+                name: "search".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                json_fragment: "{}".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallStop { index: 0 }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+            Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+                stop_sequence: None,
+            }),
+            Ok(StreamEvent::ResponseStop { usage: None }),
+        ];
+
+        let body = collect_stream(Box::pin(stream::iter(events))).await;
+
+        assert_eq!(body.matches("event: content_block_start").count(), 1);
+        assert!(body.contains("call_1"));
+        assert!(body.contains("search"));
     }
 }

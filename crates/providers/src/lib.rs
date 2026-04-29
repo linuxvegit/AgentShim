@@ -12,8 +12,9 @@ use thiserror::Error;
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
 /// A raw byte stream from an upstream provider, for passthrough proxying.
-pub type RawByteStream =
-    std::pin::Pin<Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+pub type RawByteStream = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
+>;
 
 #[derive(Debug, Clone, Default)]
 pub struct ProviderCapabilities {

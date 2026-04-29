@@ -167,8 +167,7 @@ impl BackendProvider for CopilotProvider {
         let request_id = Uuid::new_v4().to_string();
         let is_stream = req.stream;
 
-        let use_responses_api =
-            req.frontend.kind == agent_shim_core::FrontendKind::OpenAiResponses;
+        let use_responses_api = req.frontend.kind == agent_shim_core::FrontendKind::OpenAiResponses;
 
         let (url, body_value) = if use_responses_api {
             let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));
@@ -263,12 +262,13 @@ impl BackendProvider for CopilotProvider {
     async fn proxy_raw(
         &self,
         body: bytes::Bytes,
-        _target: BackendTarget,
+        target: BackendTarget,
     ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
         let token = self.manager.get().await?;
         let api_base = token.api_base.clone();
         let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));
         let request_id = Uuid::new_v4().to_string();
+        let body = rewrite_responses_model(body, &target.model)?;
 
         let headers = Self::build_copilot_headers(&token, &request_id, true)?;
 
@@ -311,4 +311,24 @@ impl BackendProvider for CopilotProvider {
 
         Ok(Some((content_type, Box::pin(response.bytes_stream()))))
     }
+}
+
+fn rewrite_responses_model(
+    body: bytes::Bytes,
+    upstream_model: &str,
+) -> Result<bytes::Bytes, ProviderError> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| ProviderError::Decode(e.to_string()))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(ProviderError::Decode(
+            "Responses request body must be a JSON object".to_string(),
+        ));
+    };
+    object.insert(
+        "model".to_string(),
+        serde_json::Value::String(upstream_model.to_string()),
+    );
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|e| ProviderError::Encode(e.to_string()))
 }
