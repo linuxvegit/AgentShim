@@ -179,7 +179,11 @@ pub fn encode(
                 }
             }
 
-            StreamEvent::ToolCallStop { index } | StreamEvent::ContentBlockStop { index } => {
+            StreamEvent::ToolCallStop { .. } => {
+                // Absorbed — ContentBlockStop handles closing the block
+            }
+
+            StreamEvent::ContentBlockStop { index } => {
                 let ev = OutboundEvent::ContentBlockStop { index };
                 if let Some(b) = serialize_event(&ev) {
                     chunks.push(Ok(b));
@@ -244,14 +248,33 @@ pub fn encode(
         futures_util::stream::iter(chunks)
     });
 
-    // Optionally interleave keepalive pings
+    // Optionally interleave keepalive pings — but stop once the event stream ends
     if let Some(interval) = keepalive {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+
+        // Wrap event stream to signal completion
+        let event_stream = event_stream.chain(futures_util::stream::once(async move {
+            done.store(true, Ordering::SeqCst);
+            // This item is filtered out below
+            Ok(Bytes::new())
+        })).filter(|item| {
+            let keep = match item {
+                Ok(b) => !b.is_empty(),
+                Err(_) => true,
+            };
+            futures::future::ready(keep)
+        });
+
         use tokio_stream::wrappers::IntervalStream;
         let ping_stream = IntervalStream::new(tokio::time::interval(interval))
+            .take_while(move |_| {
+                let is_done = done2.load(Ordering::SeqCst);
+                futures::future::ready(!is_done)
+            })
             .map(|_| Ok::<Bytes, crate::FrontendError>(sse::comment("ping")));
 
-        // Merge: emit whichever chunk arrives first. Since the event stream is
-        // faster, pings only fire during true silence.
         let merged = futures_util::stream::select(event_stream, ping_stream);
         merged.boxed()
     } else {
