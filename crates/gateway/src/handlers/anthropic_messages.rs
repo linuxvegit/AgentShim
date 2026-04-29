@@ -108,11 +108,6 @@ pub async fn handle(
         ))
     })?;
 
-    let stream = provider.complete(canonical, target).await.map_err(|e| {
-        tracing::error!(error = %e, "provider.complete failed");
-        HandlerError::Provider(e)
-    })?;
-
     if is_stream {
         let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
 
@@ -123,7 +118,33 @@ pub async fn handle(
             started,
         };
 
-        let logging_stream = stream.map({
+        // Spawn upstream request so we can return the SSE response immediately
+        // with keepalive pings while waiting for the upstream to respond.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
+        tokio::spawn(async move {
+            match provider.complete(canonical, target).await {
+                Ok(mut upstream) => {
+                    use futures::StreamExt as _;
+                    while let Some(event) = upstream.next().await {
+                        if tx.send(event).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "provider.complete failed");
+                    let _ = tx
+                        .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
+                        .await;
+                }
+            }
+        });
+
+        let upstream_stream = futures::stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        let logging_stream = upstream_stream.map({
             let usage_capture = usage_capture.clone();
             move |event| {
                 if let Ok(ref ev) = event {
@@ -166,6 +187,10 @@ pub async fn handle(
             _ => unreachable!(),
         }
     } else {
+        let stream = provider.complete(canonical, target).await.map_err(|e| {
+            tracing::error!(error = %e, "provider.complete failed");
+            HandlerError::Provider(e)
+        })?;
         let response = collect_stream(stream).await?;
         let (input, output) = match &response.usage {
             Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),

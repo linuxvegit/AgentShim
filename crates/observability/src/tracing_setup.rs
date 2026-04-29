@@ -4,7 +4,10 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// Initialize the global tracing subscriber based on config.
 /// Safe to call once per process. Subsequent calls are no-ops if a subscriber is already set.
 pub fn init(config: &LoggingConfig) {
-    let filter = EnvFilter::try_new(&config.filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            EnvFilter::try_new(&config.filter).unwrap_or_else(|_| EnvFilter::new("info"))
+        });
 
     match config.format {
         LogFormat::Json => {

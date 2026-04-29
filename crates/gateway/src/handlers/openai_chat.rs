@@ -62,17 +62,39 @@ pub async fn handle(
 
     let is_stream = canonical.stream;
 
-    // Call backend
-    let stream = provider
-        .complete(canonical, target)
-        .await
-        .map_err(HandlerError::Provider)?;
-
-    // Encode response
     if is_stream {
-        let frontend_response = state.openai.encode_stream(stream);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
+        tokio::spawn(async move {
+            match provider.complete(canonical, target).await {
+                Ok(mut upstream) => {
+                    use futures::StreamExt as _;
+                    while let Some(event) = upstream.next().await {
+                        if tx.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "provider.complete failed");
+                    let _ = tx
+                        .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
+                        .await;
+                }
+            }
+        });
+
+        let upstream_stream: agent_shim_core::CanonicalStream = Box::pin(
+            futures::stream::unfold(rx, |mut rx| async {
+                rx.recv().await.map(|item| (item, rx))
+            }),
+        );
+        let frontend_response = state.openai.encode_stream(upstream_stream);
         Ok(frontend_response_to_axum(frontend_response))
     } else {
+        let stream = provider
+            .complete(canonical, target)
+            .await
+            .map_err(HandlerError::Provider)?;
         let response = collect_stream(stream).await?;
         let frontend_response = state
             .openai

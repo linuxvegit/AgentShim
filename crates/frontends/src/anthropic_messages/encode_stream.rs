@@ -60,11 +60,26 @@ pub fn encode(
 
     let state = Arc::new(Mutex::new(EncoderState::new()));
     let done = Arc::new(AtomicBool::new(false));
-    let done_for_stream = Arc::clone(&done);
+    let done_for_flat_map = Arc::clone(&done);
+
+    // Stop consuming canonical events after MessageStop. We use take_while on
+    // the canonical stream so that flat_map never sees events after MessageStop.
+    // MessageStop itself passes through (take_while checks BEFORE the item is
+    // yielded, so we use a "seen" flag that triggers on the NEXT item).
+    let seen_message_stop = AtomicBool::new(false);
+    let canonical = canonical.take_while(move |item| {
+        if seen_message_stop.load(Ordering::SeqCst) {
+            return futures::future::ready(false);
+        }
+        if let Ok(StreamEvent::MessageStop { .. }) = item {
+            seen_message_stop.store(true, Ordering::SeqCst);
+        }
+        futures::future::ready(true)
+    });
 
     let event_stream = canonical.flat_map(move |item| {
         let state = Arc::clone(&state);
-        let done = Arc::clone(&done_for_stream);
+        let done = Arc::clone(&done_for_flat_map);
         let mut chunks: Vec<Result<Bytes, crate::FrontendError>> = Vec::new();
 
         let stream_event = match item {
