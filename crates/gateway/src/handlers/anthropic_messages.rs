@@ -11,7 +11,7 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 
 use agent_shim_core::{
-    CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason,
+    BackendTarget, CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason,
     StreamEvent, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
@@ -68,6 +68,22 @@ pub async fn handle(
         .router
         .resolve(FrontendKind::AnthropicMessages, &model_alias)
         .map_err(|e| { tracing::warn!(model = %model_alias, error = %e, "no route"); HandlerError::Route(e) })?;
+
+    let mut target = target;
+    if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model) {
+        if resolved != target.model {
+            tracing::info!(
+                requested = %target.model,
+                resolved = %resolved,
+                provider = %target.provider,
+                "fuzzy model match"
+            );
+            target = BackendTarget {
+                provider: target.provider,
+                model: resolved.to_string(),
+            };
+        }
+    }
 
     let upstream_model = target.model.clone();
 
