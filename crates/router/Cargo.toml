@@ -14,3 +14,6 @@ agent-shim-config = { path = "../config" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }

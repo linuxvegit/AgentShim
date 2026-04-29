@@ -114,6 +114,7 @@ impl ModelIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn index_with(provider: &str, models: &[&str]) -> ModelIndex {
         let set: BTreeSet<String> = models.iter().map(|s| s.to_string()).collect();
@@ -179,5 +180,14 @@ mod tests {
     fn tie_breaking_prefers_shorter_then_alphabetical() {
         let idx = index_with("p", &["model-b", "model-a"]);
         assert_eq!(idx.resolve("p", "model"), Some("model-a"));
+    }
+
+    proptest! {
+        #[test]
+        fn exact_match_always_wins(model in "[a-z][a-z0-9-]{1,30}") {
+            let idx = index_with("p", &[&model, "unrelated-model-xyz"]);
+            let result = idx.resolve("p", &model);
+            prop_assert_eq!(result, Some(model.as_str()));
+        }
     }
 }
