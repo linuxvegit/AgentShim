@@ -10,16 +10,13 @@ use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::Mutex;
 
-use agent_shim_core::{
-    BackendTarget, CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason,
-    StreamEvent, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
-};
+use agent_shim_core::{BackendTarget, FrontendKind, StreamEvent, Usage};
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_router::Router;
 
 use crate::state::AppState;
 
-use super::HandlerError;
+use super::{collect_stream, HandlerError};
 
 struct StreamLogger {
     model_alias: String,
@@ -48,6 +45,40 @@ impl Drop for StreamLogger {
             elapsed.as_secs_f64()
         );
     }
+}
+
+/// Spawn the upstream provider call on a background task and return a CanonicalStream.
+/// Used by both Anthropic and OpenAI handlers.
+pub(crate) fn spawn_provider_stream(
+    provider: Arc<dyn agent_shim_providers::BackendProvider>,
+    canonical: agent_shim_core::CanonicalRequest,
+    target: BackendTarget,
+) -> agent_shim_core::CanonicalStream {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
+
+    tokio::spawn(async move {
+        match provider.complete(canonical, target).await {
+            Ok(mut upstream) => {
+                use futures::StreamExt as _;
+                while let Some(event) = upstream.next().await {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "provider.complete failed");
+                let _ = tx
+                    .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
+                    .await;
+            }
+        }
+    });
+
+    Box::pin(futures::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    }))
 }
 
 pub async fn handle(
@@ -118,31 +149,7 @@ pub async fn handle(
             started,
         };
 
-        // Spawn upstream request so we can return the SSE response immediately
-        // with keepalive pings while waiting for the upstream to respond.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
-        tokio::spawn(async move {
-            match provider.complete(canonical, target).await {
-                Ok(mut upstream) => {
-                    use futures::StreamExt as _;
-                    while let Some(event) = upstream.next().await {
-                        if tx.send(event).await.is_err() {
-                            break; // client disconnected
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "provider.complete failed");
-                    let _ = tx
-                        .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
-                        .await;
-                }
-            }
-        });
-
-        let upstream_stream = futures::stream::unfold(rx, |mut rx| async {
-            rx.recv().await.map(|item| (item, rx))
-        });
+        let upstream_stream = spawn_provider_stream(provider.clone(), canonical, target);
 
         let logging_stream = upstream_stream.map({
             let usage_capture = usage_capture.clone();
@@ -170,7 +177,6 @@ pub async fn handle(
                 content_type,
                 stream: sse_stream,
             } => {
-                // Wrap the SSE stream so the logger is held alive and dropped when stream ends
                 let guarded_stream = GuardedStream {
                     inner: sse_stream,
                     _logger: logger,
@@ -224,7 +230,6 @@ pub async fn handle(
     }
 }
 
-/// Wraps an SSE stream and holds the StreamLogger, which logs on drop.
 struct GuardedStream<S> {
     inner: S,
     _logger: StreamLogger,
@@ -238,94 +243,4 @@ impl<S: futures::Stream + Unpin> futures::Stream for GuardedStream<S> {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
-}
-
-pub(crate) async fn collect_stream(
-    mut stream: agent_shim_core::CanonicalStream,
-) -> Result<CanonicalResponse, HandlerError> {
-    let mut id = ResponseId::new();
-    let mut model = String::new();
-    let mut content: Vec<ContentBlock> = Vec::new();
-    let mut stop_reason = StopReason::EndTurn;
-    let mut stop_sequence: Option<String> = None;
-    let mut usage: Option<Usage> = None;
-
-    let mut tool_names: std::collections::HashMap<u32, (ToolCallId, String)> =
-        std::collections::HashMap::new();
-    let mut tool_args: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-    let mut text_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-
-    while let Some(ev) = stream.next().await {
-        let ev = ev.map_err(|e| {
-            HandlerError::Provider(agent_shim_providers::ProviderError::Decode(e.to_string()))
-        })?;
-        match ev {
-            StreamEvent::ResponseStart {
-                id: rid, model: m, ..
-            } => {
-                id = rid;
-                model = m;
-            }
-            StreamEvent::TextDelta { index, text } => {
-                text_buf.entry(index).or_default().push_str(&text);
-            }
-            StreamEvent::ContentBlockStop { index } => {
-                if let Some(text) = text_buf.remove(&index) {
-                    content.push(ContentBlock::text(text));
-                }
-                if let Some((tc_id, name)) = tool_names.remove(&index) {
-                    let args_str = tool_args.remove(&index).unwrap_or_default();
-                    let args_val: serde_json::Value =
-                        serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
-                    content.push(ContentBlock::ToolCall(ToolCallBlock {
-                        id: tc_id,
-                        name,
-                        arguments: ToolCallArguments::Complete { value: args_val },
-                        extensions: Default::default(),
-                    }));
-                }
-            }
-            StreamEvent::ToolCallStart {
-                index,
-                id: tc_id,
-                name,
-            } => {
-                tool_names.insert(index, (tc_id, name));
-            }
-            StreamEvent::ToolCallArgumentsDelta {
-                index,
-                json_fragment,
-            } => {
-                tool_args.entry(index).or_default().push_str(&json_fragment);
-            }
-            StreamEvent::MessageStop {
-                stop_reason: sr,
-                stop_sequence: ss,
-            } => {
-                stop_reason = sr;
-                stop_sequence = ss;
-            }
-            StreamEvent::UsageDelta { usage: u } | StreamEvent::ResponseStop { usage: Some(u) } => {
-                usage = Some(u);
-            }
-            StreamEvent::Error { message } => {
-                return Err(HandlerError::Provider(
-                    agent_shim_providers::ProviderError::Upstream {
-                        status: 200,
-                        body: message,
-                    },
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(CanonicalResponse {
-        id,
-        model,
-        content,
-        stop_reason,
-        stop_sequence,
-        usage,
-    })
 }

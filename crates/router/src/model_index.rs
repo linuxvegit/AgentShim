@@ -96,6 +96,14 @@ impl ModelIndex {
 
     pub fn resolve(&self, provider: &str, requested: &str) -> Option<&str> {
         let entries = self.providers.get(provider)?;
+
+        // Fast path: exact case-insensitive match avoids tokenize() allocation
+        for entry in entries {
+            if entry.normalized.eq_ignore_ascii_case(requested) {
+                return Some(entry.original.as_str());
+            }
+        }
+
         let req_norm = requested.to_lowercase();
         let req_tokens = tokenize(requested);
 

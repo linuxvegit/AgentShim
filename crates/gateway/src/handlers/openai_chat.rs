@@ -1,29 +1,19 @@
-use axum::{
-    body::Body,
-    extract::State,
-    http::{HeaderMap, HeaderValue},
-    response::Response,
-};
+use axum::{extract::State, http::HeaderMap, response::Response};
 use bytes::Bytes;
-use futures::StreamExt;
 
-use agent_shim_core::{
-    BackendTarget, CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason,
-    StreamEvent, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
-};
-use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
+use agent_shim_core::{BackendTarget, FrontendKind};
+use agent_shim_frontends::FrontendProtocol;
 use agent_shim_router::Router;
 
 use crate::state::AppState;
 
-use super::HandlerError;
+use super::{collect_stream, frontend_response_to_axum, HandlerError};
 
 pub async fn handle(
     State(state): State<AppState>,
     _headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HandlerError> {
-    // Decode request using OpenAI frontend
     let canonical = state
         .openai
         .decode_request(&body)
@@ -31,7 +21,6 @@ pub async fn handle(
 
     let model_alias = canonical.model.as_str().to_string();
 
-    // Route
     let target = state
         .router
         .resolve(FrontendKind::OpenAiChat, &model_alias)
@@ -53,7 +42,6 @@ pub async fn handle(
         }
     }
 
-    // Get provider
     let provider = state.providers.get(&target.provider).ok_or_else(|| {
         HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
             target.provider.clone(),
@@ -63,31 +51,8 @@ pub async fn handle(
     let is_stream = canonical.stream;
 
     if is_stream {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
-        tokio::spawn(async move {
-            match provider.complete(canonical, target).await {
-                Ok(mut upstream) => {
-                    use futures::StreamExt as _;
-                    while let Some(event) = upstream.next().await {
-                        if tx.send(event).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "provider.complete failed");
-                    let _ = tx
-                        .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
-                        .await;
-                }
-            }
-        });
-
-        let upstream_stream: agent_shim_core::CanonicalStream = Box::pin(
-            futures::stream::unfold(rx, |mut rx| async {
-                rx.recv().await.map(|item| (item, rx))
-            }),
-        );
+        let upstream_stream =
+            super::anthropic_messages::spawn_provider_stream(provider.clone(), canonical, target);
         let frontend_response = state.openai.encode_stream(upstream_stream);
         Ok(frontend_response_to_axum(frontend_response))
     } else {
@@ -102,121 +67,4 @@ pub async fn handle(
             .map_err(HandlerError::Frontend)?;
         Ok(frontend_response_to_axum(frontend_response))
     }
-}
-
-fn frontend_response_to_axum(resp: FrontendResponse) -> Response {
-    match resp {
-        FrontendResponse::Unary { content_type, body } => {
-            let mut r = Response::new(Body::from(body));
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
-            );
-            r
-        }
-        FrontendResponse::Stream {
-            content_type,
-            stream,
-        } => {
-            let body = Body::from_stream(stream.map(|r| r.map_err(|e| e.to_string())));
-            let mut r = Response::new(body);
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
-            );
-            r
-        }
-    }
-}
-
-async fn collect_stream(
-    mut stream: agent_shim_core::CanonicalStream,
-) -> Result<CanonicalResponse, HandlerError> {
-    let mut id = ResponseId::new();
-    let mut model = String::new();
-    let mut content: Vec<ContentBlock> = Vec::new();
-    let mut stop_reason = StopReason::EndTurn;
-    let mut stop_sequence: Option<String> = None;
-    let mut usage: Option<Usage> = None;
-
-    let mut tool_names: std::collections::HashMap<u32, (ToolCallId, String)> =
-        std::collections::HashMap::new();
-    let mut tool_args: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-    let mut text_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-
-    while let Some(ev) = stream.next().await {
-        let ev = ev.map_err(|e| {
-            HandlerError::Provider(agent_shim_providers::ProviderError::Decode(e.to_string()))
-        })?;
-        match ev {
-            StreamEvent::ResponseStart {
-                id: rid, model: m, ..
-            } => {
-                id = rid;
-                model = m;
-            }
-            StreamEvent::TextDelta { index, text } => {
-                text_buf.entry(index).or_default().push_str(&text);
-            }
-            StreamEvent::ContentBlockStop { index } => {
-                if let Some(text) = text_buf.remove(&index) {
-                    content.push(ContentBlock::text(text));
-                }
-                if let Some((tc_id, name)) = tool_names.remove(&index) {
-                    let args_str = tool_args.remove(&index).unwrap_or_default();
-                    let args_val: serde_json::Value =
-                        serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
-                    content.push(ContentBlock::ToolCall(ToolCallBlock {
-                        id: tc_id,
-                        name,
-                        arguments: ToolCallArguments::Complete { value: args_val },
-                        extensions: Default::default(),
-                    }));
-                }
-            }
-            StreamEvent::ToolCallStart {
-                index,
-                id: tc_id,
-                name,
-            } => {
-                tool_names.insert(index, (tc_id, name));
-            }
-            StreamEvent::ToolCallArgumentsDelta {
-                index,
-                json_fragment,
-            } => {
-                tool_args.entry(index).or_default().push_str(&json_fragment);
-            }
-            StreamEvent::MessageStop {
-                stop_reason: sr,
-                stop_sequence: ss,
-            } => {
-                stop_reason = sr;
-                stop_sequence = ss;
-            }
-            StreamEvent::UsageDelta { usage: u } | StreamEvent::ResponseStop { usage: Some(u) } => {
-                usage = Some(u);
-            }
-            StreamEvent::Error { message } => {
-                return Err(HandlerError::Provider(
-                    agent_shim_providers::ProviderError::Upstream {
-                        status: 200,
-                        body: message,
-                    },
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(CanonicalResponse {
-        id,
-        model,
-        content,
-        stop_reason,
-        stop_sequence,
-        usage,
-    })
 }

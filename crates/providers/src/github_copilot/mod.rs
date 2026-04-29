@@ -36,13 +36,17 @@ pub struct CopilotProvider {
 }
 
 impl CopilotProvider {
+    fn build_http_client() -> Result<reqwest::Client, ProviderError> {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| ProviderError::Network(e.to_string()))
+    }
+
     /// Create and start a `CopilotProvider` using credentials stored at `credential_path`.
     /// Credentials are loaded lazily on first request, so the file doesn't need to exist at startup.
     pub fn spawn(credential_path: PathBuf) -> Result<Self, ProviderError> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let http = Self::build_http_client()?;
 
         let manager = CopilotTokenManager::new_lazy(http.clone(), credential_path);
 
@@ -63,10 +67,7 @@ impl CopilotProvider {
         creds: StoredCredentials,
         base_url: String,
     ) -> Result<Self, ProviderError> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let http = Self::build_http_client()?;
 
         let manager = CopilotTokenManager::new(http.clone(), creds, base_url);
 
