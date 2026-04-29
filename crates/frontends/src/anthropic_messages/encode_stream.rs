@@ -56,10 +56,15 @@ pub fn encode(
     canonical: agent_shim_core::stream::CanonicalStream,
     keepalive: Option<Duration>,
 ) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let state = Arc::new(Mutex::new(EncoderState::new()));
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_stream = Arc::clone(&done);
 
     let event_stream = canonical.flat_map(move |item| {
         let state = Arc::clone(&state);
+        let done = Arc::clone(&done_for_stream);
         let mut chunks: Vec<Result<Bytes, crate::FrontendError>> = Vec::new();
 
         let stream_event = match item {
@@ -235,6 +240,7 @@ pub fn encode(
                 if let Some(b) = serialize_event(&OutboundEvent::MessageStop) {
                     chunks.push(Ok(b));
                 }
+                done.store(true, Ordering::SeqCst);
             }
 
             StreamEvent::ResponseStop { usage } => {
@@ -269,31 +275,13 @@ pub fn encode(
         futures_util::stream::iter(chunks)
     });
 
-    // Optionally interleave keepalive pings — but stop once the event stream ends
+    // Optionally interleave keepalive pings — stop once message_stop is emitted
     if let Some(interval) = keepalive {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let done = Arc::new(AtomicBool::new(false));
-        let done2 = done.clone();
-
-        // Wrap event stream to signal completion
-        let event_stream = event_stream
-            .chain(futures_util::stream::once(async move {
-                done.store(true, Ordering::SeqCst);
-                // This item is filtered out below
-                Ok(Bytes::new())
-            }))
-            .filter(|item| {
-                let keep = match item {
-                    Ok(b) => !b.is_empty(),
-                    Err(_) => true,
-                };
-                futures::future::ready(keep)
-            });
-
         use tokio_stream::wrappers::IntervalStream;
+        let done2 = done;
         let ping_stream = IntervalStream::new(tokio::time::interval(interval))
             .take_while(move |_| {
-                let is_done = done2.load(Ordering::SeqCst);
+                let is_done = done2.load(std::sync::atomic::Ordering::SeqCst);
                 futures::future::ready(!is_done)
             })
             .map(|_| Ok::<Bytes, crate::FrontendError>(sse::comment("ping")));
