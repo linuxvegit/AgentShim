@@ -4,6 +4,7 @@ pub mod static_routes;
 pub mod fallback;
 pub mod rate_limit;
 pub mod circuit_breaker;
+pub mod model_index;
 
 use thiserror::Error;
 
