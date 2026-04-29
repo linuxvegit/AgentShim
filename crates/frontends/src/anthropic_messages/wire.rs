@@ -93,11 +93,16 @@ pub enum ToolResultContent {
     Blocks(Vec<Value>),
 }
 
+fn default_empty_object() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct InboundTool {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default = "default_empty_object")]
     pub input_schema: Value,
     #[serde(default)]
     pub cache_control: Option<Value>,
