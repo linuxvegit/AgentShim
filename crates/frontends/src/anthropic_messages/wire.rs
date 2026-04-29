@@ -132,10 +132,20 @@ pub struct MessagesResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboundContentBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
-    Thinking { thinking: String },
-    RedactedThinking { data: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    Thinking {
+        thinking: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -191,10 +201,20 @@ pub struct MessageStartPayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockStartPayload {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: String },
-    Thinking { thinking: String },
-    RedactedThinking { data: String },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

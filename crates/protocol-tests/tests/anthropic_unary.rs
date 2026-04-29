@@ -4,7 +4,9 @@ use agent_shim_core::{
     response::CanonicalResponse,
     usage::{StopReason, Usage},
 };
-use agent_shim_frontends::{anthropic_messages::AnthropicMessages, FrontendProtocol, FrontendResponse};
+use agent_shim_frontends::{
+    anthropic_messages::AnthropicMessages, FrontendProtocol, FrontendResponse,
+};
 
 #[test]
 fn anthropic_unary_text_response() {

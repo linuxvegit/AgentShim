@@ -7,9 +7,7 @@ pub mod wire;
 use std::time::Duration;
 
 use agent_shim_core::{
-    request::CanonicalRequest,
-    response::CanonicalResponse,
-    stream::CanonicalStream,
+    request::CanonicalRequest, response::CanonicalResponse, stream::CanonicalStream,
     target::FrontendKind,
 };
 use futures_util::StreamExt;
@@ -23,7 +21,10 @@ pub struct OpenAiChat {
 
 impl OpenAiChat {
     pub fn new() -> Self {
-        Self { keepalive: None, clock_override: None }
+        Self {
+            keepalive: None,
+            clock_override: None,
+        }
     }
 }
 

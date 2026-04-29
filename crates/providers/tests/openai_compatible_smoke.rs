@@ -1,5 +1,4 @@
 /// Smoke tests for the OpenAI-compatible provider using mockito.
-
 use std::sync::Arc;
 
 use agent_shim_core::{
@@ -71,16 +70,14 @@ async fn unary_returns_correct_event_sequence() {
         .create_async()
         .await;
 
-    let provider = OpenAiCompatibleProvider::new(
-        "openai",
-        server.url(),
-        "test-key",
-        Default::default(),
-        30,
-    )
-    .unwrap();
+    let provider =
+        OpenAiCompatibleProvider::new("openai", server.url(), "test-key", Default::default(), 30)
+            .unwrap();
 
-    let mut stream = provider.complete(make_req(false), make_target()).await.unwrap();
+    let mut stream = provider
+        .complete(make_req(false), make_target())
+        .await
+        .unwrap();
 
     let mut events = vec![];
     while let Some(ev) = stream.next().await {
@@ -89,10 +86,18 @@ async fn unary_returns_correct_event_sequence() {
 
     // Should have ResponseStart, MessageStart, ContentBlockStart, TextDelta, ContentBlockStop,
     // MessageStop, ResponseStop
-    assert!(events.iter().any(|e| matches!(e, StreamEvent::ResponseStart { .. })));
-    assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hello, world!")));
-    assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop { .. })));
-    assert!(events.iter().any(|e| matches!(e, StreamEvent::ResponseStop { .. })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ResponseStart { .. })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hello, world!")));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::MessageStop { .. })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::ResponseStop { .. })));
 
     mock.assert_async().await;
 }
@@ -117,16 +122,14 @@ async fn streaming_yields_text_deltas() {
         .create_async()
         .await;
 
-    let provider = OpenAiCompatibleProvider::new(
-        "openai",
-        server.url(),
-        "test-key",
-        Default::default(),
-        30,
-    )
-    .unwrap();
+    let provider =
+        OpenAiCompatibleProvider::new("openai", server.url(), "test-key", Default::default(), 30)
+            .unwrap();
 
-    let mut stream = provider.complete(make_req(true), make_target()).await.unwrap();
+    let mut stream = provider
+        .complete(make_req(true), make_target())
+        .await
+        .unwrap();
 
     let mut text_deltas: Vec<String> = vec![];
     let mut got_stop = false;

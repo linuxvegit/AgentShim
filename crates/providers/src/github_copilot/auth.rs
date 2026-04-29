@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::ProviderError;
 use super::{
     credential_store::{self, StoredCredentials},
     headers::{COPILOT_OAUTH_CLIENT_ID, COPILOT_OAUTH_SCOPE},
 };
+use crate::ProviderError;
 
 pub enum DeviceFlowOutcome {
     Success { path: PathBuf },

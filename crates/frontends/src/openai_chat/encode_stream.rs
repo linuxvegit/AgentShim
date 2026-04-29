@@ -6,9 +6,11 @@ use bytes::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use parking_lot::Mutex;
 
-use crate::sse;
 use super::mapping::finish_reason_from_canonical;
-use super::wire::{ChunkOut, ChoiceOut, DeltaOut, ToolCallDeltaOut, ToolCallFunctionDeltaOut, UsageOut};
+use super::wire::{
+    ChoiceOut, ChunkOut, DeltaOut, ToolCallDeltaOut, ToolCallFunctionDeltaOut, UsageOut,
+};
+use crate::sse;
 
 struct EncoderState {
     response_id: String,
@@ -90,7 +92,11 @@ pub fn encode(
         };
 
         match stream_event {
-            StreamEvent::ResponseStart { id, model, created_at_unix } => {
+            StreamEvent::ResponseStart {
+                id,
+                model,
+                created_at_unix,
+            } => {
                 let mut s = state.lock();
                 s.response_id = id.0;
                 s.model = model;
@@ -144,7 +150,10 @@ pub fn encode(
                 // OpenAI does not have a canonical reasoning delta field; skip
             }
 
-            StreamEvent::ToolCallArgumentsDelta { index, json_fragment } => {
+            StreamEvent::ToolCallArgumentsDelta {
+                index,
+                json_fragment,
+            } => {
                 let s = state.lock();
                 let delta = DeltaOut {
                     tool_calls: vec![ToolCallDeltaOut {

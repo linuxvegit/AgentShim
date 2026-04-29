@@ -49,11 +49,19 @@ fn make_long_stream(counter: Arc<AtomicUsize>) -> CanonicalStream {
         model: "test-model".into(),
         created_at_unix: 0,
     }));
-    events.push(Ok(StreamEvent::MessageStart { role: MessageRole::Assistant }));
-    events.push(Ok(StreamEvent::ContentBlockStart { index: 0, kind: ContentBlockKind::Text }));
+    events.push(Ok(StreamEvent::MessageStart {
+        role: MessageRole::Assistant,
+    }));
+    events.push(Ok(StreamEvent::ContentBlockStart {
+        index: 0,
+        kind: ContentBlockKind::Text,
+    }));
 
     for i in 0u32..1000 {
-        events.push(Ok(StreamEvent::TextDelta { index: 0, text: format!("chunk-{i}") }));
+        events.push(Ok(StreamEvent::TextDelta {
+            index: 0,
+            text: format!("chunk-{i}"),
+        }));
     }
 
     events.push(Ok(StreamEvent::ContentBlockStop { index: 0 }));
@@ -63,13 +71,19 @@ fn make_long_stream(counter: Arc<AtomicUsize>) -> CanonicalStream {
     }));
     events.push(Ok(StreamEvent::ResponseStop { usage: None }));
 
-    let inner = DropAware { inner: stream::iter(events), counter };
+    let inner = DropAware {
+        inner: stream::iter(events),
+        counter,
+    };
     Box::pin(inner)
 }
 
 /// Collect at most `limit` bytes from a byte stream, then drop the stream.
 async fn collect_up_to(
-    mut stream: futures_util::stream::BoxStream<'static, Result<Bytes, agent_shim_frontends::FrontendError>>,
+    mut stream: futures_util::stream::BoxStream<
+        'static,
+        Result<Bytes, agent_shim_frontends::FrontendError>,
+    >,
     limit: usize,
 ) {
     let mut collected = 0usize;

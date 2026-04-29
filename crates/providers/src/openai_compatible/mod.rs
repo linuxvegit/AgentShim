@@ -142,7 +142,8 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
     async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
         let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .bearer_auth(&self.api_key)
             .send()
@@ -201,26 +202,26 @@ mod tests {
     #[tokio::test]
     async fn list_models_returns_discovered_models() {
         let mut server = mockito::Server::new_async().await;
-        let mock = server.mock("GET", "/v1/models")
+        let mock = server
+            .mock("GET", "/v1/models")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "object": "list",
                 "data": [
                     {"id": "gpt-4o", "object": "model"},
                     {"id": "gpt-4o-mini", "object": "model"},
                     {"id": "deepseek-chat", "object": "model"}
                 ]
-            }"#)
-            .create_async().await;
+            }"#,
+            )
+            .create_async()
+            .await;
 
-        let provider = OpenAiCompatibleProvider::new(
-            "test",
-            server.url(),
-            "test-key",
-            Default::default(),
-            30,
-        ).unwrap();
+        let provider =
+            OpenAiCompatibleProvider::new("test", server.url(), "test-key", Default::default(), 30)
+                .unwrap();
 
         let result = provider.list_models().await.unwrap().unwrap();
         assert!(result.contains("gpt-4o"));
@@ -233,18 +234,16 @@ mod tests {
     #[tokio::test]
     async fn list_models_returns_none_on_404() {
         let mut server = mockito::Server::new_async().await;
-        let mock = server.mock("GET", "/v1/models")
+        let mock = server
+            .mock("GET", "/v1/models")
             .with_status(404)
             .with_body("not found")
-            .create_async().await;
+            .create_async()
+            .await;
 
-        let provider = OpenAiCompatibleProvider::new(
-            "test",
-            server.url(),
-            "test-key",
-            Default::default(),
-            30,
-        ).unwrap();
+        let provider =
+            OpenAiCompatibleProvider::new("test", server.url(), "test-key", Default::default(), 30)
+                .unwrap();
 
         let result = provider.list_models().await.unwrap();
         assert!(result.is_none());

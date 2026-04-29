@@ -5,16 +5,16 @@ use agent_shim_core::{
     message::{Message, SystemInstruction, SystemSource},
     request::{CanonicalRequest, GenerationOptions, RequestMetadata},
     target::{FrontendInfo, FrontendKind, FrontendModel},
-    tool::{ToolCallArguments, ToolCallBlock, ToolDefinition, ToolResultBlock, ToolChoice},
+    tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };
 use serde_json::Value;
 
-use crate::FrontendError;
 use super::mapping::role_from_anthropic;
 use super::wire::{
-    InboundContentBlock, InboundMessageContent, InboundToolChoice, MessagesRequest,
-    SystemField, ToolResultContent,
+    InboundContentBlock, InboundMessageContent, InboundToolChoice, MessagesRequest, SystemField,
+    ToolResultContent,
 };
+use crate::FrontendError;
 
 pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let req: MessagesRequest =
@@ -46,9 +46,8 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
         .messages
         .into_iter()
         .map(|m| {
-            let role = role_from_anthropic(&m.role).ok_or_else(|| {
-                FrontendError::InvalidBody(format!("unknown role: {}", m.role))
-            })?;
+            let role = role_from_anthropic(&m.role)
+                .ok_or_else(|| FrontendError::InvalidBody(format!("unknown role: {}", m.role)))?;
             let content = match m.content {
                 InboundMessageContent::Text(text) => vec![ContentBlock::text(text)],
                 InboundMessageContent::Blocks(blocks) => blocks
@@ -125,25 +124,38 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
 
 fn inbound_block_to_canonical(block: InboundContentBlock) -> Result<ContentBlock, FrontendError> {
     match block {
-        InboundContentBlock::Text { text, cache_control } => {
+        InboundContentBlock::Text {
+            text,
+            cache_control,
+        } => {
             let mut extensions = ExtensionMap::new();
             if let Some(cc) = cache_control {
                 extensions.insert("cache_control", cc);
             }
             Ok(ContentBlock::Text(TextBlock { text, extensions }))
         }
-        InboundContentBlock::Image { source, cache_control } => {
+        InboundContentBlock::Image {
+            source,
+            cache_control,
+        } => {
             // Store as unsupported with raw value; image plumbing lives in the backend
             let mut raw = serde_json::json!({ "type": "image", "source": source });
             if let Some(cc) = cache_control {
                 raw["cache_control"] = cc;
             }
-            Ok(ContentBlock::Unsupported(agent_shim_core::content::UnsupportedBlock {
-                origin: "anthropic_messages".into(),
-                raw,
-            }))
+            Ok(ContentBlock::Unsupported(
+                agent_shim_core::content::UnsupportedBlock {
+                    origin: "anthropic_messages".into(),
+                    raw,
+                },
+            ))
         }
-        InboundContentBlock::ToolUse { id, name, input, cache_control } => {
+        InboundContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            cache_control,
+        } => {
             let mut extensions = ExtensionMap::new();
             if let Some(cc) = cache_control {
                 extensions.insert("cache_control", cc);
@@ -155,7 +167,12 @@ fn inbound_block_to_canonical(block: InboundContentBlock) -> Result<ContentBlock
                 extensions,
             }))
         }
-        InboundContentBlock::ToolResult { tool_use_id, is_error, content, cache_control } => {
+        InboundContentBlock::ToolResult {
+            tool_use_id,
+            is_error,
+            content,
+            cache_control,
+        } => {
             let mut extensions = ExtensionMap::new();
             if let Some(cc) = cache_control {
                 extensions.insert("cache_control", cc);
@@ -172,10 +189,16 @@ fn inbound_block_to_canonical(block: InboundContentBlock) -> Result<ContentBlock
                 extensions,
             }))
         }
-        InboundContentBlock::Thinking { thinking, signature } => {
+        InboundContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
             let mut extensions = ExtensionMap::new();
             extensions.insert("signature", Value::String(signature));
-            Ok(ContentBlock::Reasoning(ReasoningBlock { text: thinking, extensions }))
+            Ok(ContentBlock::Reasoning(ReasoningBlock {
+                text: thinking,
+                extensions,
+            }))
         }
         InboundContentBlock::RedactedThinking { data } => {
             Ok(ContentBlock::RedactedReasoning(RedactedReasoningBlock {
@@ -285,6 +308,11 @@ mod tests {
     fn decode_tool_choice_specific() {
         let body = minimal_request(r#","tool_choice":{"type":"tool","name":"search"}"#);
         let req = decode(&body).unwrap();
-        assert_eq!(req.tool_choice, ToolChoice::Specific { name: "search".into() });
+        assert_eq!(
+            req.tool_choice,
+            ToolChoice::Specific {
+                name: "search".into()
+            }
+        );
     }
 }

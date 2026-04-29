@@ -87,16 +87,25 @@ mod tests {
 
     #[test]
     fn finish_reason_max_tokens() {
-        assert_eq!(finish_reason_from_canonical(&StopReason::MaxTokens), "length");
+        assert_eq!(
+            finish_reason_from_canonical(&StopReason::MaxTokens),
+            "length"
+        );
     }
 
     #[test]
     fn finish_reason_tool_use() {
-        assert_eq!(finish_reason_from_canonical(&StopReason::ToolUse), "tool_calls");
+        assert_eq!(
+            finish_reason_from_canonical(&StopReason::ToolUse),
+            "tool_calls"
+        );
     }
 
     #[test]
     fn finish_reason_content_filter() {
-        assert_eq!(finish_reason_from_canonical(&StopReason::ContentFilter), "content_filter");
+        assert_eq!(
+            finish_reason_from_canonical(&StopReason::ContentFilter),
+            "content_filter"
+        );
     }
 }

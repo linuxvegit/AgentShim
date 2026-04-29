@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -93,23 +95,25 @@ impl CopilotProvider {
 
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static(COPILOT_USER_AGENT),
-        );
+        headers.insert(USER_AGENT, HeaderValue::from_static(COPILOT_USER_AGENT));
 
-        let insert = |headers: &mut HeaderMap, name: &'static str, val: &str| -> Result<(), ProviderError> {
-            headers.insert(
-                HeaderName::from_static(name),
-                HeaderValue::from_str(val)
-                    .map_err(|e| ProviderError::Encode(format!("header {name}: {e}")))?,
-            );
-            Ok(())
-        };
+        let insert =
+            |headers: &mut HeaderMap, name: &'static str, val: &str| -> Result<(), ProviderError> {
+                headers.insert(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_str(val)
+                        .map_err(|e| ProviderError::Encode(format!("header {name}: {e}")))?,
+                );
+                Ok(())
+            };
 
         insert(&mut headers, "editor-version", EDITOR_VERSION)?;
         insert(&mut headers, "editor-plugin-version", EDITOR_PLUGIN_VERSION)?;
-        insert(&mut headers, "copilot-integration-id", COPILOT_INTEGRATION_ID)?;
+        insert(
+            &mut headers,
+            "copilot-integration-id",
+            COPILOT_INTEGRATION_ID,
+        )?;
         insert(&mut headers, "openai-intent", OPENAI_INTENT)?;
         insert(&mut headers, "x-request-id", request_id)?;
 

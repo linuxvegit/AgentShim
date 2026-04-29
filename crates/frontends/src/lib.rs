@@ -4,8 +4,11 @@ pub mod anthropic_messages;
 pub mod openai_chat;
 pub mod sse;
 
+use agent_shim_core::{
+    request::CanonicalRequest, response::CanonicalResponse, stream::CanonicalStream,
+    target::FrontendKind,
+};
 use thiserror::Error;
-use agent_shim_core::{request::CanonicalRequest, response::CanonicalResponse, stream::CanonicalStream, target::FrontendKind};
 
 #[derive(Debug, Error)]
 pub enum FrontendError {
@@ -20,7 +23,10 @@ pub enum FrontendError {
 }
 
 pub enum FrontendResponse {
-    Unary { content_type: String, body: bytes::Bytes },
+    Unary {
+        content_type: String,
+        body: bytes::Bytes,
+    },
     Stream {
         content_type: String,
         stream: futures_util::stream::BoxStream<'static, Result<bytes::Bytes, FrontendError>>,

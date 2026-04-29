@@ -12,13 +12,18 @@ pub struct ModelIndex {
 
 fn tokenize(name: &str) -> Vec<String> {
     name.to_lowercase()
-        .split(|c: char| c == '-' || c == '_' || c == '.' || c == '/')
+        .split(['-', '_', '.', '/'])
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
 }
 
-fn score(requested_tokens: &[String], candidate_tokens: &[String], req_norm: &str, cand_norm: &str) -> f64 {
+fn score(
+    requested_tokens: &[String],
+    candidate_tokens: &[String],
+    req_norm: &str,
+    cand_norm: &str,
+) -> f64 {
     if req_norm == cand_norm {
         return 1.0;
     }
@@ -67,7 +72,11 @@ impl ModelIndex {
                     .map(|name| {
                         let normalized = name.to_lowercase();
                         let tokens = tokenize(&name);
-                        ModelEntry { original: name, normalized, tokens }
+                        ModelEntry {
+                            original: name,
+                            normalized,
+                            tokens,
+                        }
                     })
                     .collect();
                 (provider, entries)
@@ -77,7 +86,9 @@ impl ModelIndex {
     }
 
     pub fn empty() -> Self {
-        Self { providers: HashMap::new() }
+        Self {
+            providers: HashMap::new(),
+        }
     }
 
     pub fn resolve(&self, provider: &str, requested: &str) -> Option<&str> {
@@ -125,9 +136,15 @@ mod tests {
 
     #[test]
     fn tokenize_splits_on_delimiters() {
-        assert_eq!(tokenize("claude-sonnet-4-5-20250514"), vec!["claude", "sonnet", "4", "5", "20250514"]);
+        assert_eq!(
+            tokenize("claude-sonnet-4-5-20250514"),
+            vec!["claude", "sonnet", "4", "5", "20250514"]
+        );
         assert_eq!(tokenize("gpt-4o-mini"), vec!["gpt", "4o", "mini"]);
-        assert_eq!(tokenize("Qwen/Qwen3-235B-A22B"), vec!["qwen", "qwen3", "235b", "a22b"]);
+        assert_eq!(
+            tokenize("Qwen/Qwen3-235B-A22B"),
+            vec!["qwen", "qwen3", "235b", "a22b"]
+        );
         assert_eq!(tokenize("deepseek_chat"), vec!["deepseek", "chat"]);
         assert_eq!(tokenize("model.v2.1"), vec!["model", "v2", "1"]);
     }
@@ -142,13 +159,19 @@ mod tests {
     #[test]
     fn prefix_match_finds_dated_variant() {
         let idx = index_with("p", &["claude-sonnet-4-5-20250514"]);
-        assert_eq!(idx.resolve("p", "claude-sonnet-4-5"), Some("claude-sonnet-4-5-20250514"));
+        assert_eq!(
+            idx.resolve("p", "claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5-20250514")
+        );
     }
 
     #[test]
     fn prefix_match_prefers_shorter_canonical() {
         let idx = index_with("p", &["claude-sonnet-4-5", "claude-sonnet-4-5-20250514"]);
-        assert_eq!(idx.resolve("p", "claude-sonnet-4-5"), Some("claude-sonnet-4-5"));
+        assert_eq!(
+            idx.resolve("p", "claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5")
+        );
     }
 
     #[test]
@@ -171,9 +194,15 @@ mod tests {
 
     #[test]
     fn token_overlap_selects_best_match() {
-        let idx = index_with("p", &["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-3-5"]);
+        let idx = index_with(
+            "p",
+            &["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-3-5"],
+        );
         assert_eq!(idx.resolve("p", "claude-opus-4-5"), Some("claude-opus-4-5"));
-        assert_eq!(idx.resolve("p", "claude-sonnet-4-5"), Some("claude-sonnet-4-5"));
+        assert_eq!(
+            idx.resolve("p", "claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5")
+        );
     }
 
     #[test]

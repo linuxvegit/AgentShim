@@ -41,7 +41,10 @@ impl Drop for StreamLogger {
         let elapsed = self.started.elapsed();
         tracing::info!(
             "← /v1/messages (stream) | model: {} → {} | input: {} | output: {} | {:.1}s",
-            self.model_alias, self.upstream_model, input, output,
+            self.model_alias,
+            self.upstream_model,
+            input,
+            output,
             elapsed.as_secs_f64()
         );
     }
@@ -55,10 +58,10 @@ pub async fn handle(
     let body_bytes = body.len();
     let started = std::time::Instant::now();
 
-    let canonical = state
-        .anthropic
-        .decode_request(&body)
-        .map_err(|e| { tracing::warn!(error = %e, "anthropic decode failed"); HandlerError::Frontend(e) })?;
+    let canonical = state.anthropic.decode_request(&body).map_err(|e| {
+        tracing::warn!(error = %e, "anthropic decode failed");
+        HandlerError::Frontend(e)
+    })?;
 
     let model_alias = canonical.model.as_str().to_string();
     let is_stream = canonical.stream;
@@ -67,7 +70,10 @@ pub async fn handle(
     let target = state
         .router
         .resolve(FrontendKind::AnthropicMessages, &model_alias)
-        .map_err(|e| { tracing::warn!(model = %model_alias, error = %e, "no route"); HandlerError::Route(e) })?;
+        .map_err(|e| {
+            tracing::warn!(model = %model_alias, error = %e, "no route");
+            HandlerError::Route(e)
+        })?;
 
     let mut target = target;
     if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model) {
@@ -89,23 +95,23 @@ pub async fn handle(
 
     tracing::info!(
         "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {}",
-        model_alias, upstream_model, body_bytes, max_tokens.unwrap_or(0)
+        model_alias,
+        upstream_model,
+        body_bytes,
+        max_tokens.unwrap_or(0)
     );
 
-    let provider = state
-        .providers
-        .get(&target.provider)
-        .ok_or_else(|| {
-            tracing::error!(provider = %target.provider, "provider not registered");
-            HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-                target.provider.clone(),
-            ))
-        })?;
+    let provider = state.providers.get(&target.provider).ok_or_else(|| {
+        tracing::error!(provider = %target.provider, "provider not registered");
+        HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
+            target.provider.clone(),
+        ))
+    })?;
 
-    let stream = provider
-        .complete(canonical, target)
-        .await
-        .map_err(|e| { tracing::error!(error = %e, "provider.complete failed"); HandlerError::Provider(e) })?;
+    let stream = provider.complete(canonical, target).await.map_err(|e| {
+        tracing::error!(error = %e, "provider.complete failed");
+        HandlerError::Provider(e)
+    })?;
 
     if is_stream {
         let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
@@ -139,16 +145,21 @@ pub async fn handle(
         let frontend_response = state.anthropic.encode_stream(canonical_stream);
 
         match frontend_response {
-            FrontendResponse::Stream { content_type, stream: sse_stream } => {
+            FrontendResponse::Stream {
+                content_type,
+                stream: sse_stream,
+            } => {
                 // Wrap the SSE stream so the logger is held alive and dropped when stream ends
-                let guarded_stream = GuardedStream { inner: sse_stream, _logger: logger };
+                let guarded_stream = GuardedStream {
+                    inner: sse_stream,
+                    _logger: logger,
+                };
                 let body = Body::from_stream(guarded_stream.map(|r| r.map_err(|e| e.to_string())));
                 let mut r = Response::new(body);
                 r.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
-                        HeaderValue::from_static("text/event-stream")
-                    }),
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
                 );
                 Ok(r)
             }
@@ -163,7 +174,11 @@ pub async fn handle(
         let elapsed = started.elapsed();
         tracing::info!(
             "← /v1/messages (unary) | model: {} → {} | input: {} | output: {} | {:.1}s",
-            model_alias, upstream_model, input, output, elapsed.as_secs_f64()
+            model_alias,
+            upstream_model,
+            input,
+            output,
+            elapsed.as_secs_f64()
         );
         let frontend_response = state
             .anthropic
@@ -174,9 +189,8 @@ pub async fn handle(
                 let mut r = Response::new(Body::from(body));
                 r.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
-                        HeaderValue::from_static("application/json")
-                    }),
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
                 );
                 Ok(r)
             }
@@ -213,15 +227,17 @@ pub(crate) async fn collect_stream(
 
     let mut tool_names: std::collections::HashMap<u32, (ToolCallId, String)> =
         std::collections::HashMap::new();
-    let mut tool_args: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
-    let mut text_buf: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
+    let mut tool_args: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut text_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
     while let Some(ev) = stream.next().await {
-        let ev = ev.map_err(|e| HandlerError::Provider(agent_shim_providers::ProviderError::Decode(e.to_string())))?;
+        let ev = ev.map_err(|e| {
+            HandlerError::Provider(agent_shim_providers::ProviderError::Decode(e.to_string()))
+        })?;
         match ev {
-            StreamEvent::ResponseStart { id: rid, model: m, .. } => {
+            StreamEvent::ResponseStart {
+                id: rid, model: m, ..
+            } => {
                 id = rid;
                 model = m;
             }
@@ -244,13 +260,23 @@ pub(crate) async fn collect_stream(
                     }));
                 }
             }
-            StreamEvent::ToolCallStart { index, id: tc_id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id: tc_id,
+                name,
+            } => {
                 tool_names.insert(index, (tc_id, name));
             }
-            StreamEvent::ToolCallArgumentsDelta { index, json_fragment } => {
+            StreamEvent::ToolCallArgumentsDelta {
+                index,
+                json_fragment,
+            } => {
                 tool_args.entry(index).or_default().push_str(&json_fragment);
             }
-            StreamEvent::MessageStop { stop_reason: sr, stop_sequence: ss } => {
+            StreamEvent::MessageStop {
+                stop_reason: sr,
+                stop_sequence: ss,
+            } => {
                 stop_reason = sr;
                 stop_sequence = ss;
             }

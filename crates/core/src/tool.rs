@@ -19,7 +19,9 @@ pub enum ToolChoice {
     Auto,
     None,
     Required,
-    Specific { name: String },
+    Specific {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +74,9 @@ mod tests {
 
     #[test]
     fn tool_choice_specific_round_trips() {
-        let c = ToolChoice::Specific { name: "search".into() };
+        let c = ToolChoice::Specific {
+            name: "search".into(),
+        };
         let s = serde_json::to_string(&c).unwrap();
         let back: ToolChoice = serde_json::from_str(&s).unwrap();
         assert_eq!(back, c);
@@ -80,7 +84,9 @@ mod tests {
 
     #[test]
     fn complete_args_round_trip() {
-        let args = ToolCallArguments::Complete { value: json!({"q": "test"}) };
+        let args = ToolCallArguments::Complete {
+            value: json!({"q": "test"}),
+        };
         let s = serde_json::to_string(&args).unwrap();
         let back: ToolCallArguments = serde_json::from_str(&s).unwrap();
         assert_eq!(back, args);

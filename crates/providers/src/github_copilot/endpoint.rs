@@ -17,8 +17,8 @@ pub struct TokenExchangeResponse {
 
 /// Validate that `url` is HTTPS and return it with any trailing slash stripped.
 pub fn validate_api_base(url: &str) -> Result<String, ProviderError> {
-    let parsed = url::Url::parse(url)
-        .map_err(|e| ProviderError::Encode(format!("invalid URL: {e}")))?;
+    let parsed =
+        url::Url::parse(url).map_err(|e| ProviderError::Encode(format!("invalid URL: {e}")))?;
     if parsed.scheme() != "https" {
         return Err(ProviderError::Encode(format!(
             "API base must use HTTPS, got: {}",

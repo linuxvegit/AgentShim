@@ -1,4 +1,4 @@
-use http::{Request, Response, HeaderValue, header::HeaderName};
+use http::{header::HeaderName, HeaderValue, Request, Response};
 use std::{
     future::Future,
     pin::Pin,
@@ -75,7 +75,10 @@ mod tests {
         let svc = RequestIdLayer.layer(tower::service_fn(echo_handler));
         let req = Request::builder().uri("/").body(()).unwrap();
         let resp = svc.oneshot(req).await.unwrap();
-        assert!(!resp.body().is_empty(), "expected a request-id to be injected");
+        assert!(
+            !resp.body().is_empty(),
+            "expected a request-id to be injected"
+        );
     }
 
     #[tokio::test]

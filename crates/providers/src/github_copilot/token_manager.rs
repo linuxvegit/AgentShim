@@ -4,8 +4,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
+use super::{
+    credential_store::{self, StoredCredentials},
+    endpoint::TokenExchangeResponse,
+};
 use crate::ProviderError;
-use super::{credential_store::{self, StoredCredentials}, endpoint::TokenExchangeResponse};
 
 #[derive(Debug, Clone)]
 pub struct CopilotToken {
@@ -26,13 +29,14 @@ pub struct CopilotTokenManager {
 }
 
 impl CopilotTokenManager {
-    pub fn new(
-        http: reqwest::Client,
-        creds: StoredCredentials,
-        base_url: String,
-    ) -> Self {
+    pub fn new(http: reqwest::Client, creds: StoredCredentials, base_url: String) -> Self {
         let (tx, rx) = mpsc::channel(16);
-        tokio::spawn(actor(rx, http, CredentialSource::Preloaded(creds), base_url));
+        tokio::spawn(actor(
+            rx,
+            http,
+            CredentialSource::Preloaded(creds),
+            base_url,
+        ));
         Self { tx: Arc::new(tx) }
     }
 
@@ -103,9 +107,9 @@ async fn actor(
                 let creds = match cred_source.load() {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = reply.send(Err(ProviderError::Network(
-                            format!("load credentials: {e} — run `agent-shim copilot login` first"),
-                        )));
+                        let _ = reply.send(Err(ProviderError::Network(format!(
+                            "load credentials: {e} — run `agent-shim copilot login` first"
+                        ))));
                         continue;
                     }
                 };
@@ -133,7 +137,10 @@ pub async fn exchange_with_base(
     creds: &StoredCredentials,
     base_url: &str,
 ) -> Result<CopilotToken, ProviderError> {
-    let url = format!("{}/copilot_internal/v2/token", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/copilot_internal/v2/token",
+        base_url.trim_end_matches('/')
+    );
     let resp = http
         .get(&url)
         .header(

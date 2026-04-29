@@ -1,14 +1,10 @@
 // Decode an Anthropic request, then encode its response via the OpenAI frontend.
 use agent_shim_core::{
-    content::ContentBlock,
-    ids::ResponseId,
-    response::CanonicalResponse,
-    usage::StopReason,
+    content::ContentBlock, ids::ResponseId, response::CanonicalResponse, usage::StopReason,
 };
 use agent_shim_frontends::{
-    anthropic_messages::AnthropicMessages,
-    openai_chat::OpenAiChat,
-    FrontendProtocol, FrontendResponse,
+    anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat, FrontendProtocol,
+    FrontendResponse,
 };
 
 #[test]
@@ -33,7 +29,10 @@ fn decode_anthropic_encode_openai_unary() {
         usage: None,
     };
 
-    let openai = OpenAiChat { keepalive: None, clock_override: Some(1700000000) };
+    let openai = OpenAiChat {
+        keepalive: None,
+        clock_override: Some(1700000000),
+    };
     let result = openai.encode_unary(canonical_resp).unwrap();
     let body = match result {
         FrontendResponse::Unary { body, .. } => body,
@@ -42,6 +41,9 @@ fn decode_anthropic_encode_openai_unary() {
 
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["object"], "chat.completion");
-    assert_eq!(json["choices"][0]["message"]["content"], "Rust is a systems language.");
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "Rust is a systems language."
+    );
     assert_eq!(json["choices"][0]["finish_reason"], "stop");
 }

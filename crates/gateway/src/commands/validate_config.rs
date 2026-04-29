@@ -1,5 +1,5 @@
-use std::path::Path;
 use anyhow::Result;
+use std::path::Path;
 
 pub fn run(config_path: &Path) -> Result<()> {
     let cfg = agent_shim_config::load_from_path(config_path)

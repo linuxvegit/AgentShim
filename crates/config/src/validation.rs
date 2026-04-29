@@ -1,5 +1,5 @@
-use thiserror::Error;
 use crate::schema::{GatewayConfig, UpstreamConfig};
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -28,7 +28,10 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         if !cfg.upstreams.contains_key(&route.upstream) {
             // allow "copilot" as a special upstream name when copilot config present
             let is_copilot = route.upstream == "copilot"
-                && cfg.upstreams.values().any(|u| matches!(u, UpstreamConfig::GithubCopilot));
+                && cfg
+                    .upstreams
+                    .values()
+                    .any(|u| matches!(u, UpstreamConfig::GithubCopilot));
             if !is_copilot {
                 return Err(ValidationError::UnknownUpstream(route.upstream.clone()));
             }
@@ -45,9 +48,9 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use crate::schema::*;
     use crate::secrets::Secret;
+    use std::collections::BTreeMap;
 
     fn minimal_config() -> GatewayConfig {
         GatewayConfig {
@@ -81,52 +84,63 @@ mod tests {
             upstream: "nonexistent".to_string(),
             upstream_model: "gpt-4".to_string(),
         });
-        assert!(matches!(validate(&cfg), Err(ValidationError::UnknownUpstream(_))));
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::UnknownUpstream(_))
+        ));
     }
 
     #[test]
     fn duplicate_alias_fails() {
         let mut cfg = minimal_config();
-        cfg.upstreams.insert("upstream1".to_string(), UpstreamConfig::OpenAiCompatible(
-            OpenAiCompatibleUpstream {
+        cfg.upstreams.insert(
+            "upstream1".to_string(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
                 base_url: "https://api.openai.com".to_string(),
                 api_key: Secret::new("key"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
-            }
+            }),
+        );
+        cfg.routes.push(RouteEntry {
+            frontend: "openai_chat".to_string(),
+            model: "gpt-4".to_string(),
+            upstream: "upstream1".to_string(),
+            upstream_model: "gpt-4".to_string(),
+        });
+        cfg.routes.push(RouteEntry {
+            frontend: "openai_chat".to_string(),
+            model: "gpt-4".to_string(),
+            upstream: "upstream1".to_string(),
+            upstream_model: "gpt-4".to_string(),
+        });
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::DuplicateAlias(_, _))
         ));
-        cfg.routes.push(RouteEntry {
-            frontend: "openai_chat".to_string(),
-            model: "gpt-4".to_string(),
-            upstream: "upstream1".to_string(),
-            upstream_model: "gpt-4".to_string(),
-        });
-        cfg.routes.push(RouteEntry {
-            frontend: "openai_chat".to_string(),
-            model: "gpt-4".to_string(),
-            upstream: "upstream1".to_string(),
-            upstream_model: "gpt-4".to_string(),
-        });
-        assert!(matches!(validate(&cfg), Err(ValidationError::DuplicateAlias(_, _))));
     }
 
     #[test]
     fn unknown_frontend_fails() {
         let mut cfg = minimal_config();
-        cfg.upstreams.insert("upstream1".to_string(), UpstreamConfig::OpenAiCompatible(
-            OpenAiCompatibleUpstream {
+        cfg.upstreams.insert(
+            "upstream1".to_string(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
                 base_url: "https://api.openai.com".to_string(),
                 api_key: Secret::new("key"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
-            }
-        ));
+            }),
+        );
         cfg.routes.push(RouteEntry {
             frontend: "unknown_protocol".to_string(),
             model: "gpt-4".to_string(),
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
         });
-        assert!(matches!(validate(&cfg), Err(ValidationError::UnknownFrontend(_))));
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::UnknownFrontend(_))
+        ));
     }
 }

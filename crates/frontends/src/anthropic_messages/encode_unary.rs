@@ -1,14 +1,12 @@
 use agent_shim_core::{
-    content::ContentBlock,
-    response::CanonicalResponse,
-    tool::ToolCallArguments,
+    content::ContentBlock, response::CanonicalResponse, tool::ToolCallArguments,
 };
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::FrontendError;
 use super::mapping::stop_reason_to_anthropic;
 use super::wire::{MessagesResponse, OutboundContentBlock, OutboundUsage};
+use crate::FrontendError;
 
 pub fn encode(response: CanonicalResponse) -> Result<Bytes, FrontendError> {
     let mut content_blocks: Vec<OutboundContentBlock> = Vec::new();
@@ -42,12 +40,16 @@ pub fn encode(response: CanonicalResponse) -> Result<Bytes, FrontendError> {
         }
     }
 
-    let usage = response.usage.as_ref().map(|u| OutboundUsage {
-        input_tokens: u.input_tokens.unwrap_or(0),
-        output_tokens: u.output_tokens.unwrap_or(0),
-        cache_creation_input_tokens: u.cache_creation_input_tokens,
-        cache_read_input_tokens: u.cache_read_input_tokens,
-    }).unwrap_or_default();
+    let usage = response
+        .usage
+        .as_ref()
+        .map(|u| OutboundUsage {
+            input_tokens: u.input_tokens.unwrap_or(0),
+            output_tokens: u.output_tokens.unwrap_or(0),
+            cache_creation_input_tokens: u.cache_creation_input_tokens,
+            cache_read_input_tokens: u.cache_read_input_tokens,
+        })
+        .unwrap_or_default();
 
     let stop_reason = stop_reason_to_anthropic(&response.stop_reason).to_owned();
 

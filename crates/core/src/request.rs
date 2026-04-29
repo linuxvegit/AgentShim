@@ -29,7 +29,11 @@ pub enum ResponseFormat {
     /// The model must respond with valid JSON (no schema enforcement).
     JsonObject,
     /// The model must follow the supplied JSON schema.
-    JsonSchema { name: String, schema: serde_json::Value, strict: bool },
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        strict: bool,
+    },
 }
 
 /// Request-level metadata carried through the gateway for logging/tracing.

@@ -1,7 +1,10 @@
-use figment::{Figment, providers::{Format, Yaml, Env}};
-use thiserror::Error;
-use std::path::Path;
 use crate::schema::GatewayConfig;
+use figment::{
+    providers::{Env, Format, Yaml},
+    Figment,
+};
+use std::path::Path;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {

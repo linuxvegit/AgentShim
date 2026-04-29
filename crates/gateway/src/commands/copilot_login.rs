@@ -13,7 +13,10 @@ pub async fn run(credential_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     match auth::login_device_flow(path.clone()).await? {
         auth::DeviceFlowOutcome::Success { path } => {
-            println!("Successfully authenticated. Credentials saved to: {}", path.display());
+            println!(
+                "Successfully authenticated. Credentials saved to: {}",
+                path.display()
+            );
         }
         auth::DeviceFlowOutcome::Declined => {
             println!("Authorization was declined.");

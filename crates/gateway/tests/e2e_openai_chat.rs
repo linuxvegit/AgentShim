@@ -1,5 +1,4 @@
 /// End-to-end test: mockito upstream → gateway → client (OpenAI chat completions)
-
 use std::collections::BTreeMap;
 
 use agent_shim_config::{
@@ -40,7 +39,7 @@ async fn spawn_gateway(
     upstream_url: &str,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let cfg = make_config(upstream_url);
-    let state = AppState::new(cfg);
+    let state = AppState::new(cfg).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -122,10 +121,7 @@ async fn e2e_openai_chat_streaming() {
         accumulated.contains("E2E"),
         "expected 'E2E' in SSE body, got: {accumulated}"
     );
-    assert!(
-        accumulated.contains("[DONE]"),
-        "expected [DONE] terminator"
-    );
+    assert!(accumulated.contains("[DONE]"), "expected [DONE] terminator");
 
     mock.assert_async().await;
     let _ = tx.send(());

@@ -1,5 +1,5 @@
-use agent_shim_core::usage::StopReason;
 use agent_shim_core::message::MessageRole;
+use agent_shim_core::usage::StopReason;
 
 pub fn stop_reason_to_anthropic(reason: &StopReason) -> &'static str {
     match reason {

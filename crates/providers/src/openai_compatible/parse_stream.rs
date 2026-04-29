@@ -1,5 +1,4 @@
 /// Parse an SSE byte-stream from OpenAI into a CanonicalStream.
-
 use std::collections::HashSet;
 
 use eventsource_stream::Eventsource;
@@ -162,10 +161,7 @@ fn parse_chunk(
                 }
 
                 for tc in tool_calls {
-                    let tc_index = tc
-                        .get("index")
-                        .and_then(|i| i.as_u64())
-                        .unwrap_or(0) as u32;
+                    let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                     // Offset tool indices by 1 since text uses index 0
                     let block_index = tc_index + 1;
 
@@ -225,7 +221,11 @@ fn parse_chunk(
         }
     }
 
-    if let Some(usage) = v.get("usage").filter(|u| !u.is_null()).and_then(|_| parse_usage(&v)) {
+    if let Some(usage) = v
+        .get("usage")
+        .filter(|u| !u.is_null())
+        .and_then(|_| parse_usage(&v))
+    {
         events.push(StreamEvent::UsageDelta { usage });
     }
 

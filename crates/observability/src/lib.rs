@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-pub mod tracing_setup;
-pub mod request_id;
 pub mod redaction;
+pub mod request_id;
+pub mod tracing_setup;
 
-pub use tracing_setup::init;
+pub use redaction::{is_sensitive, SENSITIVE_HEADERS};
 pub use request_id::{RequestIdLayer, RequestIdService};
-pub use redaction::{SENSITIVE_HEADERS, is_sensitive};
+pub use tracing_setup::init;

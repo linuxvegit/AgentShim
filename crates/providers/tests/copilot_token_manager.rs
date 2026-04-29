@@ -1,6 +1,5 @@
 use agent_shim_providers::github_copilot::{
-    credential_store::StoredCredentials,
-    token_manager::exchange_with_base,
+    credential_store::StoredCredentials, token_manager::exchange_with_base,
 };
 
 fn make_creds() -> StoredCredentials {
@@ -53,6 +52,8 @@ async fn exchange_returns_error_on_401() {
     let result = exchange_with_base(&make_client(), &make_creds(), &server.url()).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("401") || err.contains("unauthorized") || err.contains("Unauthorized"),
-        "unexpected error: {err}");
+    assert!(
+        err.contains("401") || err.contains("unauthorized") || err.contains("Unauthorized"),
+        "unexpected error: {err}"
+    );
 }

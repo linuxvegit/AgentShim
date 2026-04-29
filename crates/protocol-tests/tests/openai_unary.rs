@@ -8,7 +8,10 @@ use agent_shim_frontends::{openai_chat::OpenAiChat, FrontendProtocol, FrontendRe
 
 #[test]
 fn openai_unary_text_response() {
-    let frontend = OpenAiChat { keepalive: None, clock_override: Some(1700000000) };
+    let frontend = OpenAiChat {
+        keepalive: None,
+        clock_override: Some(1700000000),
+    };
     let response = CanonicalResponse {
         id: ResponseId(String::from("chatcmpl-test")),
         model: "gpt-4o".into(),
@@ -47,7 +50,10 @@ fn openai_unary_tool_call_response() {
         tool::{ToolCallArguments, ToolCallBlock},
     };
 
-    let frontend = OpenAiChat { keepalive: None, clock_override: Some(1700000000) };
+    let frontend = OpenAiChat {
+        keepalive: None,
+        clock_override: Some(1700000000),
+    };
     let response = CanonicalResponse {
         id: ResponseId(String::from("chatcmpl-tool")),
         model: "gpt-4o".into(),

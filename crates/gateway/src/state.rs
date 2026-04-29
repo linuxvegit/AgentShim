@@ -25,8 +25,13 @@ pub struct AppState {
 impl AppState {
     pub async fn new(config: GatewayConfig) -> Self {
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
-        let anthropic = Arc::new(AnthropicMessages { keepalive: Some(keepalive) });
-        let openai = Arc::new(OpenAiChat { keepalive: Some(keepalive), clock_override: None });
+        let anthropic = Arc::new(AnthropicMessages {
+            keepalive: Some(keepalive),
+        });
+        let openai = Arc::new(OpenAiChat {
+            keepalive: Some(keepalive),
+            clock_override: None,
+        });
 
         let mut registry = ProviderRegistry::new();
         for (name, upstream) in &config.upstreams {

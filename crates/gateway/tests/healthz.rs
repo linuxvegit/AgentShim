@@ -1,10 +1,10 @@
-use agent_shim_gateway::{server::run_on_listener, state::AppState};
 use agent_shim_config::GatewayConfig;
+use agent_shim_gateway::{server::run_on_listener, state::AppState};
 use std::collections::BTreeMap;
 use tokio::net::TcpListener;
 
 fn minimal_config() -> GatewayConfig {
-    use agent_shim_config::schema::{ServerConfig, LoggingConfig};
+    use agent_shim_config::schema::{LoggingConfig, ServerConfig};
     GatewayConfig {
         server: ServerConfig::default(),
         logging: LoggingConfig::default(),
@@ -20,7 +20,7 @@ async fn healthz_returns_200_ok() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let state = AppState::new(minimal_config());
+    let state = AppState::new(minimal_config()).await;
 
     // Spawn the server in the background; send shutdown immediately after test.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

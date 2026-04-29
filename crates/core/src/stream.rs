@@ -29,24 +29,58 @@ pub struct RawProviderEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
-    ResponseStart { id: ResponseId, model: String, created_at_unix: u64 },
-    MessageStart { role: MessageRole },
-    ContentBlockStart { index: u32, kind: ContentBlockKind },
-    TextDelta { index: u32, text: String },
-    ReasoningDelta { index: u32, text: String },
-    ToolCallStart { index: u32, id: ToolCallId, name: String },
-    ToolCallArgumentsDelta { index: u32, json_fragment: String },
-    ToolCallStop { index: u32 },
-    ContentBlockStop { index: u32 },
-    UsageDelta { usage: Usage },
-    MessageStop { stop_reason: StopReason, stop_sequence: Option<String> },
-    ResponseStop { usage: Option<Usage> },
-    Error { message: String },
+    ResponseStart {
+        id: ResponseId,
+        model: String,
+        created_at_unix: u64,
+    },
+    MessageStart {
+        role: MessageRole,
+    },
+    ContentBlockStart {
+        index: u32,
+        kind: ContentBlockKind,
+    },
+    TextDelta {
+        index: u32,
+        text: String,
+    },
+    ReasoningDelta {
+        index: u32,
+        text: String,
+    },
+    ToolCallStart {
+        index: u32,
+        id: ToolCallId,
+        name: String,
+    },
+    ToolCallArgumentsDelta {
+        index: u32,
+        json_fragment: String,
+    },
+    ToolCallStop {
+        index: u32,
+    },
+    ContentBlockStop {
+        index: u32,
+    },
+    UsageDelta {
+        usage: Usage,
+    },
+    MessageStop {
+        stop_reason: StopReason,
+        stop_sequence: Option<String>,
+    },
+    ResponseStop {
+        usage: Option<Usage>,
+    },
+    Error {
+        message: String,
+    },
     RawProviderEvent(RawProviderEvent),
 }
 
-pub type CanonicalStream =
-    Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send>>;
+pub type CanonicalStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, StreamError>> + Send>>;
 
 #[cfg(test)]
 mod tests {
@@ -54,14 +88,20 @@ mod tests {
 
     #[test]
     fn text_delta_serializes_with_type_tag() {
-        let e = StreamEvent::TextDelta { index: 0, text: "hi".into() };
+        let e = StreamEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains("\"type\":\"text_delta\""));
     }
 
     #[test]
     fn round_trip_preserves_variant() {
-        let e = StreamEvent::ToolCallArgumentsDelta { index: 1, json_fragment: r#"{"a":"#.into() };
+        let e = StreamEvent::ToolCallArgumentsDelta {
+            index: 1,
+            json_fragment: r#"{"a":"#.into(),
+        };
         let s = serde_json::to_string(&e).unwrap();
         let back: StreamEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back, e);

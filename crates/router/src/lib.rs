@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-pub mod static_routes;
-pub mod fallback;
-pub mod rate_limit;
 pub mod circuit_breaker;
+pub mod fallback;
 pub mod model_index;
+pub mod rate_limit;
+pub mod static_routes;
 
 use thiserror::Error;
 
@@ -13,7 +13,10 @@ use agent_shim_core::{BackendTarget, FrontendKind};
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RouteError {
     #[error("no route for frontend={frontend:?} model={model}")]
-    NoRoute { frontend: FrontendKind, model: String },
+    NoRoute {
+        frontend: FrontendKind,
+        model: String,
+    },
 }
 
 pub trait Router: Send + Sync {

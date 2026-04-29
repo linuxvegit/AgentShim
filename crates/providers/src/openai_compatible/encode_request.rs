@@ -1,13 +1,7 @@
 /// Build an OpenAI-compatible outbound request body from a CanonicalRequest.
-
 use agent_shim_core::{
-    CanonicalRequest,
-    ContentBlock,
-    MessageRole,
-    SystemSource,
-    ToolCallArguments,
-    ToolChoice,
-    request::ResponseFormat,
+    request::ResponseFormat, CanonicalRequest, ContentBlock, MessageRole, SystemSource,
+    ToolCallArguments, ToolChoice,
 };
 
 use super::wire::{
@@ -67,13 +61,17 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
             .collect();
 
         // Collect ALL tool results — each becomes a separate "tool" role message in OpenAI format.
-        let tool_results: Vec<_> = msg.content.iter().filter_map(|b| {
-            if let ContentBlock::ToolResult(tr) = b {
-                Some(tr)
-            } else {
-                None
-            }
-        }).collect();
+        let tool_results: Vec<_> = msg
+            .content
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolResult(tr) = b {
+                    Some(tr)
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         if !tool_results.is_empty() {
             // Emit each tool result as its own message.
@@ -143,19 +141,23 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
     let response_format = req.response_format.as_ref().map(|rf| match rf {
         ResponseFormat::Text => ResponseFormatOut::Text,
         ResponseFormat::JsonObject => ResponseFormatOut::JsonObject,
-        ResponseFormat::JsonSchema { name, schema, strict } => {
-            ResponseFormatOut::JsonSchema {
-                json_schema: JsonSchemaOut {
-                    name: name.clone(),
-                    schema: schema.clone(),
-                    strict: *strict,
-                },
-            }
-        }
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => ResponseFormatOut::JsonSchema {
+            json_schema: JsonSchemaOut {
+                name: name.clone(),
+                schema: schema.clone(),
+                strict: *strict,
+            },
+        },
     });
 
     let stream_options = if req.stream {
-        Some(StreamOptions { include_usage: true })
+        Some(StreamOptions {
+            include_usage: true,
+        })
     } else {
         None
     };
@@ -244,7 +246,7 @@ fn build_content_value(blocks: &[ContentBlock]) -> Option<serde_json::Value> {
                                 "url": format!("data:{};base64,{}", media_type, b64)
                             }
                         }))
-                    },
+                    }
                     BinarySource::Url { url } => Some(serde_json::json!({
                         "type": "image_url",
                         "image_url": { "url": url }

@@ -3,7 +3,10 @@ use agent_shim_protocol_tests::{collect_sse, fixture, replay_jsonl};
 
 #[tokio::test]
 async fn openai_tool_call_stream_chunks() {
-    let frontend = OpenAiChat { keepalive: None, clock_override: Some(1700000001) };
+    let frontend = OpenAiChat {
+        keepalive: None,
+        clock_override: Some(1700000001),
+    };
     let stream = replay_jsonl(fixture("tool_call_stream.jsonl"), None);
 
     let response = frontend.encode_stream(stream);
@@ -18,11 +21,23 @@ async fn openai_tool_call_stream_chunks() {
     assert!(text.contains("get_weather"), "missing tool name\n{}", text);
 
     // Argument fragments (they appear JSON-encoded inside the SSE data)
-    assert!(text.contains("city"), "missing 'city' key in arg fragment\n{}", text);
-    assert!(text.contains("Tokyo"), "missing 'Tokyo' value in arg fragment\n{}", text);
+    assert!(
+        text.contains("city"),
+        "missing 'city' key in arg fragment\n{}",
+        text
+    );
+    assert!(
+        text.contains("Tokyo"),
+        "missing 'Tokyo' value in arg fragment\n{}",
+        text
+    );
 
     // finish_reason = "tool_calls"
-    assert!(text.contains("\"tool_calls\""), "missing finish_reason tool_calls\n{}", text);
+    assert!(
+        text.contains("\"tool_calls\""),
+        "missing finish_reason tool_calls\n{}",
+        text
+    );
 
     // DONE terminator
     assert!(text.contains("[DONE]"), "missing [DONE]\n{}", text);

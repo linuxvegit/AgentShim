@@ -12,9 +12,8 @@ pub struct StoredCredentials {
 
 /// Return the default path for the credential file.
 pub fn default_path() -> Result<PathBuf, ProviderError> {
-    let base = dirs::config_dir().ok_or_else(|| {
-        ProviderError::Encode("could not determine config directory".to_string())
-    })?;
+    let base = dirs::config_dir()
+        .ok_or_else(|| ProviderError::Encode("could not determine config directory".to_string()))?;
     Ok(base.join("agent-shim").join("copilot-credentials.json"))
 }
 

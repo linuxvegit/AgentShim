@@ -41,10 +41,13 @@ impl StaticRouter {
                 }
             };
             if entry.model == "*" {
-                wildcards.insert(frontend, WildcardTarget {
-                    provider: entry.upstream.clone(),
-                    upstream_model: entry.upstream_model.clone(),
-                });
+                wildcards.insert(
+                    frontend,
+                    WildcardTarget {
+                        provider: entry.upstream.clone(),
+                        upstream_model: entry.upstream_model.clone(),
+                    },
+                );
                 continue;
             }
             let key = RouteKey {
@@ -93,7 +96,12 @@ mod tests {
     use super::*;
     use agent_shim_config::{GatewayConfig, RouteEntry};
 
-    fn cfg_with_route(frontend: &str, model: &str, upstream: &str, upstream_model: &str) -> GatewayConfig {
+    fn cfg_with_route(
+        frontend: &str,
+        model: &str,
+        upstream: &str,
+        upstream_model: &str,
+    ) -> GatewayConfig {
         GatewayConfig {
             server: Default::default(),
             logging: Default::default(),
@@ -121,15 +129,24 @@ mod tests {
     fn unknown_model_returns_no_route() {
         let cfg = cfg_with_route("openai_chat", "gpt-4o", "my-upstream", "gpt-4o-2024-11-20");
         let router = StaticRouter::from_config(&cfg);
-        let err = router.resolve(FrontendKind::OpenAiChat, "unknown-model").unwrap_err();
+        let err = router
+            .resolve(FrontendKind::OpenAiChat, "unknown-model")
+            .unwrap_err();
         assert!(matches!(err, RouteError::NoRoute { .. }));
     }
 
     #[test]
     fn resolves_anthropic_route() {
-        let cfg = cfg_with_route("anthropic_messages", "claude-3-5-sonnet", "upstream-a", "claude-3-5-sonnet-20241022");
+        let cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-3-5-sonnet",
+            "upstream-a",
+            "claude-3-5-sonnet-20241022",
+        );
         let router = StaticRouter::from_config(&cfg);
-        let target = router.resolve(FrontendKind::AnthropicMessages, "claude-3-5-sonnet").unwrap();
+        let target = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-3-5-sonnet")
+            .unwrap();
         assert_eq!(target.provider, "upstream-a");
     }
 
@@ -144,10 +161,14 @@ mod tests {
         });
         let router = StaticRouter::from_config(&cfg);
         // Specific route wins
-        let t = router.resolve(FrontendKind::AnthropicMessages, "override").unwrap();
+        let t = router
+            .resolve(FrontendKind::AnthropicMessages, "override")
+            .unwrap();
         assert_eq!(t.provider, "other");
         // Wildcard catches anything else, passes model name through
-        let t = router.resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7").unwrap();
+        let t = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
         assert_eq!(t.provider, "copilot");
         assert_eq!(t.model, "claude-opus-4-7");
     }

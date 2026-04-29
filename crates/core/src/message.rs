@@ -76,7 +76,10 @@ mod tests {
 
     #[test]
     fn message_round_trips() {
-        let msg = Message::user(vec![ContentBlock::Text(TextBlock { text: "hi".into(), extensions: ExtensionMap::new() })]);
+        let msg = Message::user(vec![ContentBlock::Text(TextBlock {
+            text: "hi".into(),
+            extensions: ExtensionMap::new(),
+        })]);
         let json = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);

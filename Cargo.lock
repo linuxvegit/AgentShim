@@ -106,6 +106,7 @@ version = "0.1.0"
 dependencies = [
  "agent-shim-core",
  "agent-shim-frontends",
+ "agent-shim-router",
  "bytes",
  "futures",
  "futures-util",
@@ -148,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
+ "proptest",
  "serde",
  "thiserror 1.0.69",
  "tracing",

@@ -1,13 +1,16 @@
-use agent_shim_core::{
-    CanonicalRequest, ContentBlock, ExtensionMap, FrontendInfo, FrontendKind,
-    FrontendModel, GenerationOptions, Message, MessageRole, RequestMetadata, SystemInstruction,
-    SystemSource, TextBlock,
-};
 use agent_shim_core::ids::RequestId;
+use agent_shim_core::{
+    CanonicalRequest, ContentBlock, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
+    GenerationOptions, Message, MessageRole, RequestMetadata, SystemInstruction, SystemSource,
+    TextBlock,
+};
 use proptest::prelude::*;
 
 fn arb_text_block() -> impl Strategy<Value = TextBlock> {
-    ".*".prop_map(|text| TextBlock { text, extensions: ExtensionMap::new() })
+    ".*".prop_map(|text| TextBlock {
+        text,
+        extensions: ExtensionMap::new(),
+    })
 }
 
 fn arb_content_block() -> impl Strategy<Value = ContentBlock> {
@@ -26,11 +29,10 @@ fn arb_message() -> impl Strategy<Value = Message> {
 }
 
 fn arb_system_instruction() -> impl Strategy<Value = SystemInstruction> {
-    prop::collection::vec(arb_content_block(), 0..2)
-        .prop_map(|content| SystemInstruction {
-            source: SystemSource::AnthropicSystem,
-            content,
-        })
+    prop::collection::vec(arb_content_block(), 0..2).prop_map(|content| SystemInstruction {
+        source: SystemSource::AnthropicSystem,
+        content,
+    })
 }
 
 fn arb_request() -> impl Strategy<Value = CanonicalRequest> {

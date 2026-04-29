@@ -7,9 +7,7 @@ pub mod wire;
 use std::time::Duration;
 
 use agent_shim_core::{
-    request::CanonicalRequest,
-    response::CanonicalResponse,
-    stream::CanonicalStream,
+    request::CanonicalRequest, response::CanonicalResponse, stream::CanonicalStream,
     target::FrontendKind,
 };
 use futures_util::StreamExt;
@@ -26,7 +24,9 @@ impl AnthropicMessages {
     }
 
     pub fn with_keepalive(interval: Duration) -> Self {
-        Self { keepalive: Some(interval) }
+        Self {
+            keepalive: Some(interval),
+        }
     }
 }
 

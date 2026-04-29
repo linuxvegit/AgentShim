@@ -1,12 +1,15 @@
+use crate::handlers;
+use crate::shutdown::shutdown_signal;
+use crate::state::AppState;
+use agent_shim_observability::RequestIdLayer;
 use anyhow::Result;
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
-use agent_shim_observability::RequestIdLayer;
-use crate::handlers;
-use crate::state::AppState;
-use crate::shutdown::shutdown_signal;
 
 async fn healthz() -> &'static str {
     "ok"
@@ -25,12 +28,8 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Start the server, binding to the address in the config.
 pub async fn run(state: AppState) -> Result<()> {
-    let bind: SocketAddr = format!(
-        "{}:{}",
-        state.config.server.bind,
-        state.config.server.port
-    )
-    .parse()?;
+    let bind: SocketAddr =
+        format!("{}:{}", state.config.server.bind, state.config.server.port).parse()?;
 
     let app = build_router(state);
     info!("Listening on {}", bind);

@@ -1,5 +1,4 @@
 /// Wire types for outbound OpenAI chat.completions requests.
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -76,7 +75,10 @@ pub(crate) struct FunctionDefOut {
 #[serde(untagged)]
 pub(crate) enum ToolChoiceOut {
     String(String),
-    Object { r#type: String, function: ToolChoiceFunction },
+    Object {
+        r#type: String,
+        function: ToolChoiceFunction,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

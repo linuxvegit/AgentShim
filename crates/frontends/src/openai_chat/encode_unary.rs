@@ -1,20 +1,23 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::mapping::finish_reason_from_canonical;
+use super::wire::{
+    ChatCompletionOut, UnaryChoice, UnaryMessage, UnaryToolCall, UnaryToolCallFunction, UsageOut,
+};
+use crate::FrontendError;
 use agent_shim_core::{
-    content::ContentBlock,
-    response::CanonicalResponse,
-    tool::ToolCallArguments,
+    content::ContentBlock, response::CanonicalResponse, tool::ToolCallArguments,
 };
 use bytes::Bytes;
-use crate::FrontendError;
-use super::mapping::finish_reason_from_canonical;
-use super::wire::{ChatCompletionOut, UnaryChoice, UnaryMessage, UnaryToolCall, UnaryToolCallFunction, UsageOut};
 
 pub fn encode(response: CanonicalResponse) -> Result<Bytes, FrontendError> {
     encode_with_clock(response, None)
 }
 
-pub fn encode_with_clock(response: CanonicalResponse, clock_override: Option<u64>) -> Result<Bytes, FrontendError> {
+pub fn encode_with_clock(
+    response: CanonicalResponse,
+    clock_override: Option<u64>,
+) -> Result<Bytes, FrontendError> {
     let created = clock_override.unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

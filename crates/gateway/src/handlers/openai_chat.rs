@@ -54,14 +54,11 @@ pub async fn handle(
     }
 
     // Get provider
-    let provider = state
-        .providers
-        .get(&target.provider)
-        .ok_or_else(|| {
-            HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-                target.provider.clone(),
-            ))
-        })?;
+    let provider = state.providers.get(&target.provider).ok_or_else(|| {
+        HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
+            target.provider.clone(),
+        ))
+    })?;
 
     let is_stream = canonical.stream;
 
@@ -91,20 +88,21 @@ fn frontend_response_to_axum(resp: FrontendResponse) -> Response {
             let mut r = Response::new(Body::from(body));
             r.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
-                    HeaderValue::from_static("application/json")
-                }),
+                HeaderValue::from_str(&content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
             );
             r
         }
-        FrontendResponse::Stream { content_type, stream } => {
+        FrontendResponse::Stream {
+            content_type,
+            stream,
+        } => {
             let body = Body::from_stream(stream.map(|r| r.map_err(|e| e.to_string())));
             let mut r = Response::new(body);
             r.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type).unwrap_or_else(|_| {
-                    HeaderValue::from_static("text/event-stream")
-                }),
+                HeaderValue::from_str(&content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
             );
             r
         }
@@ -123,15 +121,17 @@ async fn collect_stream(
 
     let mut tool_names: std::collections::HashMap<u32, (ToolCallId, String)> =
         std::collections::HashMap::new();
-    let mut tool_args: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
-    let mut text_buf: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
+    let mut tool_args: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut text_buf: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
     while let Some(ev) = stream.next().await {
-        let ev = ev.map_err(|e| HandlerError::Provider(agent_shim_providers::ProviderError::Decode(e.to_string())))?;
+        let ev = ev.map_err(|e| {
+            HandlerError::Provider(agent_shim_providers::ProviderError::Decode(e.to_string()))
+        })?;
         match ev {
-            StreamEvent::ResponseStart { id: rid, model: m, .. } => {
+            StreamEvent::ResponseStart {
+                id: rid, model: m, ..
+            } => {
                 id = rid;
                 model = m;
             }
@@ -154,13 +154,23 @@ async fn collect_stream(
                     }));
                 }
             }
-            StreamEvent::ToolCallStart { index, id: tc_id, name } => {
+            StreamEvent::ToolCallStart {
+                index,
+                id: tc_id,
+                name,
+            } => {
                 tool_names.insert(index, (tc_id, name));
             }
-            StreamEvent::ToolCallArgumentsDelta { index, json_fragment } => {
+            StreamEvent::ToolCallArgumentsDelta {
+                index,
+                json_fragment,
+            } => {
                 tool_args.entry(index).or_default().push_str(&json_fragment);
             }
-            StreamEvent::MessageStop { stop_reason: sr, stop_sequence: ss } => {
+            StreamEvent::MessageStop {
+                stop_reason: sr,
+                stop_sequence: ss,
+            } => {
                 stop_reason = sr;
                 stop_sequence = ss;
             }

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-pub mod openai_compatible;
 pub mod github_copilot;
+pub mod openai_compatible;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,7 +45,9 @@ pub trait BackendProvider: Send + Sync {
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError>;
 
-    async fn list_models(&self) -> Result<Option<std::collections::BTreeSet<String>>, ProviderError> {
+    async fn list_models(
+        &self,
+    ) -> Result<Option<std::collections::BTreeSet<String>>, ProviderError> {
         Ok(None)
     }
 }

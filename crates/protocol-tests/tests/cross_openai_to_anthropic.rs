@@ -1,14 +1,10 @@
 // Decode an OpenAI request, then encode its response via the Anthropic frontend.
 use agent_shim_core::{
-    content::ContentBlock,
-    ids::ResponseId,
-    response::CanonicalResponse,
-    usage::StopReason,
+    content::ContentBlock, ids::ResponseId, response::CanonicalResponse, usage::StopReason,
 };
 use agent_shim_frontends::{
-    anthropic_messages::AnthropicMessages,
-    openai_chat::OpenAiChat,
-    FrontendProtocol, FrontendResponse,
+    anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat, FrontendProtocol,
+    FrontendResponse,
 };
 
 #[test]

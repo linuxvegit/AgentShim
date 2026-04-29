@@ -33,7 +33,10 @@ mod tests {
     #[test]
     fn event_format() {
         let b = event("message_start", r#"{"a":1}"#);
-        assert_eq!(std::str::from_utf8(&b).unwrap(), "event: message_start\ndata: {\"a\":1}\n\n");
+        assert_eq!(
+            std::str::from_utf8(&b).unwrap(),
+            "event: message_start\ndata: {\"a\":1}\n\n"
+        );
     }
 
     #[test]

@@ -9,11 +9,11 @@ use agent_shim_core::{
 };
 use serde_json::Value;
 
-use crate::FrontendError;
 use super::mapping::{role_to_canonical, RoleClass};
 use super::wire::{
     ChatCompletionsRequest, InboundContentPart, InboundMessageContent, InboundToolChoice,
 };
+use crate::FrontendError;
 
 pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let req: ChatCompletionsRequest =
@@ -25,9 +25,8 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let mut messages: Vec<Message> = Vec::new();
 
     for inbound in req.messages {
-        let role_class = role_to_canonical(&inbound.role).ok_or_else(|| {
-            FrontendError::InvalidBody(format!("unknown role: {}", inbound.role))
-        })?;
+        let role_class = role_to_canonical(&inbound.role)
+            .ok_or_else(|| FrontendError::InvalidBody(format!("unknown role: {}", inbound.role)))?;
 
         let text_content: Vec<ContentBlock> = match inbound.content {
             None => vec![],
@@ -126,9 +125,9 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
             "required" => ToolChoice::Required,
             _ => ToolChoice::Auto,
         },
-        Some(InboundToolChoice::Specific { function, .. }) => {
-            ToolChoice::Specific { name: function.name }
-        }
+        Some(InboundToolChoice::Specific { function, .. }) => ToolChoice::Specific {
+            name: function.name,
+        },
     };
 
     // -- max_tokens: prefer max_completion_tokens, fall back to max_tokens --
@@ -255,7 +254,12 @@ mod tests {
             r#","tool_choice":{"type":"function","function":{"name":"search"}}"#,
         ))
         .unwrap();
-        assert_eq!(req.tool_choice, ToolChoice::Specific { name: "search".into() });
+        assert_eq!(
+            req.tool_choice,
+            ToolChoice::Specific {
+                name: "search".into()
+            }
+        );
     }
 
     #[test]
@@ -303,6 +307,9 @@ mod tests {
     #[test]
     fn decode_response_format_json_object() {
         let req = decode(&minimal(r#","response_format":{"type":"json_object"}"#)).unwrap();
-        assert!(matches!(req.response_format, Some(ResponseFormat::JsonObject)));
+        assert!(matches!(
+            req.response_format,
+            Some(ResponseFormat::JsonObject)
+        ));
     }
 }

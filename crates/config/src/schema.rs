@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-use serde::{Deserialize, Serialize};
 use crate::secrets::Secret;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Top-level gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]

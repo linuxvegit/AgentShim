@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::ProviderError;
 use super::token_manager::CopilotToken;
+use crate::ProviderError;
 
 /// Fetch the list of available model IDs from the Copilot API.
 pub async fn list_models(
@@ -14,8 +14,14 @@ pub async fn list_models(
         .bearer_auth(&token.token)
         .header(reqwest::header::USER_AGENT, super::headers::USER_AGENT)
         .header("Editor-Version", super::headers::EDITOR_VERSION)
-        .header("Editor-Plugin-Version", super::headers::EDITOR_PLUGIN_VERSION)
-        .header("Copilot-Integration-Id", super::headers::COPILOT_INTEGRATION_ID)
+        .header(
+            "Editor-Plugin-Version",
+            super::headers::EDITOR_PLUGIN_VERSION,
+        )
+        .header(
+            "Copilot-Integration-Id",
+            super::headers::COPILOT_INTEGRATION_ID,
+        )
         .send()
         .await
         .map_err(|e| ProviderError::Network(e.to_string()))?;

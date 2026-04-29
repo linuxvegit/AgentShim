@@ -9,11 +9,11 @@ use bytes::Bytes;
 use futures_util::{stream::BoxStream, StreamExt};
 use parking_lot::Mutex;
 
-use crate::sse;
 use super::wire::{
     ContentBlockDelta, ContentBlockStartPayload, MessageDeltaPayload, MessageStartPayload,
     OutboundEvent, OutboundUsage,
 };
+use crate::sse;
 
 /// Mutable state threaded through SSE encoding.
 struct EncoderState {
@@ -111,7 +111,9 @@ pub fn encode(
                 s.block_kinds[idx] = kind;
 
                 let payload = match kind {
-                    ContentBlockKind::Text => ContentBlockStartPayload::Text { text: String::new() },
+                    ContentBlockKind::Text => ContentBlockStartPayload::Text {
+                        text: String::new(),
+                    },
                     ContentBlockKind::ToolCall => {
                         // We don't know id/name until ToolCallStart; emit a placeholder
                         ContentBlockStartPayload::ToolUse {
@@ -120,15 +122,22 @@ pub fn encode(
                             input: String::new(),
                         }
                     }
-                    ContentBlockKind::Reasoning => {
-                        ContentBlockStartPayload::Thinking { thinking: String::new() }
-                    }
+                    ContentBlockKind::Reasoning => ContentBlockStartPayload::Thinking {
+                        thinking: String::new(),
+                    },
                     ContentBlockKind::RedactedReasoning => {
-                        ContentBlockStartPayload::RedactedThinking { data: String::new() }
+                        ContentBlockStartPayload::RedactedThinking {
+                            data: String::new(),
+                        }
                     }
-                    _ => ContentBlockStartPayload::Text { text: String::new() },
+                    _ => ContentBlockStartPayload::Text {
+                        text: String::new(),
+                    },
                 };
-                let ev = OutboundEvent::ContentBlockStart { index, content_block: payload };
+                let ev = OutboundEvent::ContentBlockStart {
+                    index,
+                    content_block: payload,
+                };
                 if let Some(b) = serialize_event(&ev) {
                     chunks.push(Ok(b));
                 }
@@ -169,10 +178,15 @@ pub fn encode(
                 }
             }
 
-            StreamEvent::ToolCallArgumentsDelta { index, json_fragment } => {
+            StreamEvent::ToolCallArgumentsDelta {
+                index,
+                json_fragment,
+            } => {
                 let ev = OutboundEvent::ContentBlockDelta {
                     index,
-                    delta: ContentBlockDelta::InputJsonDelta { partial_json: json_fragment },
+                    delta: ContentBlockDelta::InputJsonDelta {
+                        partial_json: json_fragment,
+                    },
                 };
                 if let Some(b) = serialize_event(&ev) {
                     chunks.push(Ok(b));
@@ -196,7 +210,10 @@ pub fn encode(
                 s.output_tokens += usage.output_tokens.unwrap_or(0);
             }
 
-            StreamEvent::MessageStop { stop_reason, stop_sequence } => {
+            StreamEvent::MessageStop {
+                stop_reason,
+                stop_sequence,
+            } => {
                 use super::mapping::stop_reason_to_anthropic;
                 let s = state.lock();
                 let ev = OutboundEvent::MessageDelta {
@@ -223,8 +240,12 @@ pub fn encode(
             StreamEvent::ResponseStop { usage } => {
                 if let Some(u) = usage {
                     let mut s = state.lock();
-                    if let Some(it) = u.input_tokens { s.input_tokens = it; }
-                    if let Some(ot) = u.output_tokens { s.output_tokens = ot; }
+                    if let Some(it) = u.input_tokens {
+                        s.input_tokens = it;
+                    }
+                    if let Some(ot) = u.output_tokens {
+                        s.output_tokens = ot;
+                    }
                 }
             }
 
@@ -255,17 +276,19 @@ pub fn encode(
         let done2 = done.clone();
 
         // Wrap event stream to signal completion
-        let event_stream = event_stream.chain(futures_util::stream::once(async move {
-            done.store(true, Ordering::SeqCst);
-            // This item is filtered out below
-            Ok(Bytes::new())
-        })).filter(|item| {
-            let keep = match item {
-                Ok(b) => !b.is_empty(),
-                Err(_) => true,
-            };
-            futures::future::ready(keep)
-        });
+        let event_stream = event_stream
+            .chain(futures_util::stream::once(async move {
+                done.store(true, Ordering::SeqCst);
+                // This item is filtered out below
+                Ok(Bytes::new())
+            }))
+            .filter(|item| {
+                let keep = match item {
+                    Ok(b) => !b.is_empty(),
+                    Err(_) => true,
+                };
+                futures::future::ready(keep)
+            });
 
         use tokio_stream::wrappers::IntervalStream;
         let ping_stream = IntervalStream::new(tokio::time::interval(interval))
