@@ -68,6 +68,10 @@ impl ProviderRegistry {
         self.providers.get(name).cloned()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<dyn BackendProvider>)> {
+        self.providers.iter()
+    }
+
     pub fn resolve(
         &self,
         req: CanonicalRequest,

@@ -9,6 +9,7 @@ use agent_shim_providers::{
     openai_compatible::{self},
     ProviderRegistry,
 };
+use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::StaticRouter;
 
 #[derive(Clone)]
@@ -18,10 +19,11 @@ pub struct AppState {
     pub openai: Arc<OpenAiChat>,
     pub providers: Arc<ProviderRegistry>,
     pub router: Arc<StaticRouter>,
+    pub model_index: Arc<ModelIndex>,
 }
 
 impl AppState {
-    pub fn new(config: GatewayConfig) -> Self {
+    pub async fn new(config: GatewayConfig) -> Self {
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
         let anthropic = Arc::new(AnthropicMessages { keepalive: Some(keepalive) });
         let openai = Arc::new(OpenAiChat { keepalive: Some(keepalive), clock_override: None });
@@ -55,12 +57,30 @@ impl AppState {
 
         let router = Arc::new(StaticRouter::from_config(&config));
 
+        let mut discovered = std::collections::HashMap::new();
+        for (name, provider) in registry.iter() {
+            match provider.list_models().await {
+                Ok(Some(models)) => {
+                    tracing::info!(provider = %name, count = models.len(), "discovered models");
+                    discovered.insert(name.clone(), models);
+                }
+                Ok(None) => {
+                    tracing::debug!(provider = %name, "provider does not support model discovery");
+                }
+                Err(e) => {
+                    tracing::warn!(provider = %name, error = %e, "model discovery failed, skipping");
+                }
+            }
+        }
+        let model_index = Arc::new(ModelIndex::new(discovered));
+
         Self {
             config: Arc::new(config),
             anthropic,
             openai,
             providers: Arc::new(registry),
             router,
+            model_index,
         }
     }
 }
