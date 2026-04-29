@@ -1,6 +1,7 @@
 pub(crate) mod encode_request;
 pub(crate) mod parse_stream;
 pub(crate) mod parse_unary;
+pub(crate) mod responses_api;
 pub(crate) mod wire;
 
 use std::time::Duration;

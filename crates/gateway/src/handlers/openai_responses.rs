@@ -1,5 +1,11 @@
-use axum::{extract::State, http::HeaderMap, response::Response};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{HeaderMap, HeaderValue},
+    response::Response,
+};
 use bytes::Bytes;
+use futures::StreamExt;
 
 use agent_shim_core::{BackendTarget, FrontendKind};
 use agent_shim_frontends::FrontendProtocol;
@@ -9,6 +15,18 @@ use crate::state::AppState;
 
 use super::{collect_stream, frontend_response_to_axum, HandlerError};
 
+fn extract_model(body: &[u8]) -> Result<String, super::HandlerError> {
+    #[derive(serde::Deserialize)]
+    struct Minimal {
+        model: String,
+    }
+    let m: Minimal = serde_json::from_slice(body)
+        .map_err(|e| HandlerError::Frontend(agent_shim_frontends::FrontendError::InvalidBody(
+            format!("cannot extract model: {e}"),
+        )))?;
+    Ok(m.model)
+}
+
 pub async fn handle(
     State(state): State<AppState>,
     _headers: HeaderMap,
@@ -17,25 +35,19 @@ pub async fn handle(
     let body_bytes = body.len();
     let started = std::time::Instant::now();
 
-    let canonical = state
-        .openai
-        .decode_request(&body)
-        .map_err(HandlerError::Frontend)?;
-
-    let model_alias = canonical.model.as_str().to_string();
-    let is_stream = canonical.stream;
-    let max_tokens = canonical.generation.max_tokens;
+    let model_alias = extract_model(&body)?;
 
     let target = state
         .router
-        .resolve(FrontendKind::OpenAiChat, &model_alias)
+        .resolve(FrontendKind::OpenAiResponses, &model_alias)
         .map_err(|e| {
             tracing::warn!(model = %model_alias, error = %e, "no route");
             HandlerError::Route(e)
         })?;
 
     let mut target = target;
-    if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model) {
+    if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model)
+    {
         if resolved != target.model {
             tracing::info!(
                 requested = %target.model,
@@ -53,12 +65,10 @@ pub async fn handle(
     let upstream_model = target.model.clone();
 
     tracing::info!(
-        "→ /v1/chat/completions | model: {} → {} | bodyBytes: {} | maxTokens: {} | stream: {}",
+        "→ /v1/responses | model: {} → {} | bodyBytes: {}",
         model_alias,
         upstream_model,
-        body_bytes,
-        max_tokens.unwrap_or(0),
-        is_stream
+        body_bytes
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {
@@ -68,12 +78,49 @@ pub async fn handle(
         ))
     })?;
 
-    if is_stream {
-        let upstream_stream =
-            super::anthropic_messages::spawn_provider_stream(provider.clone(), canonical, target);
-        let frontend_response = state.openai.encode_stream(upstream_stream);
+    // Try raw passthrough first — avoids parse/re-encode round-trip
+    if let Some((content_type, byte_stream)) = provider
+        .proxy_raw(body.clone(), target.clone())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "proxy_raw failed");
+            HandlerError::Provider(e)
+        })?
+    {
         tracing::info!(
-            "← /v1/chat/completions (stream) | model: {} → {} | {:.1}s",
+            "← /v1/responses (passthrough) | model: {} → {} | {:.1}s",
+            model_alias,
+            upstream_model,
+            started.elapsed().as_secs_f64()
+        );
+        let body = Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
+        let mut r = Response::new(body);
+        r.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_str(&content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
+        );
+        return Ok(r);
+    }
+
+    // Fallback: full decode → canonical → encode
+    let canonical = state
+        .openai_responses
+        .decode_request(&body)
+        .map_err(HandlerError::Frontend)?;
+
+    let is_stream = canonical.stream;
+
+    if is_stream {
+        let upstream_stream = super::anthropic_messages::spawn_provider_stream(
+            provider.clone(),
+            canonical,
+            target,
+        );
+        let frontend_response =
+            state.openai_responses.encode_stream(upstream_stream);
+        tracing::info!(
+            "← /v1/responses (stream) | model: {} → {} | {:.1}s",
             model_alias,
             upstream_model,
             started.elapsed().as_secs_f64()
@@ -93,7 +140,7 @@ pub async fn handle(
             None => (0, 0),
         };
         tracing::info!(
-            "← /v1/chat/completions (unary) | model: {} → {} | input: {} | output: {} | {:.1}s",
+            "← /v1/responses (unary) | model: {} → {} | input: {} | output: {} | {:.1}s",
             model_alias,
             upstream_model,
             input,
@@ -101,7 +148,7 @@ pub async fn handle(
             started.elapsed().as_secs_f64()
         );
         let frontend_response = state
-            .openai
+            .openai_responses
             .encode_unary(response)
             .map_err(HandlerError::Frontend)?;
         Ok(frontend_response_to_axum(frontend_response))

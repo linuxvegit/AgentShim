@@ -35,6 +35,7 @@ impl StaticRouter {
             let frontend = match entry.frontend.as_str() {
                 "anthropic_messages" | "anthropic" => FrontendKind::AnthropicMessages,
                 "openai_chat" | "openai" => FrontendKind::OpenAiChat,
+                "openai_responses" | "responses" => FrontendKind::OpenAiResponses,
                 other => {
                     tracing::warn!("unknown frontend kind in route config: {other}");
                     continue;

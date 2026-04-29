@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_shim_config::{GatewayConfig, UpstreamConfig};
-use agent_shim_frontends::{anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat};
+use agent_shim_frontends::{
+    anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat,
+    openai_responses::OpenAiResponses,
+};
 use agent_shim_providers::{
     github_copilot::{self, credential_store},
     openai_compatible::{self},
@@ -17,6 +20,7 @@ pub struct AppState {
     pub config: Arc<GatewayConfig>,
     pub anthropic: Arc<AnthropicMessages>,
     pub openai: Arc<OpenAiChat>,
+    pub openai_responses: Arc<OpenAiResponses>,
     pub providers: Arc<ProviderRegistry>,
     pub router: Arc<StaticRouter>,
     pub model_index: Arc<ModelIndex>,
@@ -29,6 +33,10 @@ impl AppState {
             keepalive: Some(keepalive),
         });
         let openai = Arc::new(OpenAiChat {
+            keepalive: Some(keepalive),
+            clock_override: None,
+        });
+        let openai_responses = Arc::new(OpenAiResponses {
             keepalive: Some(keepalive),
             clock_override: None,
         });
@@ -83,6 +91,7 @@ impl AppState {
             config: Arc::new(config),
             anthropic,
             openai,
+            openai_responses,
             providers: Arc::new(registry),
             router,
             model_index,

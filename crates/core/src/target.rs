@@ -23,6 +23,7 @@ impl<S: Into<String>> From<S> for FrontendModel {
 pub enum FrontendKind {
     AnthropicMessages,
     OpenAiChat,
+    OpenAiResponses,
 }
 
 /// Information about the frontend that sent the request.

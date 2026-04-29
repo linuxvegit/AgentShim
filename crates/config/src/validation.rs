@@ -9,11 +9,18 @@ pub enum ValidationError {
     UnknownUpstream(String),
     #[error("duplicate route alias (frontend={0}, model={1})")]
     DuplicateAlias(String, String),
-    #[error("unknown frontend protocol: {0} (must be 'anthropic_messages' or 'openai_chat')")]
+    #[error("unknown frontend protocol: {0} (must be 'anthropic_messages', 'openai_chat', or 'openai_responses')")]
     UnknownFrontend(String),
 }
 
-const VALID_FRONTENDS: &[&str] = &["anthropic_messages", "openai_chat"];
+const VALID_FRONTENDS: &[&str] = &[
+    "anthropic_messages",
+    "anthropic",
+    "openai_chat",
+    "openai",
+    "openai_responses",
+    "responses",
+];
 
 pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
     if cfg.server.port == 0 {

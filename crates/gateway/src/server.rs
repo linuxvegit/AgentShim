@@ -21,6 +21,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handlers::anthropic_messages::handle))
         .route("/v1/chat/completions", post(handlers::openai_chat::handle))
+        .route("/v1/responses", post(handlers::openai_responses::handle))
         .layer(TraceLayer::new_for_http())
         .layer(RequestIdLayer)
         .with_state(state)

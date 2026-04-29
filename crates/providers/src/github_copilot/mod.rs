@@ -19,8 +19,8 @@ use uuid::Uuid;
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
 use crate::{
-    openai_compatible::{encode_request, parse_stream, parse_unary},
-    BackendProvider, ProviderCapabilities, ProviderError,
+    openai_compatible::{encode_request, parse_stream, parse_unary, responses_api},
+    BackendProvider, ProviderCapabilities, ProviderError, RawByteStream,
 };
 use credential_store::StoredCredentials;
 use headers::{
@@ -164,22 +164,34 @@ impl BackendProvider for CopilotProvider {
     ) -> Result<CanonicalStream, ProviderError> {
         let token = self.manager.get().await?;
         let api_base = token.api_base.clone();
-        let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
         let request_id = Uuid::new_v4().to_string();
         let is_stream = req.stream;
 
-        let body = encode_request::build(&req, &target.model);
+        let use_responses_api =
+            req.frontend.kind == agent_shim_core::FrontendKind::OpenAiResponses;
+
+        let (url, body_value) = if use_responses_api {
+            let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));
+            let body = responses_api::encode_request::build(&req, &target.model);
+            (url, body)
+        } else {
+            let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+            let body = serde_json::to_value(encode_request::build(&req, &target.model))
+                .unwrap_or_default();
+            (url, body)
+        };
 
         debug!(
             provider = "github_copilot",
             model = %target.model,
             stream = is_stream,
+            responses_api = use_responses_api,
             "sending request to Copilot"
         );
 
         let headers = Self::build_copilot_headers(&token, &request_id, is_stream)?;
 
-        let mut builder = self.http.post(&url).json(&body);
+        let mut builder = self.http.post(&url).json(&body_value);
         for (k, v) in &headers {
             builder = builder.header(k, v);
         }
@@ -225,7 +237,10 @@ impl BackendProvider for CopilotProvider {
             });
         }
 
-        if is_stream {
+        if use_responses_api {
+            // Responses API always streams (even non-streaming returns SSE)
+            Ok(responses_api::parse_stream::parse(response.bytes_stream()))
+        } else if is_stream {
             Ok(parse_stream::parse(response.bytes_stream()))
         } else {
             let bytes = response
@@ -243,5 +258,57 @@ impl BackendProvider for CopilotProvider {
             return Ok(None);
         }
         Ok(Some(models))
+    }
+
+    async fn proxy_raw(
+        &self,
+        body: bytes::Bytes,
+        _target: BackendTarget,
+    ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
+        let token = self.manager.get().await?;
+        let api_base = token.api_base.clone();
+        let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));
+        let request_id = Uuid::new_v4().to_string();
+
+        let headers = Self::build_copilot_headers(&token, &request_id, true)?;
+
+        let mut builder = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        for (k, v) in &headers {
+            builder = builder.header(k, v);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            self.manager.invalidate().await;
+            return Err(ProviderError::Upstream {
+                status: 401,
+                body: "Copilot token expired, invalidated – retry".to_string(),
+            });
+        }
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_string();
+
+        Ok(Some((content_type, Box::pin(response.bytes_stream()))))
     }
 }
