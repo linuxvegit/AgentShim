@@ -21,6 +21,32 @@ use crate::state::AppState;
 
 use super::HandlerError;
 
+struct StreamLogger {
+    model_alias: String,
+    upstream_model: String,
+    usage: Arc<Mutex<Option<Usage>>>,
+    started: std::time::Instant,
+}
+
+impl Drop for StreamLogger {
+    fn drop(&mut self) {
+        let u = self.usage.lock().clone();
+        let (input, output) = match u {
+            Some(ref usage) => (
+                usage.input_tokens.unwrap_or(0),
+                usage.output_tokens.unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
+        let elapsed = self.started.elapsed();
+        tracing::info!(
+            "← /v1/messages (stream) | model: {} → {} | input: {} | output: {} | {:.1}s",
+            self.model_alias, self.upstream_model, input, output,
+            elapsed.as_secs_f64()
+        );
+    }
+}
+
 pub async fn handle(
     State(state): State<AppState>,
     _headers: HeaderMap,
@@ -67,23 +93,30 @@ pub async fn handle(
 
     if is_stream {
         let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
-        let usage_for_log = usage_capture.clone();
-        let model_alias_log = model_alias.clone();
-        let upstream_model_log = upstream_model.clone();
 
-        let logging_stream = stream.map(move |event| {
-            if let Ok(ref ev) = event {
-                match ev {
-                    StreamEvent::UsageDelta { usage } => {
-                        *usage_capture.lock() = Some(usage.clone());
+        let logger = StreamLogger {
+            model_alias: model_alias.clone(),
+            upstream_model: upstream_model.clone(),
+            usage: usage_capture.clone(),
+            started,
+        };
+
+        let logging_stream = stream.map({
+            let usage_capture = usage_capture.clone();
+            move |event| {
+                if let Ok(ref ev) = event {
+                    match ev {
+                        StreamEvent::UsageDelta { usage } => {
+                            *usage_capture.lock() = Some(usage.clone());
+                        }
+                        StreamEvent::ResponseStop { usage: Some(u) } => {
+                            *usage_capture.lock() = Some(u.clone());
+                        }
+                        _ => {}
                     }
-                    StreamEvent::ResponseStop { usage: Some(u) } => {
-                        *usage_capture.lock() = Some(u.clone());
-                    }
-                    _ => {}
                 }
+                event
             }
-            event
         });
 
         let canonical_stream: agent_shim_core::CanonicalStream = Box::pin(logging_stream);
@@ -91,26 +124,9 @@ pub async fn handle(
 
         match frontend_response {
             FrontendResponse::Stream { content_type, stream: sse_stream } => {
-                let logged_stream = sse_stream.chain(futures::stream::once(async move {
-                    let elapsed = started.elapsed();
-                    let u = usage_for_log.lock().clone();
-                    let (input, output) = match u {
-                        Some(ref usage) => (
-                            usage.input_tokens.unwrap_or(0),
-                            usage.output_tokens.unwrap_or(0),
-                        ),
-                        None => (0, 0),
-                    };
-                    tracing::info!(
-                        "← /v1/messages (stream) | model: {} → {} | input: {} | output: {} | {:.1}s",
-                        model_alias_log, upstream_model_log, input, output,
-                        elapsed.as_secs_f64()
-                    );
-                    // Yield nothing — this is just for the side-effect log
-                    Err(agent_shim_frontends::FrontendError::Encode("__log_sentinel__".into()))
-                }).filter(|_| futures::future::ready(false)));
-
-                let body = Body::from_stream(logged_stream.map(|r| r.map_err(|e| e.to_string())));
+                // Wrap the SSE stream so the logger is held alive and dropped when stream ends
+                let guarded_stream = GuardedStream { inner: sse_stream, _logger: logger };
+                let body = Body::from_stream(guarded_stream.map(|r| r.map_err(|e| e.to_string())));
                 let mut r = Response::new(body);
                 r.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
@@ -150,6 +166,22 @@ pub async fn handle(
             }
             _ => unreachable!(),
         }
+    }
+}
+
+/// Wraps an SSE stream and holds the StreamLogger, which logs on drop.
+struct GuardedStream<S> {
+    inner: S,
+    _logger: StreamLogger,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for GuardedStream<S> {
+    type Item = S::Item;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
