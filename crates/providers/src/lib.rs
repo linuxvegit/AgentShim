@@ -44,6 +44,10 @@ pub trait BackendProvider: Send + Sync {
         req: CanonicalRequest,
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError>;
+
+    async fn list_models(&self) -> Result<Option<std::collections::BTreeSet<String>>, ProviderError> {
+        Ok(None)
+    }
 }
 
 #[derive(Default, Clone)]
@@ -73,5 +77,42 @@ impl ProviderRegistry {
             .get(&target.provider)
             .ok_or_else(|| ProviderError::UnknownProvider(target.provider.clone()))?;
         Ok((provider, req, target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
+
+    struct DummyProvider;
+
+    #[async_trait]
+    impl BackendProvider for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+        fn capabilities(&self) -> &ProviderCapabilities {
+            &ProviderCapabilities {
+                streaming: false,
+                tool_use: false,
+                vision: false,
+                json_mode: false,
+            }
+        }
+        async fn complete(
+            &self,
+            _req: CanonicalRequest,
+            _target: BackendTarget,
+        ) -> Result<CanonicalStream, ProviderError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn default_list_models_returns_none() {
+        let p = DummyProvider;
+        let result = p.list_models().await.unwrap();
+        assert!(result.is_none());
     }
 }
