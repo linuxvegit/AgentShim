@@ -189,6 +189,18 @@ impl BackendProvider for CopilotProvider {
             .map_err(|e| ProviderError::Network(e.to_string()))?;
 
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        tracing::debug!(
+            provider = "github_copilot",
+            %status,
+            %content_type,
+            "upstream response"
+        );
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             self.manager.invalidate().await;

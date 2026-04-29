@@ -25,8 +25,12 @@ where
 
     let event_stream = sse_stream.flat_map(move |result| {
         let events: Vec<Result<StreamEvent, StreamError>> = match result {
-            Err(e) => vec![Err(StreamError::Upstream(e.to_string()))],
+            Err(e) => {
+                tracing::warn!(error = %e, "SSE stream error");
+                vec![Err(StreamError::Upstream(e.to_string()))]
+            }
             Ok(event) => {
+                tracing::debug!(event_type = %event.event, data_len = event.data.len(), "SSE event received");
                 if event.data == "[DONE]" {
                     let mut evts = Vec::new();
                     // Close any open text block
