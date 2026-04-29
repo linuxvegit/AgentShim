@@ -5,6 +5,7 @@ pub mod headers;
 pub mod models;
 pub mod token_manager;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -216,5 +217,14 @@ impl BackendProvider for CopilotProvider {
                 .map_err(|e| ProviderError::Network(e.to_string()))?;
             Ok(parse_unary::parse(&bytes))
         }
+    }
+
+    async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
+        let token = self.manager.get().await?;
+        let models = models::list_models(&self.http, &token).await?;
+        if models.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(models))
     }
 }
