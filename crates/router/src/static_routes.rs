@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use agent_shim_config::GatewayConfig;
-use agent_shim_core::{BackendTarget, FrontendKind};
+use agent_shim_core::{request::ReasoningEffort, BackendTarget, FrontendKind};
 
 use crate::{RouteError, Router};
 
@@ -19,6 +19,7 @@ struct RouteKey {
 struct WildcardTarget {
     provider: String,
     upstream_model: String,
+    default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// A static router built from `GatewayConfig.routes`.
@@ -41,12 +42,23 @@ impl StaticRouter {
                     continue;
                 }
             };
+            let default_reasoning_effort = entry
+                .reasoning_effort
+                .as_deref()
+                .and_then(ReasoningEffort::parse);
+            if entry.reasoning_effort.is_some() && default_reasoning_effort.is_none() {
+                tracing::warn!(
+                    value = ?entry.reasoning_effort,
+                    "ignoring unknown reasoning_effort in route config (expected minimal/low/medium/high)"
+                );
+            }
             if entry.model == "*" {
                 wildcards.insert(
                     frontend,
                     WildcardTarget {
                         provider: entry.upstream.clone(),
                         upstream_model: entry.upstream_model.clone(),
+                        default_reasoning_effort,
                     },
                 );
                 continue;
@@ -58,6 +70,7 @@ impl StaticRouter {
             let target = BackendTarget {
                 provider: entry.upstream.clone(),
                 model: entry.upstream_model.clone(),
+                default_reasoning_effort,
             };
             routes.insert(key, target);
         }
@@ -83,6 +96,7 @@ impl Router for StaticRouter {
             return Ok(BackendTarget {
                 provider: wc.provider.clone(),
                 model: upstream_model,
+                default_reasoning_effort: wc.default_reasoning_effort,
             });
         }
         Err(RouteError::NoRoute {
@@ -112,6 +126,7 @@ mod tests {
                 model: model.to_string(),
                 upstream: upstream.to_string(),
                 upstream_model: upstream_model.to_string(),
+                reasoning_effort: None,
             }],
             copilot: None,
         }
@@ -159,6 +174,7 @@ mod tests {
             model: "override".to_string(),
             upstream: "other".to_string(),
             upstream_model: "other-model".to_string(),
+            reasoning_effort: None,
         });
         let router = StaticRouter::from_config(&cfg);
         // Specific route wins

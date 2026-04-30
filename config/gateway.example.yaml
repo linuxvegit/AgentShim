@@ -20,3 +20,8 @@ routes:
     model: deepseek-reasoner
     upstream: deepseek
     upstream_model: deepseek-reasoner
+    # Optional: default reasoning_effort applied when the request omits one.
+    # One of: minimal | low | medium | high
+    # Forwarded to upstreams that understand `reasoning_effort`
+    # (Copilot/GPT-5/o-series).
+    reasoning_effort: medium

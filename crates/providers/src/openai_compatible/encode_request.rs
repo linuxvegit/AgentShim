@@ -1,7 +1,8 @@
 /// Build an OpenAI-compatible outbound request body from a CanonicalRequest.
 use agent_shim_core::{
-    request::ResponseFormat, CanonicalRequest, ContentBlock, MessageRole, SystemSource,
-    ToolCallArguments, ToolChoice,
+    request::{ReasoningEffort, ResponseFormat},
+    BackendTarget, CanonicalRequest, ContentBlock, MessageRole, SystemSource, ToolCallArguments,
+    ToolChoice,
 };
 
 use super::wire::{
@@ -9,7 +10,8 @@ use super::wire::{
     StreamOptions, ToolCallOut, ToolChoiceFunction, ToolChoiceOut, ToolOut,
 };
 
-pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
+pub(crate) fn build(req: &CanonicalRequest, target: &BackendTarget) -> ChatBody {
+    let upstream_model = target.model.as_str();
     let mut messages: Vec<MsgOut> = Vec::new();
 
     // System instructions become system/developer messages at the front.
@@ -74,6 +76,29 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
             .collect();
 
         if !tool_results.is_empty() {
+            // Emit each tool result as its own "tool" role message FIRST.
+            //
+            // Tool results MUST immediately follow the assistant message that
+            // contained the corresponding tool_use blocks. Backends like
+            // GitHub Copilot's Vertex-Anthropic route enforce Anthropic's strict
+            // ordering rule and reject requests where any other message (e.g.
+            // a user text message) is interleaved between tool_use and
+            // tool_result. So the tool messages come first, and any sibling
+            // text content from the same user message is emitted afterwards.
+            for tr in &tool_results {
+                let text_content = extract_text_from_tool_result(&tr.content);
+                messages.push(MsgOut {
+                    role: "tool".to_string(),
+                    content: Some(serde_json::Value::String(text_content)),
+                    name: msg.name.clone(),
+                    tool_calls: None,
+                    tool_call_id: Some(tr.tool_call_id.0.clone()),
+                });
+            }
+
+            // Then emit any non-tool-result content (e.g. user text that
+            // accompanied the tool result in the same canonical message)
+            // as a separate message AFTER the tool replies.
             let non_tool_result_blocks = msg
                 .content
                 .iter()
@@ -90,17 +115,6 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
                         tool_call_id: None,
                     });
                 }
-            }
-            // Emit each tool result as its own message.
-            for tr in &tool_results {
-                let text_content = extract_text_from_tool_result(&tr.content);
-                messages.push(MsgOut {
-                    role: "tool".to_string(),
-                    content: Some(serde_json::Value::String(text_content)),
-                    name: msg.name.clone(),
-                    tool_calls: None,
-                    tool_call_id: Some(tr.tool_call_id.0.clone()),
-                });
             }
         } else if !tool_calls.is_empty() {
             // Assistant message with tool calls — content may also have text.
@@ -194,7 +208,16 @@ pub(crate) fn build(req: &CanonicalRequest, upstream_model: &str) -> ChatBody {
         tool_choice,
         stream: req.stream,
         stream_options,
+        reasoning_effort: resolve_reasoning_effort(req, target).map(|e| e.as_str().to_string()),
     }
+}
+
+fn resolve_reasoning_effort(req: &CanonicalRequest, target: &BackendTarget) -> Option<ReasoningEffort> {
+    req.generation
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort)
+        .or(target.default_reasoning_effort)
 }
 
 fn extract_text_content(blocks: &[ContentBlock]) -> String {
@@ -317,6 +340,14 @@ mod tests {
         RequestId, ToolCallId, ToolResultBlock,
     };
 
+    fn target(model: &str) -> BackendTarget {
+        BackendTarget {
+            provider: "test".into(),
+            model: model.into(),
+            default_reasoning_effort: None,
+        }
+    }
+
     fn request_with_messages(messages: Vec<Message>) -> CanonicalRequest {
         CanonicalRequest {
             id: RequestId::new(),
@@ -339,6 +370,12 @@ mod tests {
 
     #[test]
     fn mixed_text_and_tool_result_preserves_user_text() {
+        // When a user message has both text and a tool_result, the tool
+        // message MUST be emitted first so it sits immediately after the
+        // assistant's tool_use message. The accompanying user text follows
+        // afterwards to satisfy Anthropic-strict backends (e.g. Copilot's
+        // Vertex Claude route) which reject any other message between
+        // tool_use and tool_result.
         let req = request_with_messages(vec![Message::user(vec![
             ContentBlock::text("The tool returned this:"),
             ContentBlock::ToolResult(ToolResultBlock {
@@ -349,16 +386,65 @@ mod tests {
             }),
         ])]);
 
-        let body = build(&req, "gpt-test");
+        let body = build(&req, &target("gpt-test"));
 
         assert_eq!(body.messages.len(), 2);
-        assert_eq!(body.messages[0].role, "user");
+        assert_eq!(body.messages[0].role, "tool");
+        assert_eq!(body.messages[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(body.messages[0].content, Some(serde_json::json!("weather")));
+        assert_eq!(body.messages[1].role, "user");
         assert_eq!(
-            body.messages[0].content,
+            body.messages[1].content,
             Some(serde_json::json!("The tool returned this:"))
         );
+    }
+
+    #[test]
+    fn tool_result_immediately_follows_tool_use_message() {
+        // Regression test for the bug where Copilot's Vertex Claude backend
+        // returned: "tool_use ids were found without tool_result blocks
+        // immediately after". Reproduces the exact ordering scenario:
+        // assistant emits tool_use, then user replies with text + tool_result.
+        // The encoded sequence must be assistant(tool_calls) -> tool, with no
+        // user-text message interleaved.
+        use agent_shim_core::{ToolCallArguments, ToolCallBlock};
+
+        let req = request_with_messages(vec![
+            Message {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall(ToolCallBlock {
+                    id: ToolCallId::from_provider("toolu_vrtx_01"),
+                    name: "search".into(),
+                    arguments: ToolCallArguments::Complete {
+                        value: serde_json::json!({"q": "rust"}),
+                    },
+                    extensions: ExtensionMap::new(),
+                })],
+                name: None,
+                extensions: ExtensionMap::new(),
+            },
+            Message::user(vec![
+                ContentBlock::text("here is your result"),
+                ContentBlock::ToolResult(ToolResultBlock {
+                    tool_call_id: ToolCallId::from_provider("toolu_vrtx_01"),
+                    content: serde_json::json!("hello"),
+                    is_error: false,
+                    extensions: ExtensionMap::new(),
+                }),
+            ]),
+        ]);
+
+        let body = build(&req, &target("gpt-test"));
+
+        // Order MUST be: assistant(tool_calls), tool, user(text).
+        assert_eq!(body.messages.len(), 3, "got: {:#?}", body.messages);
+        assert_eq!(body.messages[0].role, "assistant");
+        assert!(body.messages[0].tool_calls.is_some());
         assert_eq!(body.messages[1].role, "tool");
-        assert_eq!(body.messages[1].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(body.messages[1].content, Some(serde_json::json!("weather")));
+        assert_eq!(
+            body.messages[1].tool_call_id.as_deref(),
+            Some("toolu_vrtx_01")
+        );
+        assert_eq!(body.messages[2].role, "user");
     }
 }

@@ -90,6 +90,7 @@ mod tests {
             model: "gpt-4".to_string(),
             upstream: "nonexistent".to_string(),
             upstream_model: "gpt-4".to_string(),
+            reasoning_effort: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -114,12 +115,14 @@ mod tests {
             model: "gpt-4".to_string(),
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
+            reasoning_effort: None,
         });
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
             model: "gpt-4".to_string(),
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
+            reasoning_effort: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -144,6 +147,7 @@ mod tests {
             model: "gpt-4".to_string(),
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
+            reasoning_effort: None,
         });
         assert!(matches!(
             validate(&cfg),

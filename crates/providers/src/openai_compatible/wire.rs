@@ -29,6 +29,9 @@ pub(crate) struct ChatBody {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// GPT-5 / Copilot reasoning effort: `minimal`, `low`, `medium`, `high`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

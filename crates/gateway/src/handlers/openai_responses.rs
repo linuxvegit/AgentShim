@@ -56,19 +56,25 @@ pub async fn handle(
                 "fuzzy model match"
             );
             target = BackendTarget {
-                provider: target.provider,
                 model: resolved.to_string(),
+                ..target
             };
         }
     }
 
     let upstream_model = target.model.clone();
 
+    // The Responses handler tries raw passthrough before decoding, so we only
+    // know the route-level default here. Per-request `reasoning.effort` from
+    // the body shows up in the upstream payload regardless.
+    let reasoning_effort = target.default_reasoning_effort;
+
     tracing::info!(
-        "→ /v1/responses | model: {} → {} | bodyBytes: {}",
+        "→ /v1/responses | model: {} → {} | bodyBytes: {} | reasoning_default: {}",
         model_alias,
         upstream_model,
-        body_bytes
+        body_bytes,
+        reasoning_effort.map(|e| e.as_str()).unwrap_or("none"),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {

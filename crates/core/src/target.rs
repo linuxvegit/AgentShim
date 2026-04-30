@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::request::ReasoningEffort;
+
 /// The model name as sent by the frontend client (e.g. "claude-3-5-sonnet-20241022").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -40,6 +42,10 @@ pub struct BackendTarget {
     pub provider: String,
     /// The model to use on the backend, after any model-mapping has been applied.
     pub model: String,
+    /// Default reasoning effort to apply when the request didn't specify one.
+    /// Configured per-route in `gateway.yaml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[cfg(test)]

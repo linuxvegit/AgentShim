@@ -110,7 +110,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
         req: CanonicalRequest,
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError> {
-        let body = encode_request::build(&req, &target.model);
+        let body = encode_request::build(&req, &target);
         let is_stream = req.stream;
 
         debug!(

@@ -171,11 +171,11 @@ impl BackendProvider for CopilotProvider {
 
         let (url, body_value) = if use_responses_api {
             let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));
-            let body = responses_api::encode_request::build(&req, &target.model);
+            let body = responses_api::encode_request::build(&req, &target);
             (url, body)
         } else {
             let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-            let body = serde_json::to_value(encode_request::build(&req, &target.model))
+            let body = serde_json::to_value(encode_request::build(&req, &target))
                 .unwrap_or_default();
             (url, body)
         };

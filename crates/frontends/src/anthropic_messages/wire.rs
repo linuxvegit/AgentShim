@@ -26,6 +26,17 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub metadata: Option<Value>,
+    /// Anthropic extended-thinking config: `{ "type": "enabled", "budget_tokens": N }`.
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkingConfig {
+    #[serde(default, rename = "type")]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub budget_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

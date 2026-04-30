@@ -18,6 +18,60 @@ pub struct GenerationOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
     pub seed: Option<u64>,
+    /// Reasoning / thinking control. Translated to provider-native form by
+    /// each backend (e.g. OpenAI/Copilot `reasoning_effort`, Anthropic
+    /// `thinking.budget_tokens`). `None` means the agent didn't ask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningOptions>,
+}
+
+/// Frontend-agnostic reasoning controls.
+///
+/// Models accept a qualitative effort level (`minimal`/`low`/`medium`/`high`)
+/// or — on Anthropic — an explicit token budget. We carry both so each backend
+/// can pick the form it understands.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningOptions {
+    /// Qualitative effort (OpenAI / Copilot / GPT-5 / o-series style).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    /// Explicit reasoning token budget (Anthropic-style).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
+/// Qualitative reasoning-effort levels accepted by Copilot / OpenAI / GPT-5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "minimal" | "none" => Some(ReasoningEffort::Minimal),
+            "low" => Some(ReasoningEffort::Low),
+            "medium" | "default" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            "xhigh" | "x-high" | "extra_high" | "max" => Some(ReasoningEffort::Xhigh),
+            _ => None,
+        }
+    }
 }
 
 /// Desired output format constraints.

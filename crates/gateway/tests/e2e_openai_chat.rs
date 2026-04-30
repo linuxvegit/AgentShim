@@ -30,6 +30,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             model: "gpt-4o".to_string(),
             upstream: "test-openai".to_string(),
             upstream_model: "gpt-4o-2024-11-20".to_string(),
+            reasoning_effort: None,
         }],
         copilot: None,
     }

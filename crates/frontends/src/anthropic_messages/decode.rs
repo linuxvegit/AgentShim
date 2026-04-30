@@ -3,7 +3,7 @@ use agent_shim_core::{
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
     message::{Message, SystemInstruction, SystemSource},
-    request::{CanonicalRequest, GenerationOptions, RequestMetadata},
+    request::{CanonicalRequest, GenerationOptions, ReasoningOptions, RequestMetadata},
     target::{FrontendInfo, FrontendKind, FrontendModel},
     tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };
@@ -92,12 +92,28 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     };
 
     // -- generation options --
+    let reasoning = req.thinking.as_ref().and_then(|t| {
+        // Anthropic's `type: "disabled"` / absent budget should not enable reasoning.
+        let enabled = t
+            .mode
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("enabled"))
+            .unwrap_or(t.budget_tokens.is_some());
+        if !enabled {
+            return None;
+        }
+        Some(ReasoningOptions {
+            effort: None,
+            budget_tokens: t.budget_tokens,
+        })
+    });
     let generation = GenerationOptions {
         max_tokens: Some(req.max_tokens),
         temperature: req.temperature,
         top_p: req.top_p,
         top_k: req.top_k,
         stop_sequences: req.stop_sequences.unwrap_or_default(),
+        reasoning,
         ..Default::default()
     };
 

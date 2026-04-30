@@ -1,10 +1,12 @@
 /// Build an OpenAI Responses API request body from a CanonicalRequest.
 use agent_shim_core::{
-    request::CanonicalRequest, ContentBlock, MessageRole, ToolCallArguments, ToolChoice,
+    request::CanonicalRequest, BackendTarget, ContentBlock, MessageRole, ToolCallArguments,
+    ToolChoice,
 };
 use serde_json::{json, Value};
 
-pub fn build(req: &CanonicalRequest, upstream_model: &str) -> Value {
+pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
+    let upstream_model = target.model.as_str();
     let mut body = json!({
         "model": upstream_model,
         "stream": req.stream,
@@ -141,6 +143,17 @@ pub fn build(req: &CanonicalRequest, upstream_model: &str) -> Value {
     }
     if let Some(top_p) = req.generation.top_p {
         body["top_p"] = json!(top_p);
+    }
+
+    // Reasoning effort (Responses API uses `reasoning: { effort: "..." }`).
+    let effort = req
+        .generation
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort)
+        .or(target.default_reasoning_effort);
+    if let Some(effort) = effort {
+        body["reasoning"] = json!({ "effort": effort.as_str() });
     }
 
     body

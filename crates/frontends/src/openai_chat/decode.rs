@@ -3,7 +3,7 @@ use agent_shim_core::{
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
     message::{Message, MessageRole, SystemInstruction},
-    request::{CanonicalRequest, GenerationOptions, RequestMetadata, ResponseFormat},
+    request::{CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata, ResponseFormat},
     target::{FrontendInfo, FrontendKind, FrontendModel},
     tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };
@@ -148,6 +148,14 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     });
 
     // -- generation --
+    let reasoning = req
+        .reasoning_effort
+        .as_deref()
+        .and_then(ReasoningEffort::parse)
+        .map(|effort| ReasoningOptions {
+            effort: Some(effort),
+            budget_tokens: None,
+        });
     let generation = GenerationOptions {
         max_tokens,
         temperature: req.temperature,
@@ -156,6 +164,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
         frequency_penalty: req.frequency_penalty,
         stop_sequences: req.stop.map(|s| s.into_vec()).unwrap_or_default(),
         seed: req.seed,
+        reasoning,
         ..Default::default()
     };
 

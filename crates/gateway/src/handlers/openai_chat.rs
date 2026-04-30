@@ -44,21 +44,29 @@ pub async fn handle(
                 "fuzzy model match"
             );
             target = BackendTarget {
-                provider: target.provider,
                 model: resolved.to_string(),
+                ..target
             };
         }
     }
 
     let upstream_model = target.model.clone();
 
+    let reasoning_effort = canonical
+        .generation
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort)
+        .or(target.default_reasoning_effort);
+
     tracing::info!(
-        "→ /v1/chat/completions | model: {} → {} | bodyBytes: {} | maxTokens: {} | stream: {}",
+        "→ /v1/chat/completions | model: {} → {} | bodyBytes: {} | maxTokens: {} | stream: {} | reasoning: {}",
         model_alias,
         upstream_model,
         body_bytes,
         max_tokens.unwrap_or(0),
-        is_stream
+        is_stream,
+        reasoning_effort.map(|e| e.as_str()).unwrap_or("none"),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {

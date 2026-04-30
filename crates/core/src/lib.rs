@@ -21,7 +21,10 @@ pub use extensions::ExtensionMap;
 pub use ids::{RequestId, ResponseId, ToolCallId};
 pub use media::BinarySource;
 pub use message::*;
-pub use request::{CanonicalRequest, GenerationOptions, RequestMetadata, ResponseFormat};
+pub use request::{
+    CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
+    ResponseFormat,
+};
 pub use response::CanonicalResponse;
 pub use stream::*;
 pub use target::{BackendTarget, FrontendInfo, FrontendKind, FrontendModel};

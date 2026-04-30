@@ -182,6 +182,31 @@ routes:
 
 Your agent requests `model: "fast"` or `model: "smart"` and AgentShim routes to the right backend.
 
+## Reasoning / thinking effort
+
+AgentShim translates "thinking effort" between dialects so any agent can drive any reasoning-capable backend:
+
+| Frontend dialect | Field accepted on inbound request |
+|---|---|
+| Anthropic `/v1/messages` | `thinking: { type: "enabled", budget_tokens: N }` |
+| OpenAI `/v1/chat/completions` | `reasoning_effort: "minimal" \| "low" \| "medium" \| "high" \| "xhigh"` |
+| OpenAI `/v1/responses` | `reasoning: { effort: "..." }` |
+
+On the way out, the value is forwarded to upstreams that understand it (Copilot/GPT-5/o-series as `reasoning_effort`; OpenAI Responses API as `reasoning.effort`).
+
+**Per-route default.** Set `reasoning_effort` on a route to apply a default when the agent doesn't send one:
+
+```yaml
+routes:
+  - frontend: anthropic_messages
+    model: claude-sonnet-4-5
+    upstream: copilot
+    upstream_model: claude-sonnet-4-5
+    reasoning_effort: high     # minimal | low | medium | high | xhigh
+```
+
+Request-level reasoning settings always win over the route default. Unknown values are logged and ignored.
+
 ## Environment variable overlay
 
 Any config field can be overridden via environment variables with the `AGENT_SHIM__` prefix (double underscore for nesting):
@@ -209,6 +234,7 @@ AGENT_SHIM__LOGGING__FORMAT=json
 | `routes[].model` | string | — | Model alias the agent requests |
 | `routes[].upstream` | string | — | Which upstream to route to |
 | `routes[].upstream_model` | string | — | Model name sent to the upstream |
+| `routes[].reasoning_effort` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` | — | Default thinking effort applied when the request omits one |
 
 Unknown fields are rejected at startup (`deny_unknown_fields`). Typos fail loudly.
 

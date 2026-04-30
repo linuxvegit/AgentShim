@@ -116,20 +116,36 @@ pub async fn handle(
                 "fuzzy model match"
             );
             target = BackendTarget {
-                provider: target.provider,
                 model: resolved.to_string(),
+                ..target
             };
         }
     }
 
     let upstream_model = target.model.clone();
 
+    let reasoning_effort = canonical
+        .generation
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort)
+        .or(target.default_reasoning_effort);
+    let reasoning_budget = canonical
+        .generation
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.budget_tokens);
+
     tracing::info!(
-        "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {}",
+        "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {} | reasoning: {}{}",
         model_alias,
         upstream_model,
         body_bytes,
-        max_tokens.unwrap_or(0)
+        max_tokens.unwrap_or(0),
+        reasoning_effort.map(|e| e.as_str()).unwrap_or("none"),
+        reasoning_budget
+            .map(|b| format!(" (budget {} tok)", b))
+            .unwrap_or_default(),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {

@@ -33,6 +33,9 @@ pub struct ChatCompletionsRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub user: Option<String>,
+    /// GPT-5 / o-series reasoning effort: `minimal`, `low`, `medium`, `high`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// `stop` can be either a single string or an array of strings.

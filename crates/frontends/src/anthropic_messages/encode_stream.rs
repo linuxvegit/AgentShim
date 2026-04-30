@@ -23,6 +23,11 @@ struct EncoderState {
     block_kinds: Vec<ContentBlockKind>,
     input_tokens: u32,
     output_tokens: u32,
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
+    /// Deferred stop reason — we wait for ResponseStop to emit message_delta/message_stop
+    /// so that final usage from the provider is included.
+    pending_stop: Option<(agent_shim_core::usage::StopReason, Option<String>)>,
 }
 
 impl EncoderState {
@@ -33,6 +38,9 @@ impl EncoderState {
             block_kinds: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            pending_stop: None,
         }
     }
 }
@@ -206,46 +214,65 @@ pub fn encode(
                 let mut s = state.lock();
                 s.input_tokens += usage.input_tokens.unwrap_or(0);
                 s.output_tokens += usage.output_tokens.unwrap_or(0);
+                if let Some(v) = usage.cache_creation_input_tokens {
+                    *s.cache_creation_input_tokens.get_or_insert(0) += v;
+                }
+                if let Some(v) = usage.cache_read_input_tokens {
+                    *s.cache_read_input_tokens.get_or_insert(0) += v;
+                }
             }
 
             StreamEvent::MessageStop {
                 stop_reason,
                 stop_sequence,
             } => {
-                use super::mapping::stop_reason_to_anthropic;
-                let s = state.lock();
-                let ev = OutboundEvent::MessageDelta {
-                    delta: MessageDeltaPayload {
-                        stop_reason: stop_reason_to_anthropic(&stop_reason).to_owned(),
-                        stop_sequence,
-                    },
-                    usage: OutboundUsage {
-                        input_tokens: s.input_tokens,
-                        output_tokens: s.output_tokens,
-                        cache_creation_input_tokens: None,
-                        cache_read_input_tokens: None,
-                    },
-                };
-                drop(s);
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
-                if let Some(b) = serialize_event(&OutboundEvent::MessageStop) {
-                    chunks.push(Ok(b));
-                }
-                done.store(true, Ordering::SeqCst);
-                chunks.push(Ok(Bytes::new()));
+                // Defer emission to ResponseStop so that any trailing UsageDelta
+                // events (common with OpenAI-compatible backends) are captured.
+                let mut s = state.lock();
+                s.pending_stop = Some((stop_reason, stop_sequence));
             }
 
             StreamEvent::ResponseStop { usage } => {
+                use super::mapping::stop_reason_to_anthropic;
+                let mut s = state.lock();
+                // Apply any final usage override from the provider.
                 if let Some(u) = usage {
-                    let mut s = state.lock();
                     if let Some(it) = u.input_tokens {
                         s.input_tokens = it;
                     }
                     if let Some(ot) = u.output_tokens {
                         s.output_tokens = ot;
                     }
+                    if let Some(v) = u.cache_creation_input_tokens {
+                        s.cache_creation_input_tokens = Some(v);
+                    }
+                    if let Some(v) = u.cache_read_input_tokens {
+                        s.cache_read_input_tokens = Some(v);
+                    }
+                }
+                // Now emit the deferred message_delta + message_stop.
+                if let Some((stop_reason, stop_sequence)) = s.pending_stop.take() {
+                    let ev = OutboundEvent::MessageDelta {
+                        delta: MessageDeltaPayload {
+                            stop_reason: stop_reason_to_anthropic(&stop_reason).to_owned(),
+                            stop_sequence,
+                        },
+                        usage: OutboundUsage {
+                            input_tokens: s.input_tokens,
+                            output_tokens: s.output_tokens,
+                            cache_creation_input_tokens: s.cache_creation_input_tokens,
+                            cache_read_input_tokens: s.cache_read_input_tokens,
+                        },
+                    };
+                    drop(s);
+                    if let Some(b) = serialize_event(&ev) {
+                        chunks.push(Ok(b));
+                    }
+                    if let Some(b) = serialize_event(&OutboundEvent::MessageStop) {
+                        chunks.push(Ok(b));
+                    }
+                    done.store(true, Ordering::SeqCst);
+                    chunks.push(Ok(Bytes::new()));
                 }
             }
 

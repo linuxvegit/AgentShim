@@ -117,6 +117,11 @@ pub struct RouteEntry {
     pub model: String,
     pub upstream: String,
     pub upstream_model: String,
+    /// Default reasoning effort applied when the inbound request doesn't set
+    /// one. One of `minimal`, `low`, `medium`, `high`. Forwarded to upstreams
+    /// that understand `reasoning_effort` (Copilot/GPT-5/o-series, Anthropic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[cfg(test)]
