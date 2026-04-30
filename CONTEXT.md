@@ -46,6 +46,30 @@ An `anthropic-beta` HTTP header value (e.g. `context-1m-2025-08-07`) that toggle
 
 `StreamEvent` is the canonical-model tagged union: `ResponseStart`, `TextDelta`, `ToolCallArgumentsDelta`, `ReasoningDelta`, `UsageDelta`, `MessageStop`, etc. Frontends and providers translate to/from this.
 
+**Interleaved reasoning**
+The canonical model carries reasoning as `ContentBlock::Reasoning` blocks ordered alongside `Text` and `ToolCall` blocks in the *same* `Vec<ContentBlock>`. Providers parse upstream output with an `in_reasoning: bool` state machine and emit `ContentBlockStart`/`ContentBlockStop` events around each reasoning↔text transition. Anthropic's `thinking → text → tool_use → thinking` pattern round-trips losslessly. DeepSeek's "all reasoning, then all content" is the degenerate case (one reasoning block, then one text block). Gemini's `thoughts: bool` flag on `parts` uses the same machinery. Lives in `agent-shim-providers::oai_chat_wire::interleaved_reasoning`.
+
+## Phase 2 architecture
+
+**Native provider**
+A `BackendProvider` impl built specifically for one upstream's wire format and quirks. Distinct from the generic `openai_compatible` shim — natives handle reasoning fields, cache-usage mappings, non-OpenAI streaming formats (e.g. Gemini's JSON-array stream), etc. v0.2 ships natives for `deepseek`, `gemini`, and `anthropic`.
+
+**oai_chat_wire**
+Crate-internal lib at `agent-shim-providers::oai_chat_wire` shared between the OpenAI-compat provider and any "OpenAI-Chat-shape with quirks" provider (DeepSeek, future Kimi/Qwen). Owns `canonical_to_chat`, `chat_sse_parser`, `chat_unary_parser`, `interleaved_reasoning`. Sibling provider modules compose it; they never `pub(crate)`-import each other.
+
+**Hybrid Anthropic path**
+The Anthropic-as-backend provider has two paths inside one `BackendProvider::complete()`:
+- **Passthrough path** — when `req.frontend.kind == FrontendKind::AnthropicMessages`, proxy the raw inbound bytes through `BackendProvider::proxy_raw`. Round-trip is byte-for-byte lossless on Anthropic-only features (`cache_control`, `thinking`, beta headers).
+- **Canonical path** — for any other frontend, translate `CanonicalRequest` → Anthropic Messages JSON and parse Anthropic SSE → `CanonicalStream`.
+
+Architectural invariant: same prompt routed through both paths must produce semantically equivalent output.
+
+**Capability gate**
+Pre-network-call check raised as `ProviderError::CapabilityMismatch` when the frontend sent content (e.g. an image) the target provider's `ProviderCapabilities` says it can't handle. Frontend renders a 400 in its dialect. Replaces the alternative of letting upstream return a confusing error.
+
+**Extensions namespace**
+`ContentBlock`, `Message`, `CanonicalRequest`, and `CanonicalResponse` carry `extensions: HashMap<String, serde_json::Value>` for protocol-specific data not promoted to canonical fields. v0.2 convention: keys are namespaced by provider — `gemini.safety_ratings`, `anthropic.cache_creation`, `deepseek.<...>`. Documented first-class behaviors live in `docs/providers/<provider>.md`. Promotion to typed canonical fields happens in v0.3 based on cross-provider read patterns, not prediction.
+
 ## Glossary maintenance
 
 When introducing a new domain concept, add it here in the same paragraph it gets named. Don't rename existing terms without a search-and-replace across the codebase.
