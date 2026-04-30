@@ -66,6 +66,15 @@ impl AppState {
                         Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
                     }
                 }
+                UpstreamConfig::Anthropic(_) => {
+                    // Anthropic provider wiring is implemented in Plan 01 Task 6.
+                    // For now the config variant exists but the provider is not yet
+                    // registered; routes referencing this upstream will fail at runtime.
+                    tracing::warn!(
+                        upstream = %name,
+                        "Anthropic upstream config recognized but provider not yet wired (Task 6)",
+                    );
+                }
             }
         }
 

@@ -86,6 +86,7 @@ impl Default for LoggingConfig {
 pub enum UpstreamConfig {
     OpenAiCompatible(OpenAiCompatibleUpstream),
     GithubCopilot,
+    Anthropic(AnthropicUpstream),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,8 +100,30 @@ pub struct OpenAiCompatibleUpstream {
     pub request_timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicUpstream {
+    #[serde(default = "default_anthropic_base_url")]
+    pub base_url: String,
+    pub api_key: Secret,
+    #[serde(default = "default_anthropic_version")]
+    pub anthropic_version: String,
+    #[serde(default)]
+    pub default_headers: BTreeMap<String, String>,
+    #[serde(default = "default_timeout")]
+    pub request_timeout_secs: u64,
+}
+
 fn default_timeout() -> u64 {
     30
+}
+
+fn default_anthropic_base_url() -> String {
+    "https://api.anthropic.com".to_string()
+}
+
+fn default_anthropic_version() -> String {
+    "2023-06-01".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,5 +187,51 @@ mod tests {
     fn log_format_pretty_default() {
         let cfg: LoggingConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.format, LogFormat::Pretty);
+    }
+
+    #[test]
+    fn anthropic_upstream_yaml_round_trip_with_defaults() {
+        // Minimal Anthropic upstream config; only api_key required.
+        let yaml = "type: anthropic\napi_key: sk-ant-test\n";
+        let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
+        let UpstreamConfig::Anthropic(a) = cfg else {
+            panic!("expected Anthropic variant");
+        };
+        assert_eq!(a.api_key.expose(), "sk-ant-test");
+        assert_eq!(a.base_url, "https://api.anthropic.com");
+        assert_eq!(a.anthropic_version, "2023-06-01");
+        assert_eq!(a.request_timeout_secs, 30);
+        assert!(a.default_headers.is_empty());
+    }
+
+    #[test]
+    fn anthropic_upstream_yaml_with_overrides() {
+        let yaml = "
+type: anthropic
+api_key: sk-ant-test
+base_url: https://custom.example.com
+anthropic_version: 2024-01-01
+request_timeout_secs: 60
+default_headers:
+  x-custom: value
+";
+        let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
+        let UpstreamConfig::Anthropic(a) = cfg else {
+            panic!("expected Anthropic variant");
+        };
+        assert_eq!(a.base_url, "https://custom.example.com");
+        assert_eq!(a.anthropic_version, "2024-01-01");
+        assert_eq!(a.request_timeout_secs, 60);
+        assert_eq!(
+            a.default_headers.get("x-custom"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
+    fn anthropic_upstream_unknown_field_rejected() {
+        let yaml = "type: anthropic\napi_key: sk-ant-test\nbogus: 1\n";
+        let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
     }
 }
