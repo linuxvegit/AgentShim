@@ -71,6 +71,12 @@ impl AppState {
                     Ok(p) => registry.register(name.clone(), Arc::new(p)),
                     Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
                 },
+                UpstreamConfig::Deepseek(_) => {
+                    // T6 will replace this stub with a real DeepSeek provider build.
+                    tracing::error!(
+                        "deepseek provider not wired yet (Plan 02 T6); skipping upstream {name}"
+                    );
+                }
             }
         }
 

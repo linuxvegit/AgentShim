@@ -87,6 +87,7 @@ pub enum UpstreamConfig {
     OpenAiCompatible(OpenAiCompatibleUpstream),
     GithubCopilot,
     Anthropic(AnthropicUpstream),
+    Deepseek(DeepseekUpstream),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +115,18 @@ pub struct AnthropicUpstream {
     pub request_timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepseekUpstream {
+    pub api_key: Secret,
+    #[serde(default = "default_deepseek_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_timeout")]
+    pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub default_headers: BTreeMap<String, String>,
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -124,6 +137,10 @@ fn default_anthropic_base_url() -> String {
 
 fn default_anthropic_version() -> String {
     "2023-06-01".to_string()
+}
+
+fn default_deepseek_base_url() -> String {
+    "https://api.deepseek.com/v1".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +248,50 @@ default_headers:
     #[test]
     fn anthropic_upstream_unknown_field_rejected() {
         let yaml = "type: anthropic\napi_key: sk-ant-test\nbogus: 1\n";
+        let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
+    }
+
+    #[test]
+    fn deepseek_upstream_yaml_round_trip_with_defaults() {
+        // Minimal DeepSeek upstream config; only api_key required.
+        let yaml = "type: deepseek\napi_key: sk-deepseek-test\n";
+        let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
+        let UpstreamConfig::Deepseek(d) = cfg else {
+            panic!("expected Deepseek variant");
+        };
+        assert_eq!(d.api_key.expose(), "sk-deepseek-test");
+        assert_eq!(d.base_url, "https://api.deepseek.com/v1");
+        assert_eq!(d.request_timeout_secs, 30);
+        assert!(d.default_headers.is_empty());
+    }
+
+    #[test]
+    fn deepseek_upstream_yaml_with_overrides() {
+        let yaml = "
+type: deepseek
+api_key: sk-deepseek-test
+base_url: https://custom.deepseek.example.com/v1
+request_timeout_secs: 60
+default_headers:
+  x-custom: value
+";
+        let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
+        let UpstreamConfig::Deepseek(d) = cfg else {
+            panic!("expected Deepseek variant");
+        };
+        assert_eq!(d.api_key.expose(), "sk-deepseek-test");
+        assert_eq!(d.base_url, "https://custom.deepseek.example.com/v1");
+        assert_eq!(d.request_timeout_secs, 60);
+        assert_eq!(
+            d.default_headers.get("x-custom"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
+    fn deepseek_upstream_unknown_field_rejected() {
+        let yaml = "type: deepseek\napi_key: sk-deepseek-test\nbogus: 1\n";
         let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
     }

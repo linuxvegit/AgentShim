@@ -78,6 +78,35 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
                 ));
             }
         }
+        // TODO follow-up: api_key + base_url checks duplicate the Anthropic
+        // branch above. Extract a helper once a third upstream lands (Plan
+        // 03/04 cleanup ticket).
+        if let UpstreamConfig::Deepseek(d) = upstream {
+            if d.api_key.expose().is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "api_key must be non-empty".to_string(),
+                ));
+            }
+            if d.base_url.is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "base_url must be non-empty".to_string(),
+                ));
+            }
+            if !d.base_url.starts_with("http://") && !d.base_url.starts_with("https://") {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "base_url must start with http:// or https://".to_string(),
+                ));
+            }
+            if d.request_timeout_secs == 0 {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "request_timeout_secs must be greater than 0".to_string(),
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -236,6 +265,75 @@ mod tests {
                 anthropic_version: "2023-06-01".to_string(),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+            }),
+        );
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::InvalidUpstream(_, _))
+        ));
+    }
+
+    #[test]
+    fn deepseek_upstream_validation_passes() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                api_key: Secret::new("sk-deepseek-test"),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                request_timeout_secs: 30,
+                default_headers: BTreeMap::new(),
+            }),
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn deepseek_validation_rejects_empty_api_key() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                api_key: Secret::new(""),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                request_timeout_secs: 30,
+                default_headers: BTreeMap::new(),
+            }),
+        );
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::InvalidUpstream(_, _))
+        ));
+    }
+
+    #[test]
+    fn deepseek_validation_rejects_bad_base_url() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                api_key: Secret::new("sk-deepseek-test"),
+                base_url: "ftp://api.deepseek.com/v1".to_string(),
+                request_timeout_secs: 30,
+                default_headers: BTreeMap::new(),
+            }),
+        );
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::InvalidUpstream(_, _))
+        ));
+    }
+
+    #[test]
+    fn deepseek_validation_rejects_zero_timeout() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                api_key: Secret::new("sk-deepseek-test"),
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                request_timeout_secs: 0,
+                default_headers: BTreeMap::new(),
             }),
         );
         assert!(matches!(
