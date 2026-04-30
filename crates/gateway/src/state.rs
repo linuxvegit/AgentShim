@@ -8,6 +8,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_providers::{
+    anthropic,
     github_copilot::{self, credential_store},
     openai_compatible::{self},
     ProviderRegistry,
@@ -66,14 +67,11 @@ impl AppState {
                         Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
                     }
                 }
-                UpstreamConfig::Anthropic(_) => {
-                    // Anthropic provider wiring is implemented in Plan 01 Task 6.
-                    // For now the config variant exists but the provider is not yet
-                    // registered; routes referencing this upstream will fail at runtime.
-                    tracing::warn!(
-                        upstream = %name,
-                        "Anthropic upstream config recognized but provider not yet wired (Task 6)",
-                    );
+                UpstreamConfig::Anthropic(cfg) => {
+                    match anthropic::from_config(name, cfg) {
+                        Ok(p) => registry.register(name.clone(), Arc::new(p)),
+                        Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
+                    }
                 }
             }
         }
