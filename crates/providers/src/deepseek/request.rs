@@ -17,5 +17,8 @@ use agent_shim_core::{BackendTarget, CanonicalRequest};
 /// cache-control strip) will be applied here.
 pub(crate) fn build(req: &CanonicalRequest, target: &BackendTarget) -> serde_json::Value {
     let body = crate::oai_chat_wire::canonical_to_chat::build(req, target);
-    serde_json::to_value(&body).unwrap_or_default()
+    // ChatBody is fully Serialize and never produces an error in practice;
+    // panic loudly if a future field-shape change ever breaks that invariant
+    // rather than silently sending `null` to the upstream.
+    serde_json::to_value(&body).expect("ChatBody serialization is infallible")
 }
