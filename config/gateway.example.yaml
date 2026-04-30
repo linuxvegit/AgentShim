@@ -11,6 +11,14 @@ upstreams:
     base_url: https://api.deepseek.com/v1
     api_key: "sk-your-deepseek-api-key-here"
     request_timeout_secs: 60
+  # Anthropic-as-backend (talks to api.anthropic.com directly):
+  # anthropic:
+  #   type: anthropic
+  #   api_key: "sk-ant-your-key-here"
+  #   # Optional overrides:
+  #   # base_url: https://api.anthropic.com
+  #   # anthropic_version: "2023-06-01"
+  #   # request_timeout_secs: 60
 routes:
   - frontend: openai_chat
     model: deepseek-chat
@@ -34,3 +42,15 @@ routes:
     upstream: copilot
     upstream_model: claude-opus-4-7
     anthropic_beta: context-1m-2025-08-07
+
+  # Anthropic frontend → Anthropic backend (byte-passthrough fast path)
+  # - frontend: anthropic_messages
+  #   model: claude-opus-4-7
+  #   upstream: anthropic
+  #   upstream_model: claude-opus-4-7
+
+  # OpenAI Chat frontend → Anthropic backend (canonical translation)
+  # - frontend: openai_chat
+  #   model: claude-via-oai
+  #   upstream: anthropic
+  #   upstream_model: claude-opus-4-7

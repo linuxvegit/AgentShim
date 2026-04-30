@@ -3,7 +3,9 @@ use agent_shim_core::{
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
     message::{Message, MessageRole, SystemInstruction, SystemSource},
-    request::{CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata},
+    request::{
+        CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
+    },
     target::{FrontendInfo, FrontendKind, FrontendModel},
     tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };

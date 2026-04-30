@@ -19,7 +19,8 @@ use uuid::Uuid;
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
 use crate::{
-    openai_compatible::{encode_request, parse_stream, parse_unary, responses_api},
+    oai_chat_wire::{canonical_to_chat, chat_sse_parser, chat_unary_parser},
+    openai_compatible::responses_api,
     BackendProvider, ProviderCapabilities, ProviderError, RawByteStream,
 };
 use credential_store::StoredCredentials;
@@ -175,8 +176,8 @@ impl BackendProvider for CopilotProvider {
             (url, body)
         } else {
             let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-            let body = serde_json::to_value(encode_request::build(&req, &target))
-                .unwrap_or_default();
+            let body =
+                serde_json::to_value(canonical_to_chat::build(&req, &target)).unwrap_or_default();
             (url, body)
         };
 
@@ -246,13 +247,13 @@ impl BackendProvider for CopilotProvider {
             // Responses API always streams (even non-streaming returns SSE)
             Ok(responses_api::parse_stream::parse(response.bytes_stream()))
         } else if is_stream {
-            Ok(parse_stream::parse(response.bytes_stream()))
+            Ok(chat_sse_parser::parse(response.bytes_stream()))
         } else {
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?;
-            Ok(parse_unary::parse(&bytes))
+            Ok(chat_unary_parser::parse(&bytes))
         }
     }
 
@@ -269,7 +270,13 @@ impl BackendProvider for CopilotProvider {
         &self,
         body: bytes::Bytes,
         target: BackendTarget,
+        frontend_kind: agent_shim_core::FrontendKind,
     ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
+        // Copilot's proxy_raw only knows the Responses API shape.
+        // For any other frontend, fall back to the canonical encode/decode path.
+        if frontend_kind != agent_shim_core::FrontendKind::OpenAiResponses {
+            return Ok(None);
+        }
         let token = self.manager.get().await?;
         let api_base = token.api_base.clone();
         let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));

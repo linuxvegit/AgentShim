@@ -127,7 +127,7 @@ pub async fn dispatch(
         );
 
         if let Some((content_type, byte_stream)) = provider
-            .proxy_raw(body.clone(), target.clone())
+            .proxy_raw(body.clone(), target.clone(), spec.frontend.kind())
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "proxy_raw failed");
@@ -141,8 +141,7 @@ pub async fn dispatch(
                 upstream_model,
                 started.elapsed().as_secs_f64()
             );
-            let body_stream =
-                Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
+            let body_stream = Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
             let mut r = Response::new(body_stream);
             r.headers_mut().insert(
                 axum::http::header::CONTENT_TYPE,
@@ -494,7 +493,10 @@ mod tests {
         h.insert("content-type", "application/json".parse().unwrap());
         h.insert("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
         h.insert("anthropic-version", "2023-06-01".parse().unwrap());
-        h.insert("anthropic-api-key", "secret-should-be-dropped".parse().unwrap());
+        h.insert(
+            "anthropic-api-key",
+            "secret-should-be-dropped".parse().unwrap(),
+        );
         h.insert("ANTHROPIC-AUTH-TOKEN", "another-secret".parse().unwrap());
 
         let captured = capture_anthropic_headers(&h);

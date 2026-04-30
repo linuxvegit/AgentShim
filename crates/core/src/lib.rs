@@ -5,6 +5,7 @@ pub mod content;
 pub mod error;
 pub mod extensions;
 pub mod ids;
+pub mod mapping;
 pub mod media;
 pub mod message;
 pub mod policy;

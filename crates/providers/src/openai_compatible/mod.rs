@@ -1,8 +1,4 @@
-pub(crate) mod encode_request;
-pub(crate) mod parse_stream;
-pub(crate) mod parse_unary;
 pub(crate) mod responses_api;
-pub(crate) mod wire;
 
 use std::time::Duration;
 
@@ -110,7 +106,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
         req: CanonicalRequest,
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError> {
-        let body = encode_request::build(&req, &target);
+        let body = crate::oai_chat_wire::canonical_to_chat::build(&req, &target);
         let is_stream = req.stream;
 
         debug!(
@@ -134,8 +130,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
         // Forward Anthropic-style negotiation headers (e.g. anthropic-beta for
         // 1M context). Inbound value wins; falls back to per-route default.
-        request_builder =
-            apply_anthropic_passthrough_headers(request_builder, &req, &target);
+        request_builder = apply_anthropic_passthrough_headers(request_builder, &req, &target);
 
         let response = request_builder
             .send()
@@ -162,13 +157,13 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
         if is_stream {
             let byte_stream = response.bytes_stream();
-            Ok(parse_stream::parse(byte_stream))
+            Ok(crate::oai_chat_wire::chat_sse_parser::parse(byte_stream))
         } else {
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?;
-            Ok(parse_unary::parse(&bytes))
+            Ok(crate::oai_chat_wire::chat_unary_parser::parse(&bytes))
         }
     }
 
@@ -211,7 +206,13 @@ impl BackendProvider for OpenAiCompatibleProvider {
         &self,
         body: bytes::Bytes,
         target: BackendTarget,
+        frontend_kind: agent_shim_core::FrontendKind,
     ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
+        // OpenAI-compat's proxy_raw only knows the Responses API shape.
+        // For any other frontend, fall back to the canonical encode/decode path.
+        if frontend_kind != agent_shim_core::FrontendKind::OpenAiResponses {
+            return Ok(None);
+        }
         let body = Self::rewrite_model(body, &target.model)?;
         let mut request_builder = self
             .client

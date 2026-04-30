@@ -11,6 +11,8 @@ pub enum ValidationError {
     DuplicateAlias(String, String),
     #[error("unknown frontend protocol: {0} (must be 'anthropic_messages', 'openai_chat', or 'openai_responses')")]
     UnknownFrontend(String),
+    #[error("upstream {0}: {1}")]
+    InvalidUpstream(String, String),
 }
 
 const VALID_FRONTENDS: &[&str] = &[
@@ -46,6 +48,35 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         let key = (route.frontend.clone(), route.model.clone());
         if !seen.insert(key.clone()) {
             return Err(ValidationError::DuplicateAlias(key.0, key.1));
+        }
+    }
+
+    for (name, upstream) in &cfg.upstreams {
+        if let UpstreamConfig::Anthropic(a) = upstream {
+            if a.api_key.expose().is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "api_key must be non-empty".to_string(),
+                ));
+            }
+            if a.base_url.is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "base_url must be non-empty".to_string(),
+                ));
+            }
+            if !a.base_url.starts_with("http://") && !a.base_url.starts_with("https://") {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "base_url must start with http:// or https://".to_string(),
+                ));
+            }
+            if a.anthropic_version.is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "anthropic_version must be non-empty".to_string(),
+                ));
+            }
         }
     }
 
@@ -156,6 +187,60 @@ mod tests {
         assert!(matches!(
             validate(&cfg),
             Err(ValidationError::UnknownFrontend(_))
+        ));
+    }
+
+    #[test]
+    fn anthropic_upstream_validation_passes() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "anthropic".to_string(),
+            UpstreamConfig::Anthropic(AnthropicUpstream {
+                base_url: "https://api.anthropic.com".to_string(),
+                api_key: Secret::new("sk-ant-test"),
+                anthropic_version: "2023-06-01".to_string(),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn anthropic_upstream_empty_api_key_fails() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "anthropic".to_string(),
+            UpstreamConfig::Anthropic(AnthropicUpstream {
+                base_url: "https://api.anthropic.com".to_string(),
+                api_key: Secret::new(""),
+                anthropic_version: "2023-06-01".to_string(),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::InvalidUpstream(_, _))
+        ));
+    }
+
+    #[test]
+    fn anthropic_upstream_bad_base_url_fails() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "anthropic".to_string(),
+            UpstreamConfig::Anthropic(AnthropicUpstream {
+                base_url: "ftp://api.anthropic.com".to_string(),
+                api_key: Secret::new("sk-ant-test"),
+                anthropic_version: "2023-06-01".to_string(),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        assert!(matches!(
+            validate(&cfg),
+            Err(ValidationError::InvalidUpstream(_, _))
         ));
     }
 }

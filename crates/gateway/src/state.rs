@@ -8,6 +8,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_providers::{
+    anthropic,
     github_copilot::{self, credential_store},
     openai_compatible::{self},
     ProviderRegistry,
@@ -66,6 +67,10 @@ impl AppState {
                         Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
                     }
                 }
+                UpstreamConfig::Anthropic(cfg) => match anthropic::from_config(name, cfg) {
+                    Ok(p) => registry.register(name.clone(), Arc::new(p)),
+                    Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
+                },
             }
         }
 

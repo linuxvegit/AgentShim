@@ -17,7 +17,7 @@ pub async fn handle(
         frontend: state.anthropic.as_ref(),
         endpoint_label: "/v1/messages",
         capture_anthropic_headers: true,
-        try_proxy_raw: false,
+        try_proxy_raw: true,
         log_streaming_usage_on_drop: true,
     };
     dispatch(&state, spec, headers, body).await
