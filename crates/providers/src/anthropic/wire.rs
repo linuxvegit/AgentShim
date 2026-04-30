@@ -98,7 +98,8 @@ pub(crate) enum OutgoingContentBlock {
     },
     Thinking {
         thinking: String,
-        signature: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     RedactedThinking {
         data: String,

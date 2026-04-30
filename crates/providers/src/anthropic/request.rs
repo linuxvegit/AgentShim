@@ -32,10 +32,21 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Extension keys (namespace `anthropic.*`) carried through the canonical
 /// model that need to be lifted onto the outbound wire shape.
+///
+/// Extension key conventions: provider canonical path reads BOTH the new
+/// namespaced keys (`anthropic.cache_control`, `anthropic.signature`) AND
+/// the unprefixed legacy keys (`cache_control`, `signature`) that the
+/// existing Anthropic frontend writes during decode. This preserves
+/// round-trip fidelity for Anthropic-frontend → canonical → Anthropic-provider
+/// flows. A future plan will migrate the frontend to write the namespaced
+/// keys, at which point the legacy aliases here can be removed.
 const EXT_CACHE_CONTROL: &str = "anthropic.cache_control";
 /// Backwards-compatible alias used by the Anthropic frontend's decoder.
+/// See [`EXT_CACHE_CONTROL`] for the dual-read rationale.
 const EXT_CACHE_CONTROL_LEGACY: &str = "cache_control";
 const EXT_SIGNATURE: &str = "anthropic.signature";
+/// Backwards-compatible alias used by the Anthropic frontend's decoder.
+/// See [`EXT_CACHE_CONTROL`] for the dual-read rationale.
 const EXT_SIGNATURE_LEGACY: &str = "signature";
 
 pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
@@ -168,7 +179,7 @@ fn content_block_to_outgoing(block: &ContentBlock) -> Option<OutgoingContentBloc
         }
         ContentBlock::Reasoning(r) => Some(OutgoingContentBlock::Thinking {
             thinking: r.text.clone(),
-            signature: signature_from_ext(&r.extensions).unwrap_or_default(),
+            signature: signature_from_ext(&r.extensions),
         }),
         ContentBlock::RedactedReasoning(r) => Some(OutgoingContentBlock::RedactedThinking {
             data: r.data.clone(),
@@ -573,6 +584,33 @@ mod tests {
             "thinking out loud"
         );
         assert_eq!(body["messages"][0]["content"][0]["signature"], "sig-abc");
+    }
+
+    #[test]
+    fn thinking_block_omits_empty_signature() {
+        // A Reasoning block without a signature extension must produce a wire
+        // block where the `signature` field is ABSENT (not `""`). Anthropic
+        // rejects extended-thinking blocks with empty signatures during
+        // multi-turn replays.
+        let mut req = empty_request(false);
+        req.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Reasoning(ReasoningBlock {
+                text: "thinking out loud".into(),
+                extensions: ExtensionMap::new(),
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let body = build(&req, &target());
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "thinking out loud");
+        let obj = block.as_object().expect("thinking block is an object");
+        assert!(
+            !obj.contains_key("signature"),
+            "signature field must be omitted when no extension is present, got: {block:?}"
+        );
     }
 
     #[test]
