@@ -6,8 +6,9 @@
 pub(crate) mod canonical_to_chat;
 pub(crate) mod chat_sse_parser;
 pub(crate) mod chat_unary_parser;
-// Consumed by sibling provider modules in Plan 02 T4 (DeepSeek) and Plan 03
-// (Gemini). Until those land, the public items are only exercised by tests.
-#[allow(dead_code)]
+// Consumed by `deepseek/response.rs` (Plan 02 T4) and slated for use by the
+// Gemini provider in Plan 03. The `#[allow(dead_code)]` gate that lived here
+// before T4 was removed once the DeepSeek SSE parser became the first
+// consumer of `DeltaKind` and `ReasoningInterleaver`.
 pub(crate) mod interleaved_reasoning;
 pub(crate) mod wire;

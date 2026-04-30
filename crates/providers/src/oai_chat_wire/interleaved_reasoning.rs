@@ -61,8 +61,24 @@ pub struct ReasoningInterleaver {
 }
 
 impl ReasoningInterleaver {
+    /// Construct an idle interleaver with no blocks open. Equivalent to
+    /// [`ReasoningInterleaver::default`]; both forms exist because callers
+    /// embed the interleaver inside larger `#[derive(Default)]` state structs
+    /// (which use `default`) while tests prefer the more explicit `new`.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns the next block index that would be allocated by a future
+    /// transition out of `Idle`. Consumers use this to allocate indices for
+    /// peer block kinds (e.g. tool_calls) AFTER any text/reasoning blocks
+    /// owned by this interleaver. Note that calling [`Self::flush`] does NOT
+    /// advance `next_index`; only opening a new block does. So a caller that
+    /// wants tool indices to start strictly after the last interleaver block
+    /// should `flush` first (which closes the open block) and then read this.
+    pub(crate) fn next_index(&self) -> u32 {
+        self.next_index
     }
 
     /// Push a delta. Emits the right combination of `ContentBlockStart` /
