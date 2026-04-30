@@ -1,4 +1,5 @@
-/// Parse an SSE byte-stream from OpenAI into a CanonicalStream.
+//! Parse an SSE byte-stream from OpenAI into a CanonicalStream.
+
 use std::collections::HashSet;
 
 use eventsource_stream::Eventsource;

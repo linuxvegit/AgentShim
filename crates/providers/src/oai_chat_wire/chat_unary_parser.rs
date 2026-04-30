@@ -1,4 +1,5 @@
-/// Parse a non-streaming OpenAI chat.completions JSON response into a CanonicalStream.
+//! Parse a non-streaming OpenAI chat.completions JSON response into a CanonicalStream.
+
 use futures::stream;
 
 use agent_shim_core::{

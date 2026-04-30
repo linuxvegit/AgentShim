@@ -1,4 +1,5 @@
-/// Build an OpenAI-compatible outbound request body from a CanonicalRequest.
+//! Build an OpenAI-compatible outbound request body from a CanonicalRequest.
+
 use agent_shim_core::{
     request::ResponseFormat, BackendTarget, CanonicalRequest, ContentBlock, MessageRole,
     SystemSource, ToolCallArguments, ToolChoice,

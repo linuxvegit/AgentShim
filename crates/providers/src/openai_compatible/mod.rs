@@ -1,12 +1,3 @@
-// Re-export the shared OpenAI-Chat-shape primitives as siblings under
-// openai_compatible's namespace so the existing internal call sites in
-// mod.rs (e.g. `encode_request::build`, `parse_stream::parse`) keep working.
-// The Responses API submodule stays separate.
-pub(crate) use crate::oai_chat_wire::{
-    canonical_to_chat as encode_request, chat_sse_parser as parse_stream,
-    chat_unary_parser as parse_unary,
-};
-
 pub(crate) mod responses_api;
 
 use std::time::Duration;
@@ -115,7 +106,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
         req: CanonicalRequest,
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError> {
-        let body = encode_request::build(&req, &target);
+        let body = crate::oai_chat_wire::canonical_to_chat::build(&req, &target);
         let is_stream = req.stream;
 
         debug!(
@@ -167,13 +158,13 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
         if is_stream {
             let byte_stream = response.bytes_stream();
-            Ok(parse_stream::parse(byte_stream))
+            Ok(crate::oai_chat_wire::chat_sse_parser::parse(byte_stream))
         } else {
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?;
-            Ok(parse_unary::parse(&bytes))
+            Ok(crate::oai_chat_wire::chat_unary_parser::parse(&bytes))
         }
     }
 
