@@ -3,18 +3,29 @@
 //! Messages API. Implements the hybrid passthrough+canonical path described
 //! in ADR-0001.
 //!
-//! v0.2 ships the passthrough path: when the inbound frontend is
-//! `anthropic_messages`, the gateway forwards the raw bytes through
-//! `proxy_raw` so all Anthropic-only features (`cache_control`, `thinking`,
-//! beta headers) round-trip byte-for-byte. The canonical path (for OpenAI
-//! Chat/Responses inbound) is added in Task 5.
+//! Two paths share this provider:
+//!
+//! * **Passthrough** ([`passthrough::send`]) — when the inbound frontend is
+//!   `anthropic_messages`, the gateway forwards the raw bytes through
+//!   `proxy_raw` so all Anthropic-only features (`cache_control`, `thinking`,
+//!   beta headers) round-trip byte-for-byte.
+//! * **Canonical** ([`request::build`] + [`response::parse_stream`] /
+//!   [`response::parse_unary`]) — for OpenAI Chat / OpenAI Responses inbound,
+//!   the canonical request is encoded into Anthropic's `/v1/messages` JSON
+//!   shape and the upstream's SSE / unary response is decoded back into a
+//!   `CanonicalStream`. This is the inverse of the Anthropic frontend's
+//!   `decode` + `encode_stream` modules.
 
 pub(crate) mod passthrough;
+pub(crate) mod request;
+pub(crate) mod response;
+pub(crate) mod wire;
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
+use tracing::{debug, warn};
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream, FrontendKind};
 
@@ -87,19 +98,71 @@ impl BackendProvider for AnthropicProvider {
 
     async fn complete(
         &self,
-        _req: CanonicalRequest,
-        _target: BackendTarget,
+        req: CanonicalRequest,
+        target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError> {
-        // Canonical path is implemented in Task 5. For now it returns an
-        // error so any non-Anthropic-frontend route fails fast with a clear
-        // message rather than silently producing wrong output.
-        Err(ProviderError::CapabilityMismatch(
-            "Anthropic-as-backend canonical path is not yet supported. \
-             This route translates a non-Anthropic frontend request to Anthropic Messages \
-             and is not implemented yet. Use the anthropic_messages frontend, or pick an \
-             OpenAI-compatible backend for OpenAI-shape inbound requests."
-                .into(),
-        ))
+        let body = request::build(&req, &target);
+        let is_stream = req.stream;
+
+        debug!(
+            provider = self.name,
+            model = %target.model,
+            stream = is_stream,
+            "sending canonical request to Anthropic"
+        );
+
+        let mut request_builder = self
+            .client
+            .post(self.messages_url())
+            .header("x-api-key", self.api_key.as_str())
+            .header("anthropic-version", self.anthropic_version.as_str())
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body);
+
+        // Configured default headers (e.g. an organization-level operator override).
+        for (k, v) in &self.default_headers {
+            request_builder = request_builder.header(k, v);
+        }
+
+        // Replay any captured per-request `anthropic-*` headers + per-route
+        // `default_anthropic_beta`. The pipeline already merged them into
+        // `req.resolved_policy.anthropic_headers` via `RoutePolicy::resolve`.
+        for (key, value) in &req.resolved_policy.anthropic_headers {
+            request_builder = request_builder.header(key.as_str(), value.as_str());
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            warn!(
+                provider = self.name,
+                status = status.as_u16(),
+                body = %body_text,
+                "anthropic upstream returned error"
+            );
+            return Err(ProviderError::Upstream {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+
+        if is_stream {
+            Ok(response::parse_stream(response.bytes_stream()))
+        } else {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?;
+            Ok(response::parse_unary(&bytes))
+        }
     }
 
     async fn proxy_raw(
