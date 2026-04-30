@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-shim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-core",
  "figment",
@@ -55,7 +55,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bytes",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-frontends"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-core",
  "async-trait",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-observability"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-config",
  "http",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-protocol-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-core",
  "agent-shim-frontends",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-providers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-router"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
