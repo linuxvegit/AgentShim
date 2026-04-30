@@ -130,8 +130,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
         // Forward Anthropic-style negotiation headers (e.g. anthropic-beta for
         // 1M context). Inbound value wins; falls back to per-route default.
-        request_builder =
-            apply_anthropic_passthrough_headers(request_builder, &req, &target);
+        request_builder = apply_anthropic_passthrough_headers(request_builder, &req, &target);
 
         let response = request_builder
             .send()

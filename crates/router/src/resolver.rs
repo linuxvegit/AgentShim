@@ -92,11 +92,7 @@ mod tests {
         }
     }
 
-    fn resolver_with(
-        cfg: GatewayConfig,
-        provider: &str,
-        discovered: &[&str],
-    ) -> ModelResolver {
+    fn resolver_with(cfg: GatewayConfig, provider: &str, discovered: &[&str]) -> ModelResolver {
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
         let mut map = HashMap::new();
         let set: BTreeSet<String> = discovered.iter().map(|s| s.to_string()).collect();

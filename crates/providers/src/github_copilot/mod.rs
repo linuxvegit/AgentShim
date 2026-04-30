@@ -176,8 +176,8 @@ impl BackendProvider for CopilotProvider {
             (url, body)
         } else {
             let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-            let body = serde_json::to_value(canonical_to_chat::build(&req, &target))
-                .unwrap_or_default();
+            let body =
+                serde_json::to_value(canonical_to_chat::build(&req, &target)).unwrap_or_default();
             (url, body)
         };
 

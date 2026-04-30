@@ -254,7 +254,10 @@ fn parse_usage(v: &serde_json::Value) -> Option<Usage> {
             .map(|x| x as u32),
         cache_read_input_tokens: u
             .get("cache_read_input_tokens")
-            .or_else(|| u.get("prompt_tokens_details").and_then(|d| d.get("cached_tokens")))
+            .or_else(|| {
+                u.get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+            })
             .and_then(|x| x.as_u64())
             .map(|x| x as u32),
         ..Default::default()

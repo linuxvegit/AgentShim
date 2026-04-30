@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
 use agent_shim_config::GatewayConfig;
-use agent_shim_core::{
-    request::ReasoningEffort,
-    BackendTarget, FrontendKind, RoutePolicy,
-};
+use agent_shim_core::{request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy};
 
 use crate::{RouteError, Router};
 

@@ -55,9 +55,7 @@ fn inbound_body() -> Bytes {
     )
 }
 
-async fn collect_stream(
-    mut stream: agent_shim_providers::RawByteStream,
-) -> Vec<u8> {
+async fn collect_stream(mut stream: agent_shim_providers::RawByteStream) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
         out.extend_from_slice(&chunk.unwrap());

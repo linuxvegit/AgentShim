@@ -67,12 +67,10 @@ impl AppState {
                         Err(e) => tracing::error!("failed to build Copilot provider {name}: {e}"),
                     }
                 }
-                UpstreamConfig::Anthropic(cfg) => {
-                    match anthropic::from_config(name, cfg) {
-                        Ok(p) => registry.register(name.clone(), Arc::new(p)),
-                        Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
-                    }
-                }
+                UpstreamConfig::Anthropic(cfg) => match anthropic::from_config(name, cfg) {
+                    Ok(p) => registry.register(name.clone(), Arc::new(p)),
+                    Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
+                },
             }
         }
 
