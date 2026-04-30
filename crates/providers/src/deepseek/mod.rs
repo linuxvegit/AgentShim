@@ -1,19 +1,16 @@
-//! DeepSeek provider — speaks OpenAI-Chat-shape with two quirks that will land
-//! in subsequent tasks of Plan 02:
+//! DeepSeek provider — speaks OpenAI-Chat-shape with two quirks layered on:
 //!
-//! - T4 adds a `reasoning_content` SSE-parser extension (interleaved deltas
+//! - T4 added a `reasoning_content` SSE-parser extension (interleaved deltas
 //!   become canonical thinking blocks).
-//! - T5 maps DeepSeek's prompt cache hit/miss usage fields onto the canonical
-//!   `Usage` shape and strips Anthropic-style `cache_control` from outbound
-//!   bodies (DeepSeek 400s if it sees them).
+//! - T5 added DeepSeek-specific cache-token usage mapping (see [`usage`]) and
+//!   a `cache_control` strip on outbound bodies (DeepSeek 400s if it sees
+//!   Anthropic-style cache markers).
 //!
-//! T3 (this file) lands the bare scaffold: a struct, capabilities, and a
-//! `BackendProvider` impl that delegates request encoding and response
-//! parsing to `oai_chat_wire`. `from_config` and gateway wiring are deferred
-//! to T6.
+//! `from_config` and gateway wiring are deferred to T6.
 
 pub(crate) mod request;
 pub(crate) mod response;
+pub(crate) mod usage;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

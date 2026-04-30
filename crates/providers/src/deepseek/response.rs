@@ -11,6 +11,9 @@
 //!    blocks via [`ReasoningInterleaver::next_index`], rather than the cousin
 //!    parser's fixed `tc.index + 1` offset (which assumes text always lives at
 //!    index 0).
+//! 3. Routes `usage` payloads through [`super::usage::map_usage`] so DeepSeek's
+//!    `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` fields land in
+//!    the canonical `cache_read_input_tokens` and `input_tokens` slots.
 //!
 //! The clone-and-modify decision is documented in Plan 02 T4: extending the
 //! cousin parser would have forced its OAI-Compat callers to thread a dynamic
@@ -18,19 +21,21 @@
 //! converge later, but only after Gemini lands in Plan 03 and we can see the
 //! shared shape.
 //!
-//! `parse_unary` continues to delegate to `oai_chat_wire::chat_unary_parser`;
-//! T5 will swap in DeepSeek's cache-token usage mapping there.
+//! `parse_unary` is similarly a clone-and-modify of
+//! `oai_chat_wire::chat_unary_parser::parse` that swaps in [`map_usage`] for
+//! the final `ResponseStop` event's usage.
 
 use std::collections::HashMap;
 
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
+use futures::stream;
 use futures::StreamExt;
 use futures_core::Stream;
 
 use agent_shim_core::{
     CanonicalStream, ContentBlockKind, MessageRole, ResponseId, StopReason, StreamError,
-    StreamEvent, ToolCallId, Usage,
+    StreamEvent, ToolCallId,
 };
 
 use crate::oai_chat_wire::interleaved_reasoning::{DeltaKind, ReasoningInterleaver};
@@ -79,10 +84,139 @@ where
 
 /// Parse a non-streaming JSON response from DeepSeek into a `CanonicalStream`.
 ///
-/// T3: delegates to the shared OAI-Chat unary parser.
-/// T5: will add a cache-usage mapping step on top of the canonical events.
+/// Cloned from `oai_chat_wire::chat_unary_parser::parse` and modified to
+/// route the final `usage` block through [`super::usage::map_usage`] so
+/// DeepSeek's prompt-cache hit/miss fields land in the canonical shape.
 pub(crate) fn parse_unary(body: &[u8]) -> CanonicalStream {
-    crate::oai_chat_wire::chat_unary_parser::parse(body)
+    let events = match parse_unary_inner(body) {
+        Ok(evts) => evts.into_iter().map(Ok).collect::<Vec<_>>(),
+        Err(e) => vec![Err(StreamError::Decode(e))],
+    };
+    Box::pin(stream::iter(events))
+}
+
+fn parse_unary_inner(body: &[u8]) -> Result<Vec<StreamEvent>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("json parse: {e}"))?;
+
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("upstream error")
+            .to_string();
+        return Ok(vec![StreamEvent::Error { message: msg }]);
+    }
+
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let model = v
+        .get("model")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let created = v.get("created").and_then(|x| x.as_u64()).unwrap_or(0);
+
+    let mut events = Vec::new();
+
+    events.push(StreamEvent::ResponseStart {
+        id: ResponseId(id),
+        model,
+        created_at_unix: created,
+    });
+    events.push(StreamEvent::MessageStart {
+        role: MessageRole::Assistant,
+    });
+
+    let choices = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| "missing choices".to_string())?;
+
+    let mut stop_reason = StopReason::EndTurn;
+    let stop_sequence: Option<String> = None;
+    let mut block_index: u32 = 0;
+
+    for choice in choices {
+        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+            stop_reason = StopReason::from_provider_string(reason);
+        }
+
+        let message = match choice.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        // Text content
+        if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
+            if !text.is_empty() {
+                events.push(StreamEvent::ContentBlockStart {
+                    index: block_index,
+                    kind: ContentBlockKind::Text,
+                });
+                events.push(StreamEvent::TextDelta {
+                    index: block_index,
+                    text: text.to_string(),
+                });
+                events.push(StreamEvent::ContentBlockStop { index: block_index });
+                block_index += 1;
+            }
+        }
+
+        // Tool calls
+        if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+            for tc in tool_calls {
+                let id = tc
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("call_unknown")
+                    .to_string();
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let args_str = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}")
+                    .to_string();
+
+                events.push(StreamEvent::ContentBlockStart {
+                    index: block_index,
+                    kind: ContentBlockKind::ToolCall,
+                });
+                events.push(StreamEvent::ToolCallStart {
+                    index: block_index,
+                    id: ToolCallId::from_provider(&id),
+                    name: name.clone(),
+                });
+                events.push(StreamEvent::ToolCallArgumentsDelta {
+                    index: block_index,
+                    json_fragment: args_str.clone(),
+                });
+                events.push(StreamEvent::ToolCallStop { index: block_index });
+                events.push(StreamEvent::ContentBlockStop { index: block_index });
+                block_index += 1;
+            }
+        }
+    }
+
+    // Usage — DeepSeek-specific cache-hit/miss mapping.
+    let usage = v.get("usage").map(super::usage::map_usage);
+
+    events.push(StreamEvent::MessageStop {
+        stop_reason,
+        stop_sequence,
+    });
+    events.push(StreamEvent::ResponseStop { usage });
+
+    Ok(events)
 }
 
 #[derive(Default)]
@@ -134,8 +268,10 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
         Some(c) => c,
         None => {
             // Some chunks (e.g. final usage-only chunk) have no choices array.
-            if let Some(usage) = parse_usage(&v) {
-                events.push(StreamEvent::UsageDelta { usage });
+            if let Some(usage_value) = v.get("usage").filter(|u| !u.is_null()) {
+                events.push(StreamEvent::UsageDelta {
+                    usage: super::usage::map_usage(usage_value),
+                });
             }
             return Ok(events);
         }
@@ -237,12 +373,10 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
         }
     }
 
-    if let Some(usage) = v
-        .get("usage")
-        .filter(|u| !u.is_null())
-        .and_then(|_| parse_usage(&v))
-    {
-        events.push(StreamEvent::UsageDelta { usage });
+    if let Some(usage_value) = v.get("usage").filter(|u| !u.is_null()) {
+        events.push(StreamEvent::UsageDelta {
+            usage: super::usage::map_usage(usage_value),
+        });
     }
 
     Ok(events)
@@ -270,41 +404,10 @@ fn drain_open_tool_blocks(open_tool_blocks: &mut HashMap<u32, u32>, events: &mut
     open_tool_blocks.clear();
 }
 
-fn parse_usage(v: &serde_json::Value) -> Option<Usage> {
-    // Mirrors `oai_chat_wire::chat_sse_parser::parse_usage` for now. T5 will
-    // route DeepSeek unary parsing through `deepseek::usage::map_usage`, which
-    // adds DeepSeek-specific cache-hit/cache-miss field handling. Keeping this
-    // in lock-step until then avoids divergent usage shapes between DeepSeek
-    // and the OAI-Compat path.
-    let u = v.get("usage")?;
-    Some(Usage {
-        input_tokens: u
-            .get("prompt_tokens")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as u32),
-        output_tokens: u
-            .get("completion_tokens")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as u32),
-        cache_creation_input_tokens: u
-            .get("cache_creation_input_tokens")
-            .and_then(|x| x.as_u64())
-            .map(|x| x as u32),
-        cache_read_input_tokens: u
-            .get("cache_read_input_tokens")
-            .or_else(|| {
-                u.get("prompt_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-            })
-            .and_then(|x| x.as_u64())
-            .map(|x| x as u32),
-        ..Default::default()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_shim_core::Usage;
     use serde_json::json;
 
     fn run_chunks(chunks: &[serde_json::Value]) -> Vec<StreamEvent> {
@@ -577,20 +680,22 @@ mod tests {
     #[test]
     fn parse_chunk_usage_only_chunk_emits_usage_delta() {
         let mut state = StreamState::default();
+        let usage_json = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5
+        });
         let chunk = json!({
             "id": "chatcmpl-1",
             "object": "chat.completion.chunk",
             "created": 1_700_000_000_u64,
             "model": "deepseek-reasoner",
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5
-            }
+            "usage": usage_json,
         });
         let evts = parse_chunk(&chunk.to_string(), &mut state).unwrap();
 
         // First chunk also emits ResponseStart (no MessageStart because there's
-        // no choices/delta). Then the usage delta.
+        // no choices/delta). Then the usage delta. Without cache fields, the
+        // canonical `input_tokens` falls back to `prompt_tokens`.
         assert_eq!(
             evts,
             vec![
@@ -605,10 +710,179 @@ mod tests {
                         output_tokens: Some(5),
                         cache_creation_input_tokens: None,
                         cache_read_input_tokens: None,
-                        ..Default::default()
+                        reasoning_tokens: None,
+                        estimated: false,
+                        provider_raw: Some(usage_json),
                     },
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_chunk_usage_with_cache_fields_routes_through_map_usage() {
+        // Final usage-only chunk carrying DeepSeek's prompt_cache fields.
+        // The cache hit lands in cache_read_input_tokens, the cache miss
+        // overrides prompt_tokens for input_tokens.
+        let mut state = StreamState::default();
+        let chunk = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000_u64,
+            "model": "deepseek-reasoner",
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 20
+            }
+        });
+        let evts = parse_chunk(&chunk.to_string(), &mut state).unwrap();
+
+        let usage_event = evts
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::UsageDelta { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage delta should be present");
+
+        assert_eq!(usage_event.input_tokens, Some(20));
+        assert_eq!(usage_event.output_tokens, Some(50));
+        assert_eq!(usage_event.cache_read_input_tokens, Some(80));
+        assert_eq!(usage_event.cache_creation_input_tokens, None);
+        assert!(usage_event.provider_raw.is_some());
+    }
+
+    #[test]
+    fn parse_chunk_inline_usage_alongside_choices_emits_usage_delta() {
+        // DeepSeek streaming sometimes carries `usage` alongside the final
+        // chunk's choices/finish_reason rather than as a separate event. The
+        // parser should still route it through map_usage.
+        let mut state = StreamState::default();
+        let chunk = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000_u64,
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "prompt_cache_hit_tokens": 4,
+                "prompt_cache_miss_tokens": 1
+            }
+        });
+        let evts = parse_chunk(&chunk.to_string(), &mut state).unwrap();
+
+        let usage_event = evts
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::UsageDelta { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage delta should be present");
+
+        assert_eq!(usage_event.input_tokens, Some(1));
+        assert_eq!(usage_event.cache_read_input_tokens, Some(4));
+    }
+
+    #[test]
+    fn parse_unary_emits_canonical_event_sequence_with_cache_usage() {
+        // Full unary response: id/model/choices + DeepSeek cache usage.
+        // Verifies parse_unary routes the usage through map_usage and emits
+        // the standard ResponseStart -> MessageStart -> ... -> ResponseStop
+        // shape.
+        let body = serde_json::to_vec(&json!({
+            "id": "chatcmpl-unary-1",
+            "object": "chat.completion",
+            "created": 1_700_000_000_u64,
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Hi there" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 8,
+                "prompt_cache_hit_tokens": 90,
+                "prompt_cache_miss_tokens": 10
+            }
+        }))
+        .unwrap();
+
+        let events = futures::executor::block_on(async {
+            use futures::StreamExt;
+            parse_unary(&body)
+                .collect::<Vec<Result<StreamEvent, StreamError>>>()
+                .await
+        });
+
+        let events: Vec<StreamEvent> = events.into_iter().map(Result::unwrap).collect();
+
+        // Sanity check the structural shape.
+        assert!(matches!(events[0], StreamEvent::ResponseStart { .. }));
+        assert!(matches!(events[1], StreamEvent::MessageStart { .. }));
+
+        // The ResponseStop's usage carries DeepSeek cache fields.
+        let stop_usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ResponseStop { usage } => usage.clone(),
+                _ => None,
+            })
+            .expect("ResponseStop should carry usage");
+
+        assert_eq!(stop_usage.input_tokens, Some(10));
+        assert_eq!(stop_usage.output_tokens, Some(8));
+        assert_eq!(stop_usage.cache_read_input_tokens, Some(90));
+        assert_eq!(stop_usage.cache_creation_input_tokens, None);
+        assert!(stop_usage.provider_raw.is_some());
+    }
+
+    #[test]
+    fn parse_unary_without_cache_falls_back_to_prompt_tokens() {
+        // Older DeepSeek payloads without cache fields: input_tokens falls
+        // back to prompt_tokens via map_usage.
+        let body = serde_json::to_vec(&json!({
+            "id": "chatcmpl-unary-2",
+            "object": "chat.completion",
+            "created": 1_700_000_000_u64,
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "ok" },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 1
+            }
+        }))
+        .unwrap();
+
+        let events = futures::executor::block_on(async {
+            use futures::StreamExt;
+            parse_unary(&body)
+                .collect::<Vec<Result<StreamEvent, StreamError>>>()
+                .await
+        });
+        let events: Vec<StreamEvent> = events.into_iter().map(Result::unwrap).collect();
+
+        let stop_usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ResponseStop { usage } => usage.clone(),
+                _ => None,
+            })
+            .expect("ResponseStop should carry usage");
+
+        assert_eq!(stop_usage.input_tokens, Some(7));
+        assert_eq!(stop_usage.cache_read_input_tokens, None);
     }
 }
