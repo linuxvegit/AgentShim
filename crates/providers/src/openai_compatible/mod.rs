@@ -1,8 +1,13 @@
-pub(crate) mod encode_request;
-pub(crate) mod parse_stream;
-pub(crate) mod parse_unary;
+// Re-export the shared OpenAI-Chat-shape primitives as siblings under
+// openai_compatible's namespace so the existing internal call sites in
+// mod.rs (e.g. `encode_request::build`, `parse_stream::parse`) keep working.
+// The Responses API submodule stays separate.
+pub(crate) use crate::oai_chat_wire::{
+    canonical_to_chat as encode_request, chat_sse_parser as parse_stream,
+    chat_unary_parser as parse_unary,
+};
+
 pub(crate) mod responses_api;
-pub(crate) mod wire;
 
 use std::time::Duration;
 

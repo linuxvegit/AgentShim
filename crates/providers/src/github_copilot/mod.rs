@@ -19,7 +19,11 @@ use uuid::Uuid;
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
 use crate::{
-    openai_compatible::{encode_request, parse_stream, parse_unary, responses_api},
+    oai_chat_wire::{
+        canonical_to_chat as encode_request, chat_sse_parser as parse_stream,
+        chat_unary_parser as parse_unary,
+    },
+    openai_compatible::responses_api,
     BackendProvider, ProviderCapabilities, ProviderError, RawByteStream,
 };
 use credential_store::StoredCredentials;
