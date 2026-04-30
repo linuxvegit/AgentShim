@@ -26,7 +26,6 @@ use parking_lot::Mutex;
 use agent_shim_core::{BackendTarget, CanonicalStream, StreamEvent, Usage};
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_providers::BackendProvider;
-use agent_shim_router::Router;
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -93,28 +92,13 @@ pub async fn dispatch(
         alias
     };
 
-    let mut target = state
-        .router
+    let target = state
+        .resolver
         .resolve(spec.frontend.kind(), &model_alias)
         .map_err(|e| {
             tracing::warn!(model = %model_alias, error = %e, "no route");
             HandlerError::Route(e)
         })?;
-
-    if let Some(resolved) = state.model_index.resolve(&target.provider, &target.model) {
-        if resolved != target.model {
-            tracing::info!(
-                requested = %target.model,
-                resolved = %resolved,
-                provider = %target.provider,
-                "fuzzy model match"
-            );
-            target = BackendTarget {
-                model: resolved.to_string(),
-                ..target
-            };
-        }
-    }
 
     let upstream_model = target.model.clone();
 

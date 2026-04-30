@@ -13,7 +13,7 @@ use agent_shim_providers::{
     ProviderRegistry,
 };
 use agent_shim_router::model_index::ModelIndex;
-use agent_shim_router::StaticRouter;
+use agent_shim_router::{ModelResolver, Router, StaticRouter};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,8 +22,9 @@ pub struct AppState {
     pub openai: Arc<OpenAiChat>,
     pub openai_responses: Arc<OpenAiResponses>,
     pub providers: Arc<ProviderRegistry>,
-    pub router: Arc<StaticRouter>,
-    pub model_index: Arc<ModelIndex>,
+    /// Resolves `(frontend, model_alias)` → `BackendTarget`. Owns both the
+    /// static route table and the fuzzy model index as internal seams.
+    pub resolver: Arc<ModelResolver>,
 }
 
 impl AppState {
@@ -68,7 +69,7 @@ impl AppState {
             }
         }
 
-        let router = Arc::new(StaticRouter::from_config(&config));
+        let static_router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&config));
 
         let mut discovered = std::collections::HashMap::new();
         for (name, provider) in registry.iter() {
@@ -86,6 +87,7 @@ impl AppState {
             }
         }
         let model_index = Arc::new(ModelIndex::new(discovered));
+        let resolver = Arc::new(ModelResolver::new(static_router, model_index));
 
         Self {
             config: Arc::new(config),
@@ -93,8 +95,7 @@ impl AppState {
             openai,
             openai_responses,
             providers: Arc::new(registry),
-            router,
-            model_index,
+            resolver,
         }
     }
 }

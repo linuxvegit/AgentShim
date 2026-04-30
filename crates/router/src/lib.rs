@@ -4,6 +4,7 @@ pub mod circuit_breaker;
 pub mod fallback;
 pub mod model_index;
 pub mod rate_limit;
+pub mod resolver;
 pub mod static_routes;
 
 use thiserror::Error;
@@ -23,4 +24,5 @@ pub trait Router: Send + Sync {
     fn resolve(&self, frontend: FrontendKind, model: &str) -> Result<BackendTarget, RouteError>;
 }
 
+pub use resolver::ModelResolver;
 pub use static_routes::StaticRouter;
