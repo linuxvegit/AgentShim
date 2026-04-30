@@ -6,7 +6,7 @@
 //!   a `cache_control` strip on outbound bodies (DeepSeek 400s if it sees
 //!   Anthropic-style cache markers).
 //!
-//! `from_config` and gateway wiring are deferred to T6.
+//! T6 added the `from_config` factory and gateway wiring.
 
 pub(crate) mod request;
 pub(crate) mod response;
@@ -193,6 +193,21 @@ impl BackendProvider for DeepseekProvider {
         }
         Ok(Some(models))
     }
+}
+
+/// Build a `DeepseekProvider` from gateway config upstreams.
+pub fn from_config(
+    upstream_name: &str,
+    cfg: &agent_shim_config::DeepseekUpstream,
+) -> Result<DeepseekProvider, ProviderError> {
+    let leaked: &'static str = Box::leak(upstream_name.to_string().into_boxed_str());
+    DeepseekProvider::new(
+        leaked,
+        &cfg.base_url,
+        cfg.api_key.expose(),
+        cfg.default_headers.clone(),
+        cfg.request_timeout_secs,
+    )
 }
 
 #[cfg(test)]

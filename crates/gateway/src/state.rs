@@ -8,7 +8,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_providers::{
-    anthropic,
+    anthropic, deepseek,
     github_copilot::{self, credential_store},
     openai_compatible::{self},
     ProviderRegistry,
@@ -71,14 +71,10 @@ impl AppState {
                     Ok(p) => registry.register(name.clone(), Arc::new(p)),
                     Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
                 },
-                UpstreamConfig::Deepseek(_) => {
-                    // Deepseek provider wiring is implemented in Plan 02 Task 6.
-                    // Routes referencing this upstream will fail at runtime until then.
-                    tracing::warn!(
-                        upstream = %name,
-                        "Deepseek upstream config recognized but provider not yet wired (Task 6)"
-                    );
-                }
+                UpstreamConfig::Deepseek(cfg) => match deepseek::from_config(name, cfg) {
+                    Ok(p) => registry.register(name.clone(), Arc::new(p)),
+                    Err(e) => tracing::error!("failed to build Deepseek provider {name}: {e}"),
+                },
             }
         }
 
