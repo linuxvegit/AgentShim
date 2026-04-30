@@ -144,12 +144,8 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
     for choice in choices {
         if let Some(delta) = choice.get("delta") {
             // role → MessageStart (once)
-            if delta.get("role").and_then(|r| r.as_str()).is_some() && !state.emitted_message_start
-            {
-                state.emitted_message_start = true;
-                events.push(StreamEvent::MessageStart {
-                    role: MessageRole::Assistant,
-                });
+            if delta.get("role").and_then(|r| r.as_str()).is_some() {
+                ensure_message_start(state, &mut events);
             }
 
             // reasoning_content delta → interleaver(Reasoning, ...)
@@ -171,9 +167,10 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
             }
 
             // tool_calls deltas — close the interleaver first (tool calls
-            // are a hard block boundary; same posture as the cousin parser
-            // at chat_sse_parser.rs:162-166), then allocate canonical tool
-            // block indices AFTER the interleaver's blocks.
+            // are a hard block boundary; same posture as the text-block-close
+            // branch in `oai_chat_wire::chat_sse_parser::parse_chunk` before
+            // tool_calls are processed), then allocate canonical tool block
+            // indices AFTER the interleaver's blocks.
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                 ensure_message_start(state, &mut events);
                 state.interleaver.flush(&mut events);
