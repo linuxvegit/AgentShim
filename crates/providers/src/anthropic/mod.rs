@@ -94,7 +94,11 @@ impl BackendProvider for AnthropicProvider {
         // error so any non-Anthropic-frontend route fails fast with a clear
         // message rather than silently producing wrong output.
         Err(ProviderError::CapabilityMismatch(
-            "Anthropic provider canonical path not yet implemented (Plan 01 Task 5)".into(),
+            "Anthropic-as-backend canonical path is not yet supported. \
+             This route translates a non-Anthropic frontend request to Anthropic Messages \
+             and is not implemented yet. Use the anthropic_messages frontend, or pick an \
+             OpenAI-compatible backend for OpenAI-shape inbound requests."
+                .into(),
         ))
     }
 

@@ -58,13 +58,18 @@ pub trait BackendProvider: Send + Sync {
         Ok(None)
     }
 
-    /// Proxy a raw request to the upstream and return the raw byte stream.
-    /// Used for passthrough scenarios (e.g. Responses API → Responses API).
-    /// Returns (content_type, byte_stream), or None if not supported.
+    /// Proxy a raw inbound request body to the upstream and return the raw
+    /// byte stream of the response. Used for byte-for-byte passthrough when
+    /// the inbound and outbound wire formats match (e.g. Responses API →
+    /// Responses API, or Anthropic Messages → Anthropic Messages), avoiding
+    /// the parse/re-encode round-trip.
     ///
-    /// `frontend_kind` identifies the inbound wire shape; providers must
-    /// inspect it and return `Ok(None)` for any shape they don't natively
-    /// understand. The pipeline then falls back to the canonical decode path.
+    /// `frontend_kind` lets the implementation gate on the inbound dialect:
+    /// providers that only know one wire shape return `Ok(None)` for any
+    /// other kind, and the pipeline falls back to the canonical path.
+    ///
+    /// Returns `(content_type, byte_stream)` on success, or `None` when
+    /// passthrough isn't applicable.
     async fn proxy_raw(
         &self,
         _body: bytes::Bytes,
