@@ -118,13 +118,13 @@ pub struct AnthropicUpstream {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeepseekUpstream {
-    pub api_key: Secret,
     #[serde(default = "default_deepseek_base_url")]
     pub base_url: String,
-    #[serde(default = "default_timeout")]
-    pub request_timeout_secs: u64,
+    pub api_key: Secret,
     #[serde(default)]
     pub default_headers: BTreeMap<String, String>,
+    #[serde(default = "default_timeout")]
+    pub request_timeout_secs: u64,
 }
 
 fn default_timeout() -> u64 {

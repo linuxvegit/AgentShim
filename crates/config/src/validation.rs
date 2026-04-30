@@ -279,10 +279,10 @@ mod tests {
         cfg.upstreams.insert(
             "deepseek".to_string(),
             UpstreamConfig::Deepseek(DeepseekUpstream {
-                api_key: Secret::new("sk-deepseek-test"),
                 base_url: "https://api.deepseek.com/v1".to_string(),
-                request_timeout_secs: 30,
+                api_key: Secret::new("sk-deepseek-test"),
                 default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
             }),
         );
         assert!(validate(&cfg).is_ok());
@@ -294,16 +294,22 @@ mod tests {
         cfg.upstreams.insert(
             "deepseek".to_string(),
             UpstreamConfig::Deepseek(DeepseekUpstream {
-                api_key: Secret::new(""),
                 base_url: "https://api.deepseek.com/v1".to_string(),
-                request_timeout_secs: 30,
+                api_key: Secret::new(""),
                 default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
             }),
         );
-        assert!(matches!(
-            validate(&cfg),
-            Err(ValidationError::InvalidUpstream(_, _))
-        ));
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("api_key"),
+                    "expected api_key error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
     }
 
     #[test]
@@ -312,16 +318,22 @@ mod tests {
         cfg.upstreams.insert(
             "deepseek".to_string(),
             UpstreamConfig::Deepseek(DeepseekUpstream {
-                api_key: Secret::new("sk-deepseek-test"),
                 base_url: "ftp://api.deepseek.com/v1".to_string(),
-                request_timeout_secs: 30,
+                api_key: Secret::new("sk-deepseek-test"),
                 default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
             }),
         );
-        assert!(matches!(
-            validate(&cfg),
-            Err(ValidationError::InvalidUpstream(_, _))
-        ));
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("base_url"),
+                    "expected base_url error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
     }
 
     #[test]
@@ -330,15 +342,21 @@ mod tests {
         cfg.upstreams.insert(
             "deepseek".to_string(),
             UpstreamConfig::Deepseek(DeepseekUpstream {
-                api_key: Secret::new("sk-deepseek-test"),
                 base_url: "https://api.deepseek.com/v1".to_string(),
-                request_timeout_secs: 0,
+                api_key: Secret::new("sk-deepseek-test"),
                 default_headers: BTreeMap::new(),
+                request_timeout_secs: 0,
             }),
         );
-        assert!(matches!(
-            validate(&cfg),
-            Err(ValidationError::InvalidUpstream(_, _))
-        ));
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("request_timeout_secs"),
+                    "expected request_timeout_secs error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
     }
 }

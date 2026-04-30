@@ -72,9 +72,11 @@ impl AppState {
                     Err(e) => tracing::error!("failed to build Anthropic provider {name}: {e}"),
                 },
                 UpstreamConfig::Deepseek(_) => {
-                    // T6 will replace this stub with a real DeepSeek provider build.
-                    tracing::error!(
-                        "deepseek provider not wired yet (Plan 02 T6); skipping upstream {name}"
+                    // Deepseek provider wiring is implemented in Plan 02 Task 6.
+                    // Routes referencing this upstream will fail at runtime until then.
+                    tracing::warn!(
+                        upstream = %name,
+                        "Deepseek upstream config recognized but provider not yet wired (Task 6)"
                     );
                 }
             }
