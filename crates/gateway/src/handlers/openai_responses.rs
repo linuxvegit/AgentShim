@@ -64,17 +64,19 @@ pub async fn handle(
 
     let upstream_model = target.model.clone();
 
-    // The Responses handler tries raw passthrough before decoding, so we only
-    // know the route-level default here. Per-request `reasoning.effort` from
-    // the body shows up in the upstream payload regardless.
-    let reasoning_effort = target.default_reasoning_effort;
-
+    // The Responses handler tries raw passthrough before decoding, so the
+    // route-level policy is what we know up front. The decoded path below
+    // re-snapshots once the canonical request exists.
     tracing::info!(
         "→ /v1/responses | model: {} → {} | bodyBytes: {} | reasoning_default: {}",
         model_alias,
         upstream_model,
         body_bytes,
-        reasoning_effort.map(|e| e.as_str()).unwrap_or("none"),
+        target
+            .policy
+            .default_reasoning_effort
+            .map(|e| e.as_str())
+            .unwrap_or("none"),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {
@@ -114,6 +116,9 @@ pub async fn handle(
         .openai_responses
         .decode_request(&body)
         .map_err(HandlerError::Frontend)?;
+
+    let mut canonical = canonical;
+    canonical.resolved_policy = target.policy.resolve(&canonical);
 
     let is_stream = canonical.stream;
 

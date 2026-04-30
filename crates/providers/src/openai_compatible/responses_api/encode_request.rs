@@ -146,13 +146,7 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
     }
 
     // Reasoning effort (Responses API uses `reasoning: { effort: "..." }`).
-    let effort = req
-        .generation
-        .reasoning
-        .as_ref()
-        .and_then(|r| r.effort)
-        .or(target.default_reasoning_effort);
-    if let Some(effort) = effort {
+    if let Some(effort) = req.resolved_policy.reasoning_effort {
         body["reasoning"] = json!({ "effort": effort.as_str() });
     }
 

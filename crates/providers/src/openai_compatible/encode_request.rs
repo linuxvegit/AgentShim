@@ -1,8 +1,7 @@
 /// Build an OpenAI-compatible outbound request body from a CanonicalRequest.
 use agent_shim_core::{
-    request::{ReasoningEffort, ResponseFormat},
-    BackendTarget, CanonicalRequest, ContentBlock, MessageRole, SystemSource, ToolCallArguments,
-    ToolChoice,
+    request::ResponseFormat, BackendTarget, CanonicalRequest, ContentBlock, MessageRole,
+    SystemSource, ToolCallArguments, ToolChoice,
 };
 
 use super::wire::{
@@ -208,16 +207,11 @@ pub(crate) fn build(req: &CanonicalRequest, target: &BackendTarget) -> ChatBody 
         tool_choice,
         stream: req.stream,
         stream_options,
-        reasoning_effort: resolve_reasoning_effort(req, target).map(|e| e.as_str().to_string()),
+        reasoning_effort: req
+            .resolved_policy
+            .reasoning_effort
+            .map(|e| e.as_str().to_string()),
     }
-}
-
-fn resolve_reasoning_effort(req: &CanonicalRequest, target: &BackendTarget) -> Option<ReasoningEffort> {
-    req.generation
-        .reasoning
-        .as_ref()
-        .and_then(|r| r.effort)
-        .or(target.default_reasoning_effort)
 }
 
 fn extract_text_content(blocks: &[ContentBlock]) -> String {
@@ -344,8 +338,7 @@ mod tests {
         BackendTarget {
             provider: "test".into(),
             model: model.into(),
-            default_reasoning_effort: None,
-            default_anthropic_beta: None,
+            policy: Default::default(),
         }
     }
 
@@ -365,6 +358,8 @@ mod tests {
             response_format: None,
             stream: false,
             metadata: Default::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: Default::default(),
             extensions: ExtensionMap::new(),
         }
     }

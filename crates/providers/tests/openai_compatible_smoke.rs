@@ -23,6 +23,8 @@ fn make_req(stream: bool) -> CanonicalRequest {
         response_format: None,
         stream,
         metadata: Default::default(),
+        inbound_anthropic_headers: vec![],
+        resolved_policy: Default::default(),
         extensions: ExtensionMap::new(),
     }
 }
@@ -31,8 +33,7 @@ fn make_target() -> BackendTarget {
     BackendTarget {
         provider: "openai".to_string(),
         model: "gpt-4o".to_string(),
-        default_reasoning_effort: None,
-        default_anthropic_beta: None,
+        policy: Default::default(),
     }
 }
 
@@ -118,8 +119,7 @@ async fn proxy_raw_responses_posts_to_responses_and_rewrites_model() {
     let target = BackendTarget {
         provider: "openai".to_string(),
         model: "gpt-upstream".to_string(),
-        default_reasoning_effort: None,
-        default_anthropic_beta: None,
+        policy: Default::default(),
     };
 
     let Some((content_type, mut stream)) = provider

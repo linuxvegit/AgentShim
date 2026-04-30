@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::extensions::ExtensionMap;
 use crate::ids::RequestId;
 use crate::message::{Message, SystemInstruction};
+use crate::policy::ResolvedPolicy;
 use crate::target::{FrontendInfo, FrontendModel};
 use crate::tool::{ToolChoice, ToolDefinition};
 
@@ -97,8 +98,6 @@ pub struct RequestMetadata {
     pub user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
-    pub forwarded_headers: ExtensionMap,
 }
 
 /// The fully-normalised, frontend-agnostic request handed to a backend.
@@ -122,6 +121,23 @@ pub struct CanonicalRequest {
     pub stream: bool,
     #[serde(default)]
     pub metadata: RequestMetadata,
+    /// `anthropic-*` headers captured from the inbound HTTP request, in the
+    /// order they arrived. Frontends populate this; [`crate::RoutePolicy`]
+    /// merges with route defaults to produce [`Self::resolved_policy`].
+    /// Providers should NOT read this directly — use `resolved_policy`
+    /// instead so the inbound-vs-default merge rule lives in one place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_anthropic_headers: Vec<(String, String)>,
+    /// Per-request snapshot of the merged route policy. Populated by the
+    /// gateway after route resolution, before the request is handed to a
+    /// provider. Providers and logging read from this; no one should be
+    /// re-deriving the merge.
+    #[serde(default, skip_serializing_if = "is_default_resolved_policy")]
+    pub resolved_policy: ResolvedPolicy,
     #[serde(default, skip_serializing_if = "ExtensionMap::is_empty")]
     pub extensions: ExtensionMap,
+}
+
+fn is_default_resolved_policy(p: &ResolvedPolicy) -> bool {
+    p == &ResolvedPolicy::default()
 }

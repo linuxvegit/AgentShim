@@ -14,6 +14,26 @@ use agent_shim_core::{BackendTarget, FrontendKind, StreamEvent, Usage};
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_router::Router;
 
+/// Pull every `anthropic-*` header off the inbound request, dropping the two
+/// credential headers that are upstream-owned. Returns name/value pairs in
+/// arrival order so providers can replay them verbatim.
+pub(crate) fn capture_anthropic_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if !name_str.starts_with("anthropic-") {
+            continue;
+        }
+        if matches!(name_str, "anthropic-api-key" | "anthropic-auth-token") {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            out.push((name_str.to_string(), v.to_string()));
+        }
+    }
+    out
+}
+
 use crate::state::AppState;
 
 use super::{collect_stream, HandlerError};
@@ -99,23 +119,7 @@ pub async fn handle(
     // the same negotiation Claude Code performs — `anthropic-beta` for the
     // 1M-context window, `anthropic-version`, dangerous-direct-browser-access,
     // any future beta flags, etc.
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str();
-        if !name_str.starts_with("anthropic-") {
-            continue;
-        }
-        // Skip auth/identity headers — those are owned by the upstream
-        // provider, not the agent.
-        if matches!(name_str, "anthropic-api-key" | "anthropic-auth-token") {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            canonical.metadata.forwarded_headers.insert(
-                name_str.to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-        }
-    }
+    canonical.inbound_anthropic_headers = capture_anthropic_headers(&headers);
 
     let model_alias = canonical.model.as_str().to_string();
     let is_stream = canonical.stream;
@@ -147,24 +151,16 @@ pub async fn handle(
 
     let upstream_model = target.model.clone();
 
-    let reasoning_effort = canonical
-        .generation
-        .reasoning
-        .as_ref()
-        .and_then(|r| r.effort)
-        .or(target.default_reasoning_effort);
+    // Snapshot the merged route policy onto the canonical request. Providers
+    // and logging both read from `resolved_policy` so the merge rule lives in
+    // exactly one place (RoutePolicy::resolve).
+    canonical.resolved_policy = target.policy.resolve(&canonical);
+
     let reasoning_budget = canonical
         .generation
         .reasoning
         .as_ref()
         .and_then(|r| r.budget_tokens);
-    let anthropic_beta = canonical
-        .metadata
-        .forwarded_headers
-        .get("anthropic-beta")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| target.default_anthropic_beta.clone());
 
     tracing::info!(
         "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {} | reasoning: {}{} | beta: {}",
@@ -172,11 +168,18 @@ pub async fn handle(
         upstream_model,
         body_bytes,
         max_tokens.unwrap_or(0),
-        reasoning_effort.map(|e| e.as_str()).unwrap_or("none"),
+        canonical
+            .resolved_policy
+            .reasoning_effort
+            .map(|e| e.as_str())
+            .unwrap_or("none"),
         reasoning_budget
             .map(|b| format!(" (budget {} tok)", b))
             .unwrap_or_default(),
-        anthropic_beta.as_deref().unwrap_or("none"),
+        canonical
+            .resolved_policy
+            .anthropic_header("anthropic-beta")
+            .unwrap_or("none"),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {

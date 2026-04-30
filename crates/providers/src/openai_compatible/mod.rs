@@ -226,7 +226,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
         // Apply route default for `anthropic-beta` if configured (per-request
         // value isn't available here — proxy_raw runs before decode).
-        if let Some(beta) = &target.default_anthropic_beta {
+        if let Some(beta) = &target.policy.default_anthropic_beta {
             request_builder = request_builder.header("anthropic-beta", beta.as_str());
         }
 
@@ -266,34 +266,17 @@ impl BackendProvider for OpenAiCompatibleProvider {
 
 use std::collections::BTreeSet;
 
-/// Forward Anthropic-style negotiation headers from the canonical request onto
-/// the outbound HTTP request. Every `anthropic-*` header captured by the
-/// frontend is replayed verbatim. The per-route `anthropic_beta` default is
-/// applied only when the inbound request didn't supply its own value.
+/// Forward Anthropic-style negotiation headers onto the outbound HTTP request.
+/// Reads the merged snapshot from `req.resolved_policy` — the gateway has
+/// already applied the inbound-vs-route-default merge.
 fn apply_anthropic_passthrough_headers(
     mut builder: reqwest::RequestBuilder,
     req: &CanonicalRequest,
-    target: &BackendTarget,
+    _target: &BackendTarget,
 ) -> reqwest::RequestBuilder {
-    let mut sent_beta = false;
-    for (key, value) in req.metadata.forwarded_headers.0.iter() {
-        if !key.starts_with("anthropic-") {
-            continue;
-        }
-        let Some(v) = value.as_str() else { continue };
-        builder = builder.header(key.as_str(), v);
-        if key == "anthropic-beta" {
-            sent_beta = true;
-        }
+    for (key, value) in &req.resolved_policy.anthropic_headers {
+        builder = builder.header(key.as_str(), value.as_str());
     }
-
-    // Per-route default fills in if the inbound request didn't carry one.
-    if !sent_beta {
-        if let Some(beta) = &target.default_anthropic_beta {
-            builder = builder.header("anthropic-beta", beta.as_str());
-        }
-    }
-
     builder
 }
 

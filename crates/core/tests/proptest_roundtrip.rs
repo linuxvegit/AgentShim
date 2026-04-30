@@ -53,6 +53,8 @@ fn arb_request() -> impl Strategy<Value = CanonicalRequest> {
         response_format: None,
         stream: false,
         metadata: RequestMetadata::default(),
+        inbound_anthropic_headers: vec![],
+        resolved_policy: Default::default(),
         extensions: ExtensionMap::new(),
     })
 }

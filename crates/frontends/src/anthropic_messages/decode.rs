@@ -134,6 +134,8 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
         response_format: None,
         stream: req.stream.unwrap_or(false),
         metadata: RequestMetadata::default(),
+        inbound_anthropic_headers: vec![],
+        resolved_policy: Default::default(),
         extensions: ExtensionMap::new(),
     })
 }

@@ -190,6 +190,8 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
         response_format,
         stream: req.stream.unwrap_or(false),
         metadata,
+        inbound_anthropic_headers: vec![],
+        resolved_policy: Default::default(),
         extensions: ExtensionMap::new(),
     })
 }

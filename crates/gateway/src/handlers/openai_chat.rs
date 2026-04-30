@@ -52,12 +52,10 @@ pub async fn handle(
 
     let upstream_model = target.model.clone();
 
-    let reasoning_effort = canonical
-        .generation
-        .reasoning
-        .as_ref()
-        .and_then(|r| r.effort)
-        .or(target.default_reasoning_effort);
+    // Snapshot the merged route policy onto the canonical request. Providers
+    // and logging both read from `resolved_policy`.
+    let mut canonical = canonical;
+    canonical.resolved_policy = target.policy.resolve(&canonical);
 
     tracing::info!(
         "→ /v1/chat/completions | model: {} → {} | bodyBytes: {} | maxTokens: {} | stream: {} | reasoning: {}",
@@ -66,7 +64,11 @@ pub async fn handle(
         body_bytes,
         max_tokens.unwrap_or(0),
         is_stream,
-        reasoning_effort.map(|e| e.as_str()).unwrap_or("none"),
+        canonical
+            .resolved_policy
+            .reasoning_effort
+            .map(|e| e.as_str())
+            .unwrap_or("none"),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {

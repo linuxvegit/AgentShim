@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::request::ReasoningEffort;
+use crate::policy::RoutePolicy;
 
 /// The model name as sent by the frontend client (e.g. "claude-3-5-sonnet-20241022").
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,15 +42,15 @@ pub struct BackendTarget {
     pub provider: String,
     /// The model to use on the backend, after any model-mapping has been applied.
     pub model: String,
-    /// Default reasoning effort to apply when the request didn't specify one.
-    /// Configured per-route in `gateway.yaml`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_reasoning_effort: Option<ReasoningEffort>,
-    /// Default `anthropic-beta` header value to apply when the request didn't
-    /// supply one. Used to enable beta features like the 1M context window
-    /// (`context-1m-2025-08-07`) without baking them into the model name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_anthropic_beta: Option<String>,
+    /// Per-route policy: defaults for fields the inbound request didn't set.
+    /// New per-route knobs go here, not on `BackendTarget` directly, so the
+    /// routing surface stays small.
+    #[serde(default, skip_serializing_if = "is_default_policy")]
+    pub policy: RoutePolicy,
+}
+
+fn is_default_policy(p: &RoutePolicy) -> bool {
+    p == &RoutePolicy::default()
 }
 
 #[cfg(test)]
