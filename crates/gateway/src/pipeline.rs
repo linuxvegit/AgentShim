@@ -127,7 +127,7 @@ pub async fn dispatch(
         );
 
         if let Some((content_type, byte_stream)) = provider
-            .proxy_raw(body.clone(), target.clone())
+            .proxy_raw(body.clone(), target.clone(), spec.frontend.kind())
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "proxy_raw failed");

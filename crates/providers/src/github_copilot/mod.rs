@@ -270,7 +270,13 @@ impl BackendProvider for CopilotProvider {
         &self,
         body: bytes::Bytes,
         target: BackendTarget,
+        frontend_kind: agent_shim_core::FrontendKind,
     ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
+        // Copilot's proxy_raw only knows the Responses API shape.
+        // For any other frontend, fall back to the canonical encode/decode path.
+        if frontend_kind != agent_shim_core::FrontendKind::OpenAiResponses {
+            return Ok(None);
+        }
         let token = self.manager.get().await?;
         let api_base = token.api_base.clone();
         let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));

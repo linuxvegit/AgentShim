@@ -207,7 +207,13 @@ impl BackendProvider for OpenAiCompatibleProvider {
         &self,
         body: bytes::Bytes,
         target: BackendTarget,
+        frontend_kind: agent_shim_core::FrontendKind,
     ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
+        // OpenAI-compat's proxy_raw only knows the Responses API shape.
+        // For any other frontend, fall back to the canonical encode/decode path.
+        if frontend_kind != agent_shim_core::FrontendKind::OpenAiResponses {
+            return Ok(None);
+        }
         let body = Self::rewrite_model(body, &target.model)?;
         let mut request_builder = self
             .client

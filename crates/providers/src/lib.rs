@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod anthropic;
 pub mod github_copilot;
 pub mod oai_chat_wire;
 pub mod openai_compatible;
@@ -60,10 +61,15 @@ pub trait BackendProvider: Send + Sync {
     /// Proxy a raw request to the upstream and return the raw byte stream.
     /// Used for passthrough scenarios (e.g. Responses API → Responses API).
     /// Returns (content_type, byte_stream), or None if not supported.
+    ///
+    /// `frontend_kind` identifies the inbound wire shape; providers must
+    /// inspect it and return `Ok(None)` for any shape they don't natively
+    /// understand. The pipeline then falls back to the canonical decode path.
     async fn proxy_raw(
         &self,
         _body: bytes::Bytes,
         _target: BackendTarget,
+        _frontend_kind: agent_shim_core::FrontendKind,
     ) -> Result<Option<(String, RawByteStream)>, ProviderError> {
         Ok(None)
     }

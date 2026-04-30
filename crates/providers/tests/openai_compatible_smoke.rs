@@ -126,6 +126,7 @@ async fn proxy_raw_responses_posts_to_responses_and_rewrites_model() {
         .proxy_raw(
             bytes::Bytes::from_static(br#"{"model":"alias","input":"Hello","stream":true}"#),
             target,
+            FrontendKind::OpenAiResponses,
         )
         .await
         .unwrap()
