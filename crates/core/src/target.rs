@@ -46,6 +46,11 @@ pub struct BackendTarget {
     /// Configured per-route in `gateway.yaml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning_effort: Option<ReasoningEffort>,
+    /// Default `anthropic-beta` header value to apply when the request didn't
+    /// supply one. Used to enable beta features like the 1M context window
+    /// (`context-1m-2025-08-07`) without baking them into the model name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_anthropic_beta: Option<String>,
 }
 
 #[cfg(test)]

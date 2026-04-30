@@ -195,6 +195,27 @@ impl BackendProvider for CopilotProvider {
             builder = builder.header(k, v);
         }
 
+        // Replay every `anthropic-*` header the frontend captured (e.g.
+        // `anthropic-beta` for 1M context, `anthropic-version`, etc.). The
+        // route-level `anthropic_beta` default fills in only when the agent
+        // didn't supply its own.
+        let mut sent_beta = false;
+        for (key, value) in req.metadata.forwarded_headers.0.iter() {
+            if !key.starts_with("anthropic-") {
+                continue;
+            }
+            let Some(v) = value.as_str() else { continue };
+            builder = builder.header(key.as_str(), v);
+            if key == "anthropic-beta" {
+                sent_beta = true;
+            }
+        }
+        if !sent_beta {
+            if let Some(beta) = &target.default_anthropic_beta {
+                builder = builder.header("anthropic-beta", beta.as_str());
+            }
+        }
+
         let response = builder
             .send()
             .await
@@ -279,6 +300,12 @@ impl BackendProvider for CopilotProvider {
             .body(body);
         for (k, v) in &headers {
             builder = builder.header(k, v);
+        }
+
+        // Apply per-route default `anthropic-beta` (per-request value would
+        // require decoding the body, which proxy_raw deliberately avoids).
+        if let Some(beta) = &target.default_anthropic_beta {
+            builder = builder.header("anthropic-beta", beta.as_str());
         }
 
         let response = builder

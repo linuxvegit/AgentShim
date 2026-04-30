@@ -83,16 +83,39 @@ pub(crate) fn spawn_provider_stream(
 
 pub async fn handle(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HandlerError> {
     let body_bytes = body.len();
     let started = std::time::Instant::now();
 
-    let canonical = state.anthropic.decode_request(&body).map_err(|e| {
+    let mut canonical = state.anthropic.decode_request(&body).map_err(|e| {
         tracing::warn!(error = %e, "anthropic decode failed");
         HandlerError::Frontend(e)
     })?;
+
+    // Capture every `anthropic-*` header from the inbound request so backends
+    // that speak Anthropic natively (e.g. Copilot's Vertex Claude route) see
+    // the same negotiation Claude Code performs — `anthropic-beta` for the
+    // 1M-context window, `anthropic-version`, dangerous-direct-browser-access,
+    // any future beta flags, etc.
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if !name_str.starts_with("anthropic-") {
+            continue;
+        }
+        // Skip auth/identity headers — those are owned by the upstream
+        // provider, not the agent.
+        if matches!(name_str, "anthropic-api-key" | "anthropic-auth-token") {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            canonical.metadata.forwarded_headers.insert(
+                name_str.to_string(),
+                serde_json::Value::String(v.to_string()),
+            );
+        }
+    }
 
     let model_alias = canonical.model.as_str().to_string();
     let is_stream = canonical.stream;
@@ -135,9 +158,16 @@ pub async fn handle(
         .reasoning
         .as_ref()
         .and_then(|r| r.budget_tokens);
+    let anthropic_beta = canonical
+        .metadata
+        .forwarded_headers
+        .get("anthropic-beta")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| target.default_anthropic_beta.clone());
 
     tracing::info!(
-        "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {} | reasoning: {}{}",
+        "→ /v1/messages | model: {} → {} | bodyBytes: {} | maxTokens: {} | reasoning: {}{} | beta: {}",
         model_alias,
         upstream_model,
         body_bytes,
@@ -146,6 +176,7 @@ pub async fn handle(
         reasoning_budget
             .map(|b| format!(" (budget {} tok)", b))
             .unwrap_or_default(),
+        anthropic_beta.as_deref().unwrap_or("none"),
     );
 
     let provider = state.providers.get(&target.provider).ok_or_else(|| {

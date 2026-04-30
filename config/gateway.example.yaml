@@ -21,7 +21,16 @@ routes:
     upstream: deepseek
     upstream_model: deepseek-reasoner
     # Optional: default reasoning_effort applied when the request omits one.
-    # One of: minimal | low | medium | high
+    # One of: minimal | low | medium | high | xhigh
     # Forwarded to upstreams that understand `reasoning_effort`
     # (Copilot/GPT-5/o-series).
     reasoning_effort: medium
+
+  # Anthropic 1M context — enabled via header, NOT a different model name.
+  # Claude Code sends `anthropic-beta: context-1m-...` automatically; this
+  # default kicks in only if the inbound request didn't supply one.
+  - frontend: anthropic_messages
+    model: claude-opus-4-7
+    upstream: copilot
+    upstream_model: claude-opus-4-7
+    anthropic_beta: context-1m-2025-08-07

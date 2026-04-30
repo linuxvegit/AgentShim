@@ -91,6 +91,7 @@ mod tests {
             upstream: "nonexistent".to_string(),
             upstream_model: "gpt-4".to_string(),
             reasoning_effort: None,
+            anthropic_beta: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -116,6 +117,7 @@ mod tests {
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
             reasoning_effort: None,
+            anthropic_beta: None,
         });
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
@@ -123,6 +125,7 @@ mod tests {
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
             reasoning_effort: None,
+            anthropic_beta: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -148,6 +151,7 @@ mod tests {
             upstream: "upstream1".to_string(),
             upstream_model: "gpt-4".to_string(),
             reasoning_effort: None,
+            anthropic_beta: None,
         });
         assert!(matches!(
             validate(&cfg),

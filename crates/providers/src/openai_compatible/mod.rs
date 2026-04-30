@@ -132,6 +132,11 @@ impl BackendProvider for OpenAiCompatibleProvider {
             request_builder = request_builder.header(k, v);
         }
 
+        // Forward Anthropic-style negotiation headers (e.g. anthropic-beta for
+        // 1M context). Inbound value wins; falls back to per-route default.
+        request_builder =
+            apply_anthropic_passthrough_headers(request_builder, &req, &target);
+
         let response = request_builder
             .send()
             .await
@@ -219,6 +224,12 @@ impl BackendProvider for OpenAiCompatibleProvider {
             request_builder = request_builder.header(k, v);
         }
 
+        // Apply route default for `anthropic-beta` if configured (per-request
+        // value isn't available here — proxy_raw runs before decode).
+        if let Some(beta) = &target.default_anthropic_beta {
+            request_builder = request_builder.header("anthropic-beta", beta.as_str());
+        }
+
         let response = request_builder
             .send()
             .await
@@ -254,6 +265,37 @@ impl BackendProvider for OpenAiCompatibleProvider {
 }
 
 use std::collections::BTreeSet;
+
+/// Forward Anthropic-style negotiation headers from the canonical request onto
+/// the outbound HTTP request. Every `anthropic-*` header captured by the
+/// frontend is replayed verbatim. The per-route `anthropic_beta` default is
+/// applied only when the inbound request didn't supply its own value.
+fn apply_anthropic_passthrough_headers(
+    mut builder: reqwest::RequestBuilder,
+    req: &CanonicalRequest,
+    target: &BackendTarget,
+) -> reqwest::RequestBuilder {
+    let mut sent_beta = false;
+    for (key, value) in req.metadata.forwarded_headers.0.iter() {
+        if !key.starts_with("anthropic-") {
+            continue;
+        }
+        let Some(v) = value.as_str() else { continue };
+        builder = builder.header(key.as_str(), v);
+        if key == "anthropic-beta" {
+            sent_beta = true;
+        }
+    }
+
+    // Per-route default fills in if the inbound request didn't carry one.
+    if !sent_beta {
+        if let Some(beta) = &target.default_anthropic_beta {
+            builder = builder.header("anthropic-beta", beta.as_str());
+        }
+    }
+
+    builder
+}
 
 /// Build an `OpenAiCompatibleProvider` from gateway config upstreams.
 pub fn from_config(

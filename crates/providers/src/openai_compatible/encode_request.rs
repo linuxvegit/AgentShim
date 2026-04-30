@@ -345,6 +345,7 @@ mod tests {
             provider: "test".into(),
             model: model.into(),
             default_reasoning_effort: None,
+            default_anthropic_beta: None,
         }
     }
 

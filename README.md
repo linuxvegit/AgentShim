@@ -207,6 +207,25 @@ routes:
 
 Request-level reasoning settings always win over the route default. Unknown values are logged and ignored.
 
+## Anthropic beta features (1M context, prompt caching, etc.)
+
+Anthropic enables some features via the `anthropic-beta` HTTP header rather than a distinct model ID. For example, **Claude 1M context** uses the same `claude-opus-4-7` model name with `anthropic-beta: context-1m-2025-08-07`. Claude Code adds this header automatically when you pick the 1M variant in `/model`.
+
+AgentShim forwards `anthropic-beta` (and `anthropic-version`) end-to-end so backends like GitHub Copilot's Vertex Anthropic route see the same beta flags the agent sent.
+
+**Per-route default.** If you want to force a beta even when the agent doesn't send one, set `anthropic_beta` on the route:
+
+```yaml
+routes:
+  - frontend: anthropic_messages
+    model: claude-opus-4-7
+    upstream: copilot
+    upstream_model: claude-opus-4-7
+    anthropic_beta: context-1m-2025-08-07
+```
+
+Inbound header wins; the route value is the fallback. Comma-separated values are passed through unchanged.
+
 ## Environment variable overlay
 
 Any config field can be overridden via environment variables with the `AGENT_SHIM__` prefix (double underscore for nesting):
@@ -235,6 +254,7 @@ AGENT_SHIM__LOGGING__FORMAT=json
 | `routes[].upstream` | string | — | Which upstream to route to |
 | `routes[].upstream_model` | string | — | Model name sent to the upstream |
 | `routes[].reasoning_effort` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` | — | Default thinking effort applied when the request omits one |
+| `routes[].anthropic_beta` | string | — | Default `anthropic-beta` header value applied when the request omits one (e.g. `context-1m-2025-08-07`) |
 
 Unknown fields are rejected at startup (`deny_unknown_fields`). Typos fail loudly.
 

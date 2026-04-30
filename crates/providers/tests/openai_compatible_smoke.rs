@@ -32,6 +32,7 @@ fn make_target() -> BackendTarget {
         provider: "openai".to_string(),
         model: "gpt-4o".to_string(),
         default_reasoning_effort: None,
+        default_anthropic_beta: None,
     }
 }
 
@@ -118,6 +119,7 @@ async fn proxy_raw_responses_posts_to_responses_and_rewrites_model() {
         provider: "openai".to_string(),
         model: "gpt-upstream".to_string(),
         default_reasoning_effort: None,
+        default_anthropic_beta: None,
     };
 
     let Some((content_type, mut stream)) = provider

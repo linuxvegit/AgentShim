@@ -20,6 +20,7 @@ struct WildcardTarget {
     provider: String,
     upstream_model: String,
     default_reasoning_effort: Option<ReasoningEffort>,
+    default_anthropic_beta: Option<String>,
 }
 
 /// A static router built from `GatewayConfig.routes`.
@@ -59,6 +60,7 @@ impl StaticRouter {
                         provider: entry.upstream.clone(),
                         upstream_model: entry.upstream_model.clone(),
                         default_reasoning_effort,
+                        default_anthropic_beta: entry.anthropic_beta.clone(),
                     },
                 );
                 continue;
@@ -71,6 +73,7 @@ impl StaticRouter {
                 provider: entry.upstream.clone(),
                 model: entry.upstream_model.clone(),
                 default_reasoning_effort,
+                default_anthropic_beta: entry.anthropic_beta.clone(),
             };
             routes.insert(key, target);
         }
@@ -97,6 +100,7 @@ impl Router for StaticRouter {
                 provider: wc.provider.clone(),
                 model: upstream_model,
                 default_reasoning_effort: wc.default_reasoning_effort,
+                default_anthropic_beta: wc.default_anthropic_beta.clone(),
             });
         }
         Err(RouteError::NoRoute {
@@ -127,6 +131,7 @@ mod tests {
                 upstream: upstream.to_string(),
                 upstream_model: upstream_model.to_string(),
                 reasoning_effort: None,
+                anthropic_beta: None,
             }],
             copilot: None,
         }
@@ -175,6 +180,7 @@ mod tests {
             upstream: "other".to_string(),
             upstream_model: "other-model".to_string(),
             reasoning_effort: None,
+            anthropic_beta: None,
         });
         let router = StaticRouter::from_config(&cfg);
         // Specific route wins
