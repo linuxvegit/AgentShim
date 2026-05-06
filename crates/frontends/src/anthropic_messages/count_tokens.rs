@@ -158,4 +158,19 @@ mod tests {
         req.messages.push(user_text("the quick brown fox"));
         assert_eq!(count(&req), count(&req));
     }
+
+    #[test]
+    fn system_instruction_adds_per_system_overhead_plus_content() {
+        use agent_shim_core::message::{SystemInstruction, SystemSource};
+        let mut req = empty_request();
+        req.system.push(SystemInstruction {
+            source: SystemSource::AnthropicSystem,
+            content: vec![ContentBlock::Text(TextBlock {
+                text: "you are helpful".into(),
+                extensions: ExtensionMap::new(),
+            })],
+        });
+        let expected = count_text("you are helpful") + PER_SYSTEM;
+        assert_eq!(count(&req), expected);
+    }
 }
