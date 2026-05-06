@@ -13,6 +13,7 @@ repository = "https://github.com/anthropics/agent-shim"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 thiserror = "1"
+tiktoken-rs = "0.5"
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 proptest = "1"
