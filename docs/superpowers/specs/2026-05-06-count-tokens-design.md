@@ -156,7 +156,7 @@ in `count_tokens.rs` as `const` items so future tuning is one edit.
 | Each tool_result block                 | +6 on top of content                |
 | Each reasoning / redacted_reasoning    | +4 on top of content                |
 | Each tool definition                   | +10 on top of name + description + serialized schema |
-| `tool_choice` (if non-`auto`)          | +6                                  |
+| `tool_choice` (if non-`auto`)          | +6 (plus tokenized tool name for the `tool` form) |
 | Image block                            | +200 (fixed; deliberate over-count) |
 
 The image overhead is intentionally a flat over-approximation. We do
@@ -183,8 +183,16 @@ plus the +10 structural overhead.
 
 ### Final number
 
-`u32` accumulator, capped at `u32::MAX` defensively. Unreachable in
-practice (~16GB request body required) but cheap to assert.
+A `u32` accumulator using `saturating_add` for every addition.
+`u32::MAX` is unreachable in practice (~16GB request body required) but
+saturating arithmetic guarantees no overflow panic and no silent wrap.
+
+### Naming bridge
+
+The "Decoded fields" list uses Anthropic wire names (`thinking`,
+`redacted_thinking`); the algorithm operates on `CanonicalRequest`,
+which uses `Reasoning` / `RedactedReasoning`. Same blocks, two names.
+The decoder maps wire → canonical; the counter only sees canonical.
 
 ## File-level changes
 
