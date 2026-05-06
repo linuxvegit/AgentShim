@@ -19,13 +19,11 @@ const PER_MESSAGE: u32 = 4;
 const PER_SYSTEM: u32 = 4;
 const PER_TOOL_USE: u32 = 8;
 const PER_TOOL_RESULT: u32 = 6;
-#[allow(dead_code)]
 const PER_REASONING: u32 = 4;
 #[allow(dead_code)]
 const PER_TOOL_DEF: u32 = 10;
 #[allow(dead_code)]
 const PER_TOOL_CHOICE: u32 = 6;
-#[allow(dead_code)]
 const PER_IMAGE: u32 = 200;
 
 /// Count the approximate input tokens of a canonical request.
@@ -73,7 +71,20 @@ fn count_block(block: &ContentBlock) -> u32 {
             let content_text = serde_json::to_string(&b.content).unwrap_or_default();
             count_text(&content_text).saturating_add(PER_TOOL_RESULT)
         }
-        _ => 0, // implemented in later tasks
+        ContentBlock::Reasoning(b) => count_text(&b.text).saturating_add(PER_REASONING),
+        ContentBlock::RedactedReasoning(b) => {
+            let approx = (b.data.len() as u32) / 4;
+            approx.saturating_add(PER_REASONING)
+        }
+        // Anthropic images decode into Unsupported(...) per
+        // anthropic_messages::decode::inbound_block_to_canonical. Use the flat
+        // image overhead — we don't have dimensions, and tokenizing the base64
+        // blob would over-count by orders of magnitude.
+        ContentBlock::Unsupported(_) => PER_IMAGE,
+        // Native image/audio/file blocks aren't produced by the Anthropic
+        // decoder today, but in case some path produces them, treat them as
+        // image-equivalent rather than zero.
+        ContentBlock::Image(_) | ContentBlock::Audio(_) | ContentBlock::File(_) => PER_IMAGE,
     }
 }
 
@@ -226,6 +237,58 @@ mod tests {
         });
         let serialized = serde_json::to_string(&content).unwrap();
         let expected = count_text(&serialized) + PER_TOOL_RESULT + PER_MESSAGE;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn reasoning_block_counts_text_plus_overhead() {
+        use agent_shim_core::content::ReasoningBlock;
+        let mut req = empty_request();
+        req.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::Reasoning(ReasoningBlock {
+                text: "thinking aloud".into(),
+                extensions: ExtensionMap::new(), // signature lives here, must NOT be counted
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let expected = count_text("thinking aloud") + PER_REASONING + PER_MESSAGE;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn redacted_reasoning_counts_blob_length_quarter_plus_overhead() {
+        use agent_shim_core::content::RedactedReasoningBlock;
+        let mut req = empty_request();
+        let blob = "x".repeat(40);
+        req.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::RedactedReasoning(RedactedReasoningBlock {
+                data: blob.clone(),
+                extensions: ExtensionMap::new(),
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let expected = (blob.len() as u32 / 4) + PER_REASONING + PER_MESSAGE;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn image_unsupported_block_uses_flat_overhead_only() {
+        use agent_shim_core::content::UnsupportedBlock;
+        let mut req = empty_request();
+        req.messages.push(Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Unsupported(UnsupportedBlock {
+                origin: "anthropic_messages".into(),
+                raw: serde_json::json!({"type":"image","source":{"type":"base64","data":"aGVsbG8="}}),
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let expected = PER_IMAGE + PER_MESSAGE;
         assert_eq!(count(&req), expected);
     }
 }
