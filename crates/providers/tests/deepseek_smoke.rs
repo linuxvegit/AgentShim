@@ -101,7 +101,7 @@ fn make_target(model: &str) -> BackendTarget {
 /// Build a synthetic `CanonicalRequest`. The DeepSeek provider's `complete()`
 /// path does not gate on `frontend.kind`, so any inbound frontend (OpenAiChat,
 /// OpenAiResponses, AnthropicMessages) routes through the same code.
-fn make_req(frontend_kind: FrontendKind, stream: bool) -> CanonicalRequest {
+fn make_req(stream: bool, frontend_kind: FrontendKind) -> CanonicalRequest {
     CanonicalRequest {
         id: RequestId::new(),
         frontend: FrontendInfo {
@@ -163,7 +163,7 @@ async fn text_stream_yields_canonical_events() {
     let provider = make_provider(server.url());
     let stream = provider
         .complete(
-            make_req(FrontendKind::OpenAiChat, true),
+            make_req(true, FrontendKind::OpenAiChat),
             make_target("deepseek-chat"),
         )
         .await
@@ -270,7 +270,7 @@ async fn reasoning_stream_yields_interleaved_reasoning_and_text() {
     let provider = make_provider(server.url());
     let stream = provider
         .complete(
-            make_req(FrontendKind::OpenAiChat, true),
+            make_req(true, FrontendKind::OpenAiChat),
             make_target("deepseek-reasoner"),
         )
         .await
@@ -379,7 +379,7 @@ async fn cache_hit_unary_populates_cache_read_input_tokens() {
     let provider = make_provider(server.url());
     let stream = provider
         .complete(
-            make_req(FrontendKind::OpenAiChat, false),
+            make_req(false, FrontendKind::OpenAiChat),
             make_target("deepseek-chat"),
         )
         .await
@@ -457,6 +457,14 @@ async fn canonical_path_with_anthropic_frontend_renders_reasoning_then_text() {
     // inbound request. The canonical event stream is identical regardless of
     // the inbound frontend kind.
     //
+    // Note: `GenerationOptions::default()` leaves `thinking` unset; the
+    // DeepSeek provider does not consult that field, so reasoning emergence
+    // here is controlled entirely by the upstream SSE fixture
+    // (`REASONING_SSE`). A real Anthropic Messages request from a Claude Code
+    // client carrying `thinking: { type: "enabled", budget_tokens: 1024 }`
+    // would land on the same canonical path; the field is simply not part of
+    // what the DeepSeek provider observes.
+    //
     // The frontend-side encoding (canonical → Anthropic SSE with
     // `content_block_start type: thinking` followed by
     // `content_block_start type: text`) is covered by the Anthropic frontend's
@@ -480,7 +488,7 @@ async fn canonical_path_with_anthropic_frontend_renders_reasoning_then_text() {
     let provider = make_provider(server.url());
     let stream = provider
         .complete(
-            make_req(FrontendKind::AnthropicMessages, true),
+            make_req(true, FrontendKind::AnthropicMessages),
             make_target("deepseek-reasoner"),
         )
         .await
