@@ -2,8 +2,8 @@
 //!
 //! Plan 03 lands this module incrementally:
 //!
-//! - **T2 (this commit)** introduces the wire DTOs in [`wire`].
-//! - T3 adds auth + endpoint URL helpers.
+//! - **T2** introduced the wire DTOs in [`wire`].
+//! - **T3 (this commit)** adds [`auth`] + [`endpoint`] URL helpers.
 //! - T4 adds the canonical → wire encoder.
 //! - T5 adds the streaming JSON-array reader.
 //! - T6 adds the wire → canonical parser.
@@ -13,4 +13,11 @@
 //! Submodules stay `pub(crate)` until a public surface is needed
 //! (`from_config` will be the only public export when T7 lands).
 
+// Consumed by sibling submodules in Plan 03 T6 (response parser) and T7
+// (BackendProvider impl). Until those land, the public items are only
+// exercised by tests, so the unused-code lints are gated here.
+#[allow(dead_code)]
+pub(crate) mod auth;
+#[allow(dead_code)]
+pub(crate) mod endpoint;
 pub(crate) mod wire;
