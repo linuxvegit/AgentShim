@@ -28,6 +28,14 @@ uuid.workspace = true
 dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 url = "2"
+# TLS plumbing for the optional `SSLKEYLOGFILE` debug branch in
+# `http_client::build`. Default `reqwest::Client::builder()` does not honor
+# the env var on its own; we have to construct a rustls `ClientConfig` and
+# pass it via `use_preconfigured_tls`. Both crates are already in the lock
+# file transitively (rustls via reqwest's `rustls-tls` feature), so adding
+# them as direct deps does not pull in new code.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
 [dev-dependencies]
 mockito.workspace = true

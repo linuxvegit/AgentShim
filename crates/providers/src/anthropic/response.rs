@@ -49,8 +49,16 @@ where
     let event_stream = sse_stream.flat_map(move |result| {
         let events: Vec<Result<StreamEvent, StreamError>> = match result {
             Err(e) => {
-                tracing::warn!(error = %e, "anthropic SSE stream error");
-                vec![Err(StreamError::Upstream(e.to_string()))]
+                if state.completed {
+                    tracing::debug!(
+                        error = %e,
+                        "ignoring anthropic transport error after upstream end-of-stream"
+                    );
+                    Vec::new()
+                } else {
+                    tracing::warn!(error = %e, "anthropic SSE stream error");
+                    vec![Err(StreamError::Upstream(e.to_string()))]
+                }
             }
             Ok(event) => {
                 tracing::debug!(
@@ -93,6 +101,10 @@ struct StreamState {
     /// (output / cache). Emitted once on `message_stop` as the final
     /// `ResponseStop { usage }`.
     accumulated_usage: Usage,
+    /// Set once the upstream has emitted `message_stop`, so the outer
+    /// `flat_map` can drop a trailing transport-level error from the
+    /// connection closing without WARN-spamming the logs.
+    completed: bool,
 }
 
 fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, String> {
@@ -210,6 +222,7 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
             out.push(StreamEvent::ResponseStop {
                 usage: Some(final_usage),
             });
+            state.completed = true;
         }
         IncomingEvent::Ping => {
             // No canonical equivalent — drop.

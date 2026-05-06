@@ -16,13 +16,32 @@ where
 
     let mut emitted_response_start = false;
     let mut emitted_message_start = false;
+    // Set once we see `response.completed` / `response.failed`. After that,
+    // a transport-level error from the upstream closing the connection is
+    // expected and we drop it instead of forwarding a `StreamError::Upstream`.
+    let mut stream_completed = false;
 
     let event_stream = sse_stream.flat_map(move |result| {
         let events: Vec<Result<StreamEvent, StreamError>> = match result {
-            Err(e) => vec![Err(StreamError::Upstream(e.to_string()))],
+            Err(e) => {
+                if stream_completed {
+                    tracing::debug!(
+                        error = %e,
+                        "ignoring openai-responses transport error after upstream end-of-stream"
+                    );
+                    Vec::new()
+                } else {
+                    tracing::warn!(error = %e, "openai-responses SSE stream error");
+                    vec![Err(StreamError::Upstream(e.to_string()))]
+                }
+            }
             Ok(sse_event) => {
                 let event_type = sse_event.event.as_str();
                 let data = &sse_event.data;
+
+                if event_type == "response.completed" || event_type == "response.failed" {
+                    stream_completed = true;
+                }
 
                 let parsed: serde_json::Value = match serde_json::from_str(data) {
                     Ok(v) => v,

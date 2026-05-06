@@ -134,6 +134,7 @@ dependencies = [
  "futures-util",
  "mockito",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -141,6 +142,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

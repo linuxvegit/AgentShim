@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream, FrontendKind};
 
-use crate::{BackendProvider, ProviderCapabilities, ProviderError, RawByteStream};
+use crate::{http_client, BackendProvider, ProviderCapabilities, ProviderError, RawByteStream};
 
 pub struct AnthropicProvider {
     name: &'static str,
@@ -59,10 +59,7 @@ impl AnthropicProvider {
             headers.insert(name, val);
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let client = http_client::build(Duration::from_secs(timeout_secs))?;
 
         Ok(Self {
             name,

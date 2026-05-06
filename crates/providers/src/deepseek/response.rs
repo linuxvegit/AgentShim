@@ -51,8 +51,16 @@ where
     let event_stream = sse_stream.flat_map(move |result| {
         let events: Vec<Result<StreamEvent, StreamError>> = match result {
             Err(e) => {
-                tracing::warn!(error = %e, "deepseek SSE stream error");
-                vec![Err(StreamError::Upstream(e.to_string()))]
+                if state.completed {
+                    tracing::debug!(
+                        error = %e,
+                        "ignoring deepseek transport error after upstream end-of-stream"
+                    );
+                    Vec::new()
+                } else {
+                    tracing::warn!(error = %e, "deepseek SSE stream error");
+                    vec![Err(StreamError::Upstream(e.to_string()))]
+                }
             }
             Ok(event) => {
                 tracing::debug!(
@@ -67,6 +75,7 @@ where
                     state.interleaver.flush(&mut evts);
                     drain_open_tool_blocks(&mut state.open_tool_blocks, &mut evts);
                     evts.push(StreamEvent::ResponseStop { usage: None });
+                    state.completed = true;
                     evts.into_iter().map(Ok).collect()
                 } else {
                     match parse_chunk(&event.data, &mut state) {
@@ -232,6 +241,11 @@ struct StreamState {
     open_tool_blocks: HashMap<u32, u32>,
     response_id: String,
     response_model: String,
+    /// Set once the upstream signals end-of-stream (`[DONE]` sentinel or a
+    /// `finish_reason`). Lets the outer `flat_map` drop the trailing transport
+    /// error that some upstreams emit when they close the connection right
+    /// after the final SSE event.
+    completed: bool,
 }
 
 fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, String> {
@@ -369,6 +383,9 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
                     stop_reason: StopReason::from_provider_string(reason),
                     stop_sequence: None,
                 });
+                // Mark completion so a trailing transport-level error from the
+                // upstream closing the connection is treated as benign.
+                state.completed = true;
             }
         }
     }

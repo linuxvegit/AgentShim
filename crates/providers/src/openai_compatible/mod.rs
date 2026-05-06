@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
-use crate::{BackendProvider, ProviderCapabilities, ProviderError, RawByteStream};
+use crate::{http_client, BackendProvider, ProviderCapabilities, ProviderError, RawByteStream};
 
 pub struct OpenAiCompatibleProvider {
     name: &'static str,
@@ -37,10 +37,7 @@ impl OpenAiCompatibleProvider {
             headers.insert(name, val);
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let client = http_client::build(Duration::from_secs(timeout_secs))?;
 
         Ok(Self {
             name,

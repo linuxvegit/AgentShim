@@ -19,6 +19,7 @@ use uuid::Uuid;
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 
 use crate::{
+    http_client,
     oai_chat_wire::{canonical_to_chat, chat_sse_parser, chat_unary_parser},
     openai_compatible::responses_api,
     BackendProvider, ProviderCapabilities, ProviderError, RawByteStream,
@@ -38,10 +39,17 @@ pub struct CopilotProvider {
 
 impl CopilotProvider {
     fn build_http_client() -> Result<reqwest::Client, ProviderError> {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| ProviderError::Network(e.to_string()))
+        // 300s read_timeout — maximum gap between successive body reads.
+        // This is *not* a total request timeout; long Claude tool-call
+        // streams can run several minutes total but emit fragments well
+        // under a second apart. The high cap accommodates rare longer
+        // gaps (model "thinks" before resuming output) while still
+        // catching genuinely dead connections in a reasonable window.
+        // Earlier 60s was too tight: tool-call streams were getting
+        // cut mid-emission and surfacing as `error decoding response
+        // body` WARNs. See `http_client::build` for why we use
+        // `read_timeout` instead of a total `timeout`.
+        http_client::build(Duration::from_secs(300))
     }
 
     /// Create and start a `CopilotProvider` using credentials stored at `credential_path`.
