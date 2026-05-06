@@ -72,6 +72,13 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
                 d.api_key.expose(),
                 d.request_timeout_secs,
             )?;
+        } else if let UpstreamConfig::Gemini(g) = upstream {
+            validate_oai_style_upstream(
+                name,
+                &g.base_url,
+                g.api_key.expose(),
+                g.request_timeout_secs,
+            )?;
         }
     }
 
@@ -356,6 +363,93 @@ mod tests {
         match validate(&cfg) {
             Err(ValidationError::InvalidUpstream(name, msg)) => {
                 assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("request_timeout_secs"),
+                    "expected request_timeout_secs error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_upstream_validation_passes() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new("ai-studio-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn gemini_validation_rejects_empty_api_key() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new(""),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "gemini");
+                assert!(
+                    msg.contains("api_key"),
+                    "expected api_key error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_validation_rejects_bad_base_url() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "ftp://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new("ai-studio-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "gemini");
+                assert!(
+                    msg.contains("base_url"),
+                    "expected base_url error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_validation_rejects_zero_timeout() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new("ai-studio-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 0,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "gemini");
                 assert!(
                     msg.contains("request_timeout_secs"),
                     "expected request_timeout_secs error, got: {msg}"
