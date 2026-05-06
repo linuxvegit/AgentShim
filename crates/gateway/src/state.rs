@@ -8,7 +8,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_providers::{
-    anthropic, deepseek,
+    anthropic, deepseek, gemini,
     github_copilot::{self, credential_store},
     openai_compatible::{self},
     ProviderRegistry,
@@ -74,6 +74,10 @@ impl AppState {
                 UpstreamConfig::Deepseek(cfg) => match deepseek::from_config(name, cfg) {
                     Ok(p) => registry.register(name.clone(), Arc::new(p)),
                     Err(e) => tracing::error!("failed to build Deepseek provider {name}: {e}"),
+                },
+                UpstreamConfig::Gemini(cfg) => match gemini::from_config(name, cfg) {
+                    Ok(p) => registry.register(name.clone(), Arc::new(p)),
+                    Err(e) => tracing::error!("failed to build Gemini provider {name}: {e}"),
                 },
             }
         }

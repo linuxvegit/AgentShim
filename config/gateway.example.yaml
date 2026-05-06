@@ -26,6 +26,19 @@ upstreams:
   #   # base_url: https://api.anthropic.com
   #   # anthropic_version: "2023-06-01"
   #   # request_timeout_secs: 60
+  # Gemini-as-backend (talks to generativelanguage.googleapis.com directly):
+  # Uses the native `gemini` upstream type which supports:
+  #   - JSON-array streaming on :streamGenerateContent (not SSE)
+  #   - inlineData (base64) and fileData (URL) image inputs
+  #   - functionDeclarations / functionCall / functionResponse for tools
+  #   - thinkingConfig (budget tokens) for reasoning-capable models
+  # gemini:
+  #   type: gemini
+  #   api_key: "AIzaSy-your-ai-studio-api-key-here"
+  #   # Optional overrides (defaults shown):
+  #   # base_url: https://generativelanguage.googleapis.com/v1beta
+  #   # request_timeout_secs: 30
+  #   # default_headers: {}
 routes:
   - frontend: openai_chat
     model: deepseek-chat
@@ -71,3 +84,21 @@ routes:
   #   model: claude-via-oai
   #   upstream: anthropic
   #   upstream_model: claude-opus-4-7
+
+  # OpenAI Chat frontend → Gemini Flash (general use). Tool calls and JSON
+  # mode work; vision works via base64 or URL image inputs.
+  # - frontend: openai_chat
+  #   model: gemini-2.0-flash
+  #   upstream: gemini
+  #   upstream_model: gemini-2.0-flash
+
+  # Anthropic frontend → Gemini thinking model. Gemini emits `thought:true`
+  # parts which the parser routes into canonical Reasoning blocks; the
+  # Anthropic encoder renders them as `content_block_start type: thinking`.
+  # The route-level reasoning_effort below maps to a thinking budget per the
+  # docs/providers/gemini.md table (medium = 1024 tokens).
+  # - frontend: anthropic_messages
+  #   model: gemini-2.5-flash-thinking
+  #   upstream: gemini
+  #   upstream_model: gemini-2.5-flash-thinking
+  #   reasoning_effort: medium

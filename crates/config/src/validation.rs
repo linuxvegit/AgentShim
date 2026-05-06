@@ -53,62 +53,74 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
 
     for (name, upstream) in &cfg.upstreams {
         if let UpstreamConfig::Anthropic(a) = upstream {
-            if a.api_key.expose().is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "api_key must be non-empty".to_string(),
-                ));
-            }
-            if a.base_url.is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must be non-empty".to_string(),
-                ));
-            }
-            if !a.base_url.starts_with("http://") && !a.base_url.starts_with("https://") {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must start with http:// or https://".to_string(),
-                ));
-            }
+            validate_oai_style_upstream(
+                name,
+                &a.base_url,
+                a.api_key.expose(),
+                a.request_timeout_secs,
+            )?;
             if a.anthropic_version.is_empty() {
                 return Err(ValidationError::InvalidUpstream(
                     name.clone(),
                     "anthropic_version must be non-empty".to_string(),
                 ));
             }
-        }
-        // TODO follow-up: api_key + base_url checks duplicate the Anthropic
-        // branch above. Extract a helper once a third upstream lands (Plan
-        // 03/04 cleanup ticket).
-        if let UpstreamConfig::Deepseek(d) = upstream {
-            if d.api_key.expose().is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "api_key must be non-empty".to_string(),
-                ));
-            }
-            if d.base_url.is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must be non-empty".to_string(),
-                ));
-            }
-            if !d.base_url.starts_with("http://") && !d.base_url.starts_with("https://") {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must start with http:// or https://".to_string(),
-                ));
-            }
-            if d.request_timeout_secs == 0 {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "request_timeout_secs must be greater than 0".to_string(),
-                ));
-            }
+        } else if let UpstreamConfig::Deepseek(d) = upstream {
+            validate_oai_style_upstream(
+                name,
+                &d.base_url,
+                d.api_key.expose(),
+                d.request_timeout_secs,
+            )?;
+        } else if let UpstreamConfig::Gemini(g) = upstream {
+            validate_oai_style_upstream(
+                name,
+                &g.base_url,
+                g.api_key.expose(),
+                g.request_timeout_secs,
+            )?;
         }
     }
 
+    Ok(())
+}
+
+/// Shared validation for OpenAI-style upstream configs. Verifies that the
+/// `api_key` and `base_url` are non-empty, the `base_url` uses an http(s)
+/// scheme, and the `request_timeout_secs` is greater than zero.
+///
+/// Anthropic-specific checks (e.g. `anthropic_version` non-empty) are handled
+/// at the call site after this helper returns.
+fn validate_oai_style_upstream(
+    name: &str,
+    base_url: &str,
+    api_key: &str,
+    timeout: u64,
+) -> Result<(), ValidationError> {
+    if api_key.is_empty() {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "api_key must be non-empty".to_string(),
+        ));
+    }
+    if base_url.is_empty() {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "base_url must be non-empty".to_string(),
+        ));
+    }
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "base_url must start with http:// or https://".to_string(),
+        ));
+    }
+    if timeout == 0 {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "request_timeout_secs must be greater than 0".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -351,6 +363,93 @@ mod tests {
         match validate(&cfg) {
             Err(ValidationError::InvalidUpstream(name, msg)) => {
                 assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("request_timeout_secs"),
+                    "expected request_timeout_secs error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_upstream_validation_passes() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new("ai-studio-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn gemini_validation_rejects_empty_api_key() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new(""),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "gemini");
+                assert!(
+                    msg.contains("api_key"),
+                    "expected api_key error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_validation_rejects_bad_base_url() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "ftp://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new("ai-studio-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "gemini");
+                assert!(
+                    msg.contains("base_url"),
+                    "expected base_url error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_validation_rejects_zero_timeout() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "gemini".to_string(),
+            UpstreamConfig::Gemini(GeminiUpstream {
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                api_key: Secret::new("ai-studio-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 0,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "gemini");
                 assert!(
                     msg.contains("request_timeout_secs"),
                     "expected request_timeout_secs error, got: {msg}"
