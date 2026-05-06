@@ -9,7 +9,7 @@ use agent_shim_core::{
     content::ContentBlock,
     message::Message,
     request::CanonicalRequest,
-    tool::{ToolChoice, ToolDefinition},
+    tool::{ToolCallArguments, ToolChoice, ToolDefinition},
 };
 use std::sync::OnceLock;
 use tiktoken_rs::CoreBPE;
@@ -17,9 +17,7 @@ use tiktoken_rs::CoreBPE;
 // Per-piece structural overhead. See spec §"Per-piece structural overhead".
 const PER_MESSAGE: u32 = 4;
 const PER_SYSTEM: u32 = 4;
-#[allow(dead_code)]
 const PER_TOOL_USE: u32 = 8;
-#[allow(dead_code)]
 const PER_TOOL_RESULT: u32 = 6;
 #[allow(dead_code)]
 const PER_REASONING: u32 = 4;
@@ -60,6 +58,21 @@ fn count_message(msg: &Message) -> u32 {
 fn count_block(block: &ContentBlock) -> u32 {
     match block {
         ContentBlock::Text(b) => count_text(&b.text),
+        ContentBlock::ToolCall(b) => {
+            let args_text = match &b.arguments {
+                ToolCallArguments::Complete { value } => {
+                    serde_json::to_string(value).unwrap_or_default()
+                }
+                ToolCallArguments::Streaming { data } => data.clone(),
+            };
+            count_text(&b.name)
+                .saturating_add(count_text(&args_text))
+                .saturating_add(PER_TOOL_USE)
+        }
+        ContentBlock::ToolResult(b) => {
+            let content_text = serde_json::to_string(&b.content).unwrap_or_default();
+            count_text(&content_text).saturating_add(PER_TOOL_RESULT)
+        }
         _ => 0, // implemented in later tasks
     }
 }
@@ -171,6 +184,48 @@ mod tests {
             })],
         });
         let expected = count_text("you are helpful") + PER_SYSTEM;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn tool_use_block_counts_name_arguments_plus_overhead() {
+        use agent_shim_core::{ids::ToolCallId, tool::{ToolCallBlock, ToolCallArguments}};
+        let mut req = empty_request();
+        let args = serde_json::json!({"q": "rust"});
+        req.messages.push(Message {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolCall(ToolCallBlock {
+                id: ToolCallId::from_provider("call_1".to_string()),
+                name: "search".into(),
+                arguments: ToolCallArguments::Complete { value: args.clone() },
+                extensions: ExtensionMap::new(),
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let serialized = serde_json::to_string(&args).unwrap();
+        let expected = count_text("search") + count_text(&serialized) + PER_TOOL_USE + PER_MESSAGE;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn tool_result_block_counts_serialized_content_plus_overhead() {
+        use agent_shim_core::{ids::ToolCallId, tool::ToolResultBlock};
+        let mut req = empty_request();
+        let content = serde_json::json!("the result text");
+        req.messages.push(Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult(ToolResultBlock {
+                tool_call_id: ToolCallId::from_provider("call_1".to_string()),
+                content: content.clone(),
+                is_error: false,
+                extensions: ExtensionMap::new(),
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let serialized = serde_json::to_string(&content).unwrap();
+        let expected = count_text(&serialized) + PER_TOOL_RESULT + PER_MESSAGE;
         assert_eq!(count(&req), expected);
     }
 }
