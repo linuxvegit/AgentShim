@@ -207,7 +207,10 @@ mod tests {
 
     #[test]
     fn tool_use_block_counts_name_arguments_plus_overhead() {
-        use agent_shim_core::{ids::ToolCallId, tool::{ToolCallBlock, ToolCallArguments}};
+        use agent_shim_core::{
+            ids::ToolCallId,
+            tool::{ToolCallArguments, ToolCallBlock},
+        };
         let mut req = empty_request();
         let args = serde_json::json!({"q": "rust"});
         req.messages.push(Message {
@@ -215,7 +218,9 @@ mod tests {
             content: vec![ContentBlock::ToolCall(ToolCallBlock {
                 id: ToolCallId::from_provider("call_1".to_string()),
                 name: "search".into(),
-                arguments: ToolCallArguments::Complete { value: args.clone() },
+                arguments: ToolCallArguments::Complete {
+                    value: args.clone(),
+                },
                 extensions: ExtensionMap::new(),
             })],
             name: None,
