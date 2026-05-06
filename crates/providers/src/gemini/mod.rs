@@ -4,8 +4,8 @@
 //!
 //! - **T2** introduced the wire DTOs in [`wire`].
 //! - **T3** added [`auth`] + [`endpoint`] URL helpers.
-//! - **T4 (this commit)** adds the canonical → wire encoder in [`request`].
-//! - T5 adds the streaming JSON-array reader.
+//! - **T4** added the canonical → wire encoder in [`request`].
+//! - **T5 (this commit)** adds the streaming JSON-array reader in [`stream`].
 //! - T6 adds the wire → canonical parser.
 //! - T7 wires everything into the [`crate::BackendProvider`] trait via a
 //!   `GeminiProvider` struct + `from_config` factory.
@@ -22,4 +22,6 @@ pub(crate) mod auth;
 pub(crate) mod endpoint;
 #[allow(dead_code)]
 pub(crate) mod request;
+#[allow(dead_code)]
+pub(crate) mod stream;
 pub(crate) mod wire;
