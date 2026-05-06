@@ -20,9 +20,7 @@ const PER_SYSTEM: u32 = 4;
 const PER_TOOL_USE: u32 = 8;
 const PER_TOOL_RESULT: u32 = 6;
 const PER_REASONING: u32 = 4;
-#[allow(dead_code)]
 const PER_TOOL_DEF: u32 = 10;
-#[allow(dead_code)]
 const PER_TOOL_CHOICE: u32 = 6;
 const PER_IMAGE: u32 = 200;
 
@@ -88,12 +86,21 @@ fn count_block(block: &ContentBlock) -> u32 {
     }
 }
 
-fn count_tool(_t: &ToolDefinition) -> u32 {
-    0 // implemented in a later task
+fn count_tool(t: &ToolDefinition) -> u32 {
+    let desc = t.description.as_deref().unwrap_or("");
+    let schema = serde_json::to_string(&t.input_schema).unwrap_or_default();
+    count_text(&t.name)
+        .saturating_add(count_text(desc))
+        .saturating_add(count_text(&schema))
+        .saturating_add(PER_TOOL_DEF)
 }
 
-fn count_tool_choice(_c: &ToolChoice) -> u32 {
-    0 // implemented in a later task
+fn count_tool_choice(c: &ToolChoice) -> u32 {
+    match c {
+        ToolChoice::Auto => 0,
+        ToolChoice::None | ToolChoice::Required => PER_TOOL_CHOICE,
+        ToolChoice::Specific { name } => count_text(name).saturating_add(PER_TOOL_CHOICE),
+    }
 }
 
 /// Count the cl100k_base tokens in a string. Uses `encode_ordinary` so
@@ -289,6 +296,66 @@ mod tests {
             extensions: ExtensionMap::new(),
         });
         let expected = PER_IMAGE + PER_MESSAGE;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn tool_definition_counts_name_description_schema_plus_overhead() {
+        let mut req = empty_request();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "q": { "type": "string" } },
+            "required": ["q"]
+        });
+        req.tools.push(ToolDefinition {
+            name: "search".into(),
+            description: Some("find things".into()),
+            input_schema: schema.clone(),
+            extensions: ExtensionMap::new(),
+        });
+        let serialized = serde_json::to_string(&schema).unwrap();
+        let expected = count_text("search")
+            + count_text("find things")
+            + count_text(&serialized)
+            + PER_TOOL_DEF;
+        assert_eq!(count(&req), expected);
+    }
+
+    #[test]
+    fn tool_definition_with_no_description_does_not_panic() {
+        let mut req = empty_request();
+        req.tools.push(ToolDefinition {
+            name: "ping".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            extensions: ExtensionMap::new(),
+        });
+        // We just care it doesn't panic and includes the tool overhead.
+        let n = count(&req);
+        assert!(n >= PER_TOOL_DEF);
+    }
+
+    #[test]
+    fn tool_choice_auto_adds_zero() {
+        let mut req = empty_request();
+        req.tool_choice = ToolChoice::Auto;
+        assert_eq!(count(&req), 0);
+    }
+
+    #[test]
+    fn tool_choice_required_adds_overhead() {
+        let mut req = empty_request();
+        req.tool_choice = ToolChoice::Required;
+        assert_eq!(count(&req), PER_TOOL_CHOICE);
+    }
+
+    #[test]
+    fn tool_choice_specific_adds_overhead_plus_tool_name() {
+        let mut req = empty_request();
+        req.tool_choice = ToolChoice::Specific {
+            name: "search".into(),
+        };
+        let expected = count_text("search") + PER_TOOL_CHOICE;
         assert_eq!(count(&req), expected);
     }
 }
