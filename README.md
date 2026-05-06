@@ -66,19 +66,19 @@ logging:
 
 upstreams:
   deepseek:
-    type: open_ai_compatible
+    type: deepseek                  # or `open_ai_compatible`; see docs/providers/deepseek.md
     base_url: https://api.deepseek.com/v1
     api_key: sk-your-key-here       # or use env: AGENT_SHIM__UPSTREAMS__DEEPSEEK__API_KEY
     request_timeout_secs: 120
 
 routes:
-  # Claude Code → DeepSeek (Anthropic protocol in, OpenAI-compat out)
+  # Claude Code → DeepSeek (Anthropic protocol in, native DeepSeek out)
   - frontend: anthropic_messages
     model: deepseek-chat
     upstream: deepseek
     upstream_model: deepseek-chat
 
-  # Cursor/Codex → DeepSeek (OpenAI protocol in, OpenAI-compat out)
+  # Cursor/Codex → DeepSeek (OpenAI protocol in, native DeepSeek out)
   - frontend: openai_chat
     model: deepseek-chat
     upstream: deepseek
