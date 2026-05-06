@@ -3,8 +3,8 @@
 //! Plan 03 lands this module incrementally:
 //!
 //! - **T2** introduced the wire DTOs in [`wire`].
-//! - **T3 (this commit)** adds [`auth`] + [`endpoint`] URL helpers.
-//! - T4 adds the canonical → wire encoder.
+//! - **T3** added [`auth`] + [`endpoint`] URL helpers.
+//! - **T4 (this commit)** adds the canonical → wire encoder in [`request`].
 //! - T5 adds the streaming JSON-array reader.
 //! - T6 adds the wire → canonical parser.
 //! - T7 wires everything into the [`crate::BackendProvider`] trait via a
@@ -20,4 +20,6 @@
 pub(crate) mod auth;
 #[allow(dead_code)]
 pub(crate) mod endpoint;
+#[allow(dead_code)]
+pub(crate) mod request;
 pub(crate) mod wire;
