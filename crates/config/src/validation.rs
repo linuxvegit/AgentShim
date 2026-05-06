@@ -53,62 +53,67 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
 
     for (name, upstream) in &cfg.upstreams {
         if let UpstreamConfig::Anthropic(a) = upstream {
-            if a.api_key.expose().is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "api_key must be non-empty".to_string(),
-                ));
-            }
-            if a.base_url.is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must be non-empty".to_string(),
-                ));
-            }
-            if !a.base_url.starts_with("http://") && !a.base_url.starts_with("https://") {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must start with http:// or https://".to_string(),
-                ));
-            }
+            validate_oai_style_upstream(
+                name,
+                &a.base_url,
+                a.api_key.expose(),
+                a.request_timeout_secs,
+            )?;
             if a.anthropic_version.is_empty() {
                 return Err(ValidationError::InvalidUpstream(
                     name.clone(),
                     "anthropic_version must be non-empty".to_string(),
                 ));
             }
-        }
-        // TODO follow-up: api_key + base_url checks duplicate the Anthropic
-        // branch above. Extract a helper once a third upstream lands (Plan
-        // 03/04 cleanup ticket).
-        if let UpstreamConfig::Deepseek(d) = upstream {
-            if d.api_key.expose().is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "api_key must be non-empty".to_string(),
-                ));
-            }
-            if d.base_url.is_empty() {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must be non-empty".to_string(),
-                ));
-            }
-            if !d.base_url.starts_with("http://") && !d.base_url.starts_with("https://") {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "base_url must start with http:// or https://".to_string(),
-                ));
-            }
-            if d.request_timeout_secs == 0 {
-                return Err(ValidationError::InvalidUpstream(
-                    name.clone(),
-                    "request_timeout_secs must be greater than 0".to_string(),
-                ));
-            }
+        } else if let UpstreamConfig::Deepseek(d) = upstream {
+            validate_oai_style_upstream(
+                name,
+                &d.base_url,
+                d.api_key.expose(),
+                d.request_timeout_secs,
+            )?;
         }
     }
 
+    Ok(())
+}
+
+/// Shared validation for OpenAI-style upstream configs. Verifies that the
+/// `api_key` and `base_url` are non-empty, the `base_url` uses an http(s)
+/// scheme, and the `request_timeout_secs` is greater than zero.
+///
+/// Anthropic-specific checks (e.g. `anthropic_version` non-empty) are handled
+/// at the call site after this helper returns.
+fn validate_oai_style_upstream(
+    name: &str,
+    base_url: &str,
+    api_key: &str,
+    timeout: u64,
+) -> Result<(), ValidationError> {
+    if api_key.is_empty() {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "api_key must be non-empty".to_string(),
+        ));
+    }
+    if base_url.is_empty() {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "base_url must be non-empty".to_string(),
+        ));
+    }
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "base_url must start with http:// or https://".to_string(),
+        ));
+    }
+    if timeout == 0 {
+        return Err(ValidationError::InvalidUpstream(
+            name.to_string(),
+            "request_timeout_secs must be greater than 0".to_string(),
+        ));
+    }
     Ok(())
 }
 
