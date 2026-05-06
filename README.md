@@ -29,8 +29,19 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 - **GitHub Copilot** — OAuth device-flow login, automatic token refresh, Copilot-specific headers
 - **Anthropic** — direct talk to api.anthropic.com via Messages API. Hybrid path: byte-passthrough when inbound is Anthropic, canonical translation otherwise.
 - **DeepSeek native** — direct talk to api.deepseek.com with reasoning passthrough (deepseek-reasoner emits visible thinking blocks via the ReasoningInterleaver state machine) and cache hit/miss usage mapping.
+- **Gemini (AI Studio)** — direct talk to generativelanguage.googleapis.com via the Generate Content API. Native JSON-array streaming, `inlineData`/`fileData` images, `thinkingConfig` (budget tokens) for reasoning-capable models, `safetyRatings` round-trip via the canonical extensions map.
 
 **Cross-protocol translation works.** An Anthropic-speaking agent can talk to an OpenAI-compatible backend and vice versa, including streaming tool-call argument deltas.
+
+## Capability matrix (v0.2)
+
+| Frontend → Provider | OAI-compat | Copilot | Anthropic | DeepSeek | Gemini |
+|---|---|---|---|---|---|
+| Anthropic Messages | text · tools · vision | text · tools · vision | text · tools · vision (passthrough = lossless) | text · tools · reasoning | text · tools · vision · thinking |
+| OpenAI Chat | text · tools · vision | text · tools · vision | text · tools (canonical path) | text · tools · reasoning | text · tools · vision · thinking |
+| OpenAI Responses | text · tools | text · tools | n/a in v0.2 | text · tools | n/a in v0.2 |
+
+Vision support gates at the gateway boundary: when an inbound request contains an image block but the routed provider's `capabilities.vision == false` (today: DeepSeek), the request is rejected with HTTP 400 and a frontend-shaped error envelope before any upstream call. See [docs/architecture.md](docs/architecture.md#capability-gate).
 
 ## Install
 
@@ -247,7 +258,7 @@ AGENT_SHIM__LOGGING__FORMAT=json
 | `server.keepalive_secs` | u64 | `15` | SSE keepalive interval (0 = disabled) |
 | `logging.format` | `pretty` \| `json` | `pretty` | Log output format |
 | `logging.filter` | string | `info,agent_shim=debug` | `RUST_LOG`-style filter |
-| `upstreams.<name>.type` | `open_ai_compatible` \| `github_copilot` \| `anthropic` \| `deepseek` | — | Backend type |
+| `upstreams.<name>.type` | `open_ai_compatible` \| `github_copilot` \| `anthropic` \| `deepseek` \| `gemini` | — | Backend type |
 | `upstreams.<name>.base_url` | string | — | API base URL (OpenAI-compat; optional override for Anthropic, default `https://api.anthropic.com`) |
 | `upstreams.<name>.api_key` | string | — | API key (OpenAI-compat and Anthropic) |
 | `upstreams.<name>.anthropic_version` | string | `2023-06-01` | `anthropic-version` header value (Anthropic only) |
@@ -286,21 +297,20 @@ crates/
   core/           # Canonical data model (zero I/O)
   config/         # YAML schema, validation, Secret newtype
   observability/  # Tracing, request-ID middleware, header redaction
-  frontends/      # Anthropic + OpenAI protocol adapters
-  providers/      # OpenAI-compatible + GitHub Copilot backends
-  router/         # Model alias → backend resolution
-  gateway/        # The binary: axum server, CLI, signal handling
-  protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz
+  frontends/      # Anthropic + OpenAI Chat + OpenAI Responses adapters
+  providers/      # OpenAI-compatible, GitHub Copilot, Anthropic, DeepSeek, Gemini
+  router/         # Model alias → backend resolution + fuzzy upgrade
+  gateway/        # The binary: axum server, CLI, signal handling, capability gate
+  protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.1
+## What's NOT in v0.2
 
-- OpenAI `/v1/responses` frontend (Phase 3)
-- Native Gemini/Qwen adapters with provider-specific quirk handling (Phase 2; DeepSeek native landed in Plan 02)
+- OpenAI `/v1/responses` frontend wired to Anthropic/Gemini (Phase 3 — works for OAI-compat/Copilot/DeepSeek today)
 - Fallback chains, circuit breakers, retries (Phase 4)
 - Rate limiting, per-agent API keys (Phase 4)
 - Prometheus metrics, hot-reload config, OpenTelemetry (Phase 5)
-- Vision / audio / file content end-to-end
+- Audio / file content end-to-end (vision Tier-1 is in)
 - Multi-account Copilot
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
