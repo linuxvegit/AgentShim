@@ -57,11 +57,12 @@ routes:
   # Anthropic 1M context — enabled via header, NOT a different model name.
   # Claude Code sends `anthropic-beta: context-1m-...` automatically; this
   # default kicks in only if the inbound request didn't supply one.
-  - frontend: anthropic_messages
-    model: claude-opus-4-7
-    upstream: copilot
-    upstream_model: claude-opus-4-7
-    anthropic_beta: context-1m-2025-08-07
+  # Uncomment after declaring a `copilot` upstream block above.
+  # - frontend: anthropic_messages
+  #   model: claude-opus-4-7
+  #   upstream: copilot
+  #   upstream_model: claude-opus-4-7
+  #   anthropic_beta: context-1m-2025-08-07
 
   # Anthropic frontend → DeepSeek-Reasoner (visible thinking blocks).
   # DeepSeek-R1 emits `reasoning_content` deltas alongside regular
