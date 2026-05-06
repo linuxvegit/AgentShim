@@ -78,6 +78,35 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
                 ));
             }
         }
+        // TODO follow-up: api_key + base_url checks duplicate the Anthropic
+        // branch above. Extract a helper once a third upstream lands (Plan
+        // 03/04 cleanup ticket).
+        if let UpstreamConfig::Deepseek(d) = upstream {
+            if d.api_key.expose().is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "api_key must be non-empty".to_string(),
+                ));
+            }
+            if d.base_url.is_empty() {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "base_url must be non-empty".to_string(),
+                ));
+            }
+            if !d.base_url.starts_with("http://") && !d.base_url.starts_with("https://") {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "base_url must start with http:// or https://".to_string(),
+                ));
+            }
+            if d.request_timeout_secs == 0 {
+                return Err(ValidationError::InvalidUpstream(
+                    name.clone(),
+                    "request_timeout_secs must be greater than 0".to_string(),
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -242,5 +271,92 @@ mod tests {
             validate(&cfg),
             Err(ValidationError::InvalidUpstream(_, _))
         ));
+    }
+
+    #[test]
+    fn deepseek_upstream_validation_passes() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                api_key: Secret::new("sk-deepseek-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn deepseek_validation_rejects_empty_api_key() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                api_key: Secret::new(""),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("api_key"),
+                    "expected api_key error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepseek_validation_rejects_bad_base_url() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                base_url: "ftp://api.deepseek.com/v1".to_string(),
+                api_key: Secret::new("sk-deepseek-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("base_url"),
+                    "expected base_url error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deepseek_validation_rejects_zero_timeout() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "deepseek".to_string(),
+            UpstreamConfig::Deepseek(DeepseekUpstream {
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                api_key: Secret::new("sk-deepseek-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 0,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "deepseek");
+                assert!(
+                    msg.contains("request_timeout_secs"),
+                    "expected request_timeout_secs error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
     }
 }

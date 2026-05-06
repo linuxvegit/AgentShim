@@ -28,6 +28,7 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 - **OpenAI-compatible** — any provider with a `/v1/chat/completions` endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM, llama.cpp, Azure OpenAI, etc.)
 - **GitHub Copilot** — OAuth device-flow login, automatic token refresh, Copilot-specific headers
 - **Anthropic** — direct talk to api.anthropic.com via Messages API. Hybrid path: byte-passthrough when inbound is Anthropic, canonical translation otherwise.
+- **DeepSeek native** — direct talk to api.deepseek.com with reasoning passthrough (deepseek-reasoner emits visible thinking blocks via the ReasoningInterleaver state machine) and cache hit/miss usage mapping.
 
 **Cross-protocol translation works.** An Anthropic-speaking agent can talk to an OpenAI-compatible backend and vice versa, including streaming tool-call argument deltas.
 
@@ -65,19 +66,19 @@ logging:
 
 upstreams:
   deepseek:
-    type: open_ai_compatible
+    type: deepseek                  # or `open_ai_compatible`; see docs/providers/deepseek.md
     base_url: https://api.deepseek.com/v1
     api_key: sk-your-key-here       # or use env: AGENT_SHIM__UPSTREAMS__DEEPSEEK__API_KEY
     request_timeout_secs: 120
 
 routes:
-  # Claude Code → DeepSeek (Anthropic protocol in, OpenAI-compat out)
+  # Claude Code → DeepSeek (Anthropic protocol in, native DeepSeek out)
   - frontend: anthropic_messages
     model: deepseek-chat
     upstream: deepseek
     upstream_model: deepseek-chat
 
-  # Cursor/Codex → DeepSeek (OpenAI protocol in, OpenAI-compat out)
+  # Cursor/Codex → DeepSeek (OpenAI protocol in, native DeepSeek out)
   - frontend: openai_chat
     model: deepseek-chat
     upstream: deepseek
@@ -246,7 +247,7 @@ AGENT_SHIM__LOGGING__FORMAT=json
 | `server.keepalive_secs` | u64 | `15` | SSE keepalive interval (0 = disabled) |
 | `logging.format` | `pretty` \| `json` | `pretty` | Log output format |
 | `logging.filter` | string | `info,agent_shim=debug` | `RUST_LOG`-style filter |
-| `upstreams.<name>.type` | `open_ai_compatible` \| `github_copilot` \| `anthropic` | — | Backend type |
+| `upstreams.<name>.type` | `open_ai_compatible` \| `github_copilot` \| `anthropic` \| `deepseek` | — | Backend type |
 | `upstreams.<name>.base_url` | string | — | API base URL (OpenAI-compat; optional override for Anthropic, default `https://api.anthropic.com`) |
 | `upstreams.<name>.api_key` | string | — | API key (OpenAI-compat and Anthropic) |
 | `upstreams.<name>.anthropic_version` | string | `2023-06-01` | `anthropic-version` header value (Anthropic only) |
@@ -295,7 +296,7 @@ crates/
 ## What's NOT in v0.1
 
 - OpenAI `/v1/responses` frontend (Phase 3)
-- Native DeepSeek/Gemini/Qwen adapters with provider-specific quirk handling (Phase 2)
+- Native Gemini/Qwen adapters with provider-specific quirk handling (Phase 2; DeepSeek native landed in Plan 02)
 - Fallback chains, circuit breakers, retries (Phase 4)
 - Rate limiting, per-agent API keys (Phase 4)
 - Prometheus metrics, hot-reload config, OpenTelemetry (Phase 5)

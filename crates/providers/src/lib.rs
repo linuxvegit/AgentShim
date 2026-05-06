@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
+pub mod deepseek;
 pub mod github_copilot;
 pub mod oai_chat_wire;
 pub mod openai_compatible;
