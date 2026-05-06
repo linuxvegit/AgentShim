@@ -36,13 +36,16 @@ use agent_shim_core::{
 
 use self::auth::AiStudioAuth;
 use self::wire::GenerateContentResponse;
-use crate::{BackendProvider, ProviderCapabilities, ProviderError};
+use crate::{http_client, BackendProvider, ProviderCapabilities, ProviderError};
 
 /// Native Gemini AI Studio provider.
 ///
 /// One instance per upstream config block. Holds the API key, base URL,
-/// any operator-supplied default headers, and a pre-built `reqwest::Client`
-/// that enforces a request timeout.
+/// any operator-supplied default headers, and a `reqwest::Client` built
+/// via the shared [`crate::http_client`] helper so streaming requests
+/// pick up the same `read_timeout`-based per-read budget the other
+/// providers use (rather than a total request timeout that would kill
+/// otherwise-healthy long streams).
 pub struct GeminiProvider {
     name: &'static str,
     base_url: String,
@@ -85,10 +88,7 @@ impl GeminiProvider {
             headers.insert(header_name, val);
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
+        let client = http_client::build(Duration::from_secs(timeout_secs))?;
 
         Ok(Self {
             name,
