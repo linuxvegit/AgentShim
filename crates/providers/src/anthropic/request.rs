@@ -210,13 +210,33 @@ fn image_block_to_outgoing(
                 "data": encoded,
             })
         }
+        BinarySource::Bytes { media_type, data } => {
+            // Plan 04 T5: in-memory bytes go on the wire as Anthropic
+            // base64 sources. Same shape as `BinarySource::Base64`, but
+            // sourced from an unencoded buffer (e.g. a frontend that
+            // hands us raw bytes from a multipart upload).
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let encoded = STANDARD.encode(data);
+            json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": encoded,
+            })
+        }
         BinarySource::Url { url } => json!({
             "type": "url",
             "url": url,
         }),
-        BinarySource::Bytes { .. } | BinarySource::ProviderFileId { .. } => {
-            tracing::debug!(
-                "anthropic provider: skipping image with non-Base64/Url BinarySource for v0.2"
+        BinarySource::ProviderFileId { file_id } => {
+            // Anthropic Messages doesn't have a `file_id` image source
+            // shape today. Mismatched-provider file IDs (e.g. an OpenAI
+            // file_id routed to Anthropic) can't be resolved at this
+            // boundary — drop with a warn so operators see why an image
+            // didn't make it through.
+            tracing::warn!(
+                file_id = %file_id,
+                "anthropic provider: BinarySource::ProviderFileId not supported in v0.2; \
+                 image part dropped"
             );
             return None;
         }
@@ -661,6 +681,63 @@ mod tests {
             body["messages"][0]["content"][0]["source"]["url"],
             "https://example.com/cat.png"
         );
+    }
+
+    #[test]
+    fn image_bytes_source_serializes_as_base64() {
+        // Plan 04 T5: BinarySource::Bytes should encode-as-base64 onto
+        // the Anthropic wire (same shape as a Base64 source) so an
+        // upstream multipart upload that hands us raw bytes still
+        // round-trips cleanly.
+        let mut req = empty_request(false);
+        req.messages.push(Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Image(ImageBlock {
+                source: BinarySource::Bytes {
+                    media_type: "image/png".into(),
+                    data: bytes::Bytes::from_static(b"\x89PNG\r\n"),
+                },
+                extensions: ExtensionMap::new(),
+            })],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let body = build(&req, &target());
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "base64");
+        assert_eq!(block["source"]["media_type"], "image/png");
+        // base64 of "\x89PNG\r\n" is "iVBORw0K".
+        assert_eq!(block["source"]["data"], "iVBORw0K");
+    }
+
+    #[test]
+    fn image_provider_file_id_source_is_dropped_with_warning() {
+        // Anthropic doesn't accept `file_id` image sources today —
+        // drop the part rather than fabricate a wire shape.
+        let mut req = empty_request(false);
+        req.messages.push(Message {
+            role: MessageRole::User,
+            content: vec![
+                ContentBlock::Image(ImageBlock {
+                    source: BinarySource::ProviderFileId {
+                        file_id: "file-xyz".into(),
+                    },
+                    extensions: ExtensionMap::new(),
+                }),
+                ContentBlock::Text(TextBlock {
+                    text: "still here".into(),
+                    extensions: ExtensionMap::new(),
+                }),
+            ],
+            name: None,
+            extensions: ExtensionMap::new(),
+        });
+        let body = build(&req, &target());
+        // The image block was dropped; the text survives.
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(blocks.as_array().unwrap().len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
     }
 
     #[test]

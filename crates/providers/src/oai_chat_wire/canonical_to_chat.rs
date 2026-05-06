@@ -282,11 +282,43 @@ fn build_content_value(blocks: &[ContentBlock]) -> Option<serde_json::Value> {
                             }
                         }))
                     }
+                    BinarySource::Bytes { media_type, data } => {
+                        // Same on the wire as Base64 — OpenAI Chat only
+                        // understands data URIs, not opaque bytes. Treating
+                        // Bytes as Base64 keeps the encoder lossless when a
+                        // frontend hands us raw image bytes (e.g. Anthropic
+                        // Messages → OpenAI Chat round-trip with an inline
+                        // image).
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(data.as_ref());
+                        Some(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", media_type, b64)
+                            }
+                        }))
+                    }
                     BinarySource::Url { url } => Some(serde_json::json!({
                         "type": "image_url",
                         "image_url": { "url": url }
                     })),
-                    _ => None,
+                    BinarySource::ProviderFileId { file_id } => {
+                        // OpenAI Chat doesn't have a `file_id` part for
+                        // vision; this only makes sense when the provider
+                        // is the SAME provider that minted the file_id
+                        // (e.g. OpenAI → OpenAI passthrough). For the
+                        // canonical OAI-compat encoder we drop with a
+                        // warning rather than guessing — the upstream
+                        // request will still complete, just without that
+                        // image. Plan 04 T4 marks this as
+                        // not-supported-in-v0.2.
+                        tracing::warn!(
+                            file_id = %file_id,
+                            "BinarySource::ProviderFileId not supported by OpenAI-compat \
+                             vision encoder; image part dropped"
+                        );
+                        None
+                    }
                 }
             }
             // Skip tool_call/tool_result blocks — handled separately above
@@ -443,5 +475,115 @@ mod tests {
             Some("toolu_vrtx_01")
         );
         assert_eq!(body.messages[2].role, "user");
+    }
+
+    // ── vision encoder (Plan 04 T4) ───────────────────────────────────
+
+    use agent_shim_core::{
+        content::{ImageBlock, TextBlock},
+        media::BinarySource,
+    };
+
+    #[test]
+    fn image_url_part_emitted_for_url_source() {
+        let req = request_with_messages(vec![Message::user(vec![
+            ContentBlock::Text(TextBlock {
+                text: "describe".into(),
+                extensions: ExtensionMap::new(),
+            }),
+            ContentBlock::Image(ImageBlock {
+                source: BinarySource::Url {
+                    url: "https://example.com/cat.png".into(),
+                },
+                extensions: ExtensionMap::new(),
+            }),
+        ])]);
+        let body = build(&req, &target("gpt-4o"));
+        let content = body.messages[0]
+            .content
+            .as_ref()
+            .expect("user content present");
+        let parts = content.as_array().expect("multipart user content");
+        // 0 = text, 1 = image_url
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "https://example.com/cat.png");
+    }
+
+    #[test]
+    fn image_url_part_emits_data_uri_for_base64_source() {
+        let req =
+            request_with_messages(vec![Message::user(vec![ContentBlock::Image(ImageBlock {
+                source: BinarySource::Base64 {
+                    media_type: "image/png".into(),
+                    data: bytes::Bytes::from_static(b"\x89PNG\r\n"),
+                },
+                extensions: ExtensionMap::new(),
+            })])]);
+        let body = build(&req, &target("gpt-4o"));
+        let parts = body.messages[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(parts[0]["type"], "image_url");
+        let url = parts[0]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "got url: {url}");
+        // Payload after the comma is the base64 of "\x89PNG\r\n" = "iVBORw0K".
+        assert!(url.ends_with("iVBORw0K"));
+    }
+
+    #[test]
+    fn image_bytes_source_encodes_as_base64_data_uri() {
+        // Plan 04 T4: in-memory bytes are treated as base64 (the OpenAI
+        // wire only understands data URIs). This makes the encoder
+        // lossless when a frontend hands us raw bytes.
+        let req =
+            request_with_messages(vec![Message::user(vec![ContentBlock::Image(ImageBlock {
+                source: BinarySource::Bytes {
+                    media_type: "image/jpeg".into(),
+                    data: bytes::Bytes::from_static(b"\xff\xd8\xff"),
+                },
+                extensions: ExtensionMap::new(),
+            })])]);
+        let body = build(&req, &target("gpt-4o"));
+        let parts = body.messages[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let url = parts[0]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"), "got url: {url}");
+    }
+
+    #[test]
+    fn image_provider_file_id_source_drops_with_warning() {
+        // OpenAI Chat doesn't accept opaque file_ids in image_url parts.
+        // The encoder warns and drops the part rather than fabricating a
+        // wire shape that would fail at the upstream.
+        let req = request_with_messages(vec![Message::user(vec![
+            ContentBlock::Image(ImageBlock {
+                source: BinarySource::ProviderFileId {
+                    file_id: "file-abc".into(),
+                },
+                extensions: ExtensionMap::new(),
+            }),
+            ContentBlock::Text(TextBlock {
+                text: "still here".into(),
+                extensions: ExtensionMap::new(),
+            }),
+        ])]);
+        let body = build(&req, &target("gpt-4o"));
+        let parts = body.messages[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap();
+        // The image part was dropped; only the text remains.
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
     }
 }
