@@ -6,11 +6,18 @@ logging:
   format: pretty
   filter: info,agent_shim=debug
 upstreams:
+  # DeepSeek-as-backend (talks to api.deepseek.com directly):
+  # Uses the native `deepseek` upstream type which adds:
+  #   - `reasoning_content` interleaving for deepseek-reasoner (R1)
+  #   - cache_hit / cache_miss usage mapping into the canonical Usage shape
+  #   - defense-in-depth `cache_control` strip on outbound bodies
   deepseek:
-    type: open_ai_compatible
-    base_url: https://api.deepseek.com/v1
+    type: deepseek
     api_key: "sk-your-deepseek-api-key-here"
-    request_timeout_secs: 60
+    # Optional overrides (defaults shown):
+    # base_url: https://api.deepseek.com/v1
+    # request_timeout_secs: 30
+    # default_headers: {}
   # Anthropic-as-backend (talks to api.anthropic.com directly):
   # anthropic:
   #   type: anthropic
@@ -42,6 +49,16 @@ routes:
     upstream: copilot
     upstream_model: claude-opus-4-7
     anthropic_beta: context-1m-2025-08-07
+
+  # Anthropic frontend → DeepSeek-Reasoner (visible thinking blocks).
+  # DeepSeek-R1 emits `reasoning_content` deltas alongside regular
+  # `content`; the parser routes both through the ReasoningInterleaver
+  # so the Anthropic encoder renders reasoning as `thinking` events that
+  # Claude Code displays as a "thinking" indicator.
+  # - frontend: anthropic_messages
+  #   model: deepseek-reasoner
+  #   upstream: deepseek
+  #   upstream_model: deepseek-reasoner
 
   # Anthropic frontend → Anthropic backend (byte-passthrough fast path)
   # - frontend: anthropic_messages
