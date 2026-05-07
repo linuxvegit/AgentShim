@@ -262,32 +262,19 @@ async fn responses_to_gemini_tools_round_trip() {
         text
     );
 
-    // ── 5. output_item.done at completed status for the function call ────
+    // ── 5. output_item.done event present (status pinned in section 7) ───
     assert!(
         text.contains("event: response.output_item.done"),
         "missing output_item.done\n{}",
         text
     );
-    assert!(
-        text.contains("\"status\":\"completed\""),
-        "missing completed status on output_item.done\n{}",
-        text
-    );
 
-    // ── 6. response.completed at the tail with usage from usageMetadata ──
+    // ── 6. response.completed event present (usage tokens pinned to its
+    //       frame in section 8 — the global contains-check is strictly
+    //       weaker so we drop it here).
     assert!(
         text.contains("event: response.completed"),
         "missing response.completed\n{}",
-        text
-    );
-    assert!(
-        text.contains("\"input_tokens\":15"),
-        "missing input_tokens=15 on response.completed\n{}",
-        text
-    );
-    assert!(
-        text.contains("\"output_tokens\":8"),
-        "missing output_tokens=8 on response.completed\n{}",
         text
     );
 
@@ -321,9 +308,11 @@ async fn responses_to_gemini_tools_round_trip() {
     let item_done_pos = events
         .iter()
         .position(|e| {
-            e.starts_with("response.output_item.done") && e.contains(r#""type":"function_call""#)
+            e.starts_with("response.output_item.done")
+                && e.contains(r#""type":"function_call""#)
+                && e.contains(r#""status":"completed""#)
         })
-        .expect("function_call output_item.done present");
+        .expect("function_call output_item.done with completed status present");
     let completed_pos = events
         .iter()
         .position(|e| e.starts_with("response.completed"))
