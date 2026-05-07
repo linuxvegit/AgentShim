@@ -230,20 +230,12 @@ async fn responses_to_gemini_thinking_round_trip() {
         text
     );
 
-    // ── 4. response.completed at the tail with usage from usageMetadata ──
+    // ── 4. response.completed event present (usage tokens pinned to its
+    //       frame in section 6 — the global contains-check is strictly
+    //       weaker so we drop it here).
     assert!(
         text.contains("event: response.completed"),
         "missing response.completed\n{}",
-        text
-    );
-    assert!(
-        text.contains("\"input_tokens\":15"),
-        "missing input_tokens=15 on response.completed\n{}",
-        text
-    );
-    assert!(
-        text.contains("\"output_tokens\":8"),
-        "missing output_tokens=8 on response.completed\n{}",
         text
     );
 
