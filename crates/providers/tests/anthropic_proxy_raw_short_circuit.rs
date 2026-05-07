@@ -3,8 +3,8 @@
 //! path; every other inbound frontend kind must return `Ok(None)` so the
 //! gateway falls through to the canonical (`complete()`) path.
 //!
-//! See `crates/providers/src/anthropic/mod.rs::proxy_raw` (lines 165-176)
-//! for the source of truth this test pins down.
+//! See `AnthropicProvider::proxy_raw` for the source of truth this test
+//! pins down.
 
 use agent_shim_core::{BackendTarget, FrontendKind, RoutePolicy};
 use agent_shim_providers::{anthropic::AnthropicProvider, BackendProvider};
@@ -34,16 +34,12 @@ fn make_target() -> BackendTarget {
     }
 }
 
-fn empty_body() -> Bytes {
-    Bytes::new()
-}
-
 #[tokio::test]
 async fn proxy_raw_returns_none_for_openai_responses_frontend() {
     let provider = make_provider();
 
     let result = provider
-        .proxy_raw(empty_body(), make_target(), FrontendKind::OpenAiResponses)
+        .proxy_raw(Bytes::new(), make_target(), FrontendKind::OpenAiResponses)
         .await
         .expect("short-circuit must not return an error");
 
@@ -59,7 +55,7 @@ async fn proxy_raw_returns_none_for_openai_chat_frontend() {
     let provider = make_provider();
 
     let result = provider
-        .proxy_raw(empty_body(), make_target(), FrontendKind::OpenAiChat)
+        .proxy_raw(Bytes::new(), make_target(), FrontendKind::OpenAiChat)
         .await
         .expect("short-circuit must not return an error");
 
