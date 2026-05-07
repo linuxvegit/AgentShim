@@ -101,6 +101,13 @@ struct StreamState {
     /// (output / cache). Emitted once on `message_stop` as the final
     /// `ResponseStop { usage }`.
     accumulated_usage: Usage,
+    /// Tool-call content block indices opened by `content_block_start` for
+    /// `tool_use` blocks; on `content_block_stop` we synthesise a
+    /// `ToolCallStop` before the `ContentBlockStop` so the canonical event
+    /// sequence matches the unary path. Frontends that consume the
+    /// canonical stream (e.g. OpenAI Responses) require `ToolCallStop` to
+    /// flush `function_call_arguments.done` / `output_item.done`.
+    open_tool_indices: std::collections::HashSet<u32>,
     /// Set once the upstream has emitted `message_stop`, so the outer
     /// `flat_map` can drop a trailing transport-level error from the
     /// connection closing without WARN-spamming the logs.
@@ -154,6 +161,7 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
                     id: ToolCallId::from_provider(id),
                     name,
                 });
+                state.open_tool_indices.insert(index);
             }
             IncomingContentBlockStart::Thinking { thinking } => {
                 out.push(StreamEvent::ContentBlockStart {
@@ -198,6 +206,13 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
             }
         },
         IncomingEvent::ContentBlockStop { index } => {
+            // For tool_use blocks the streaming path must emit a
+            // `ToolCallStop` before `ContentBlockStop` to mirror the unary
+            // path and let downstream encoders flush per-call lifecycle
+            // (e.g. OpenAI Responses' `function_call_arguments.done`).
+            if state.open_tool_indices.remove(&index) {
+                out.push(StreamEvent::ToolCallStop { index });
+            }
             out.push(StreamEvent::ContentBlockStop { index });
         }
         IncomingEvent::MessageDelta { delta, usage } => {
