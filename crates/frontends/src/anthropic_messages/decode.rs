@@ -16,10 +16,23 @@ use super::wire::{
 };
 use crate::FrontendError;
 
+/// Decode a raw Anthropic Messages request body into a [`CanonicalRequest`].
+///
+/// Use this when you only have the raw bytes (e.g. from an HTTP handler that
+/// hasn't deserialized the body yet). If you already have a [`MessagesRequest`]
+/// struct in hand, prefer [`decode_request`] to avoid a redundant parse.
 pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let req: MessagesRequest =
         serde_json::from_slice(body).map_err(|e| FrontendError::InvalidBody(e.to_string()))?;
+    decode_request(req)
+}
 
+/// Decode an already-deserialized [`MessagesRequest`] into a [`CanonicalRequest`].
+///
+/// Use this when you already hold the typed struct — for example, after calling
+/// [`CountTokensRequest::into_messages_request`] — to avoid serializing and
+/// re-parsing the body a second time.
+pub fn decode_request(req: MessagesRequest) -> Result<CanonicalRequest, FrontendError> {
     let model = FrontendModel(req.model.clone());
 
     // -- system --
