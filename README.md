@@ -315,6 +315,12 @@ crates/
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
 
+## Releases
+
+See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
+**v0.2.0** — Phase 2 provider breadth (Anthropic, DeepSeek, Gemini natives) +
+vision Tier-1 + `/v1/messages/count_tokens` endpoint.
+
 ## Contributing
 
 ```bash
