@@ -233,8 +233,11 @@ fn decode_items(
                     extensions: ExtensionMap::new(),
                 });
             }
-            // Reasoning items are accepted but not yet decoded; T2 will wire
-            // these into ContentBlock::Reasoning on the assistant message.
+            // Reasoning items are accepted (post-T1) but not yet decoded;
+            // T2 will wire these into `ContentBlock::Reasoning` on the
+            // preceding assistant message. Pre-T1 the variant didn't exist
+            // and unknown-tag inputs failed serde with HTTP 400 — accepting
+            // and silently dropping is intentional pending T2.
             InputItem::Reasoning { .. } => {}
         }
     }

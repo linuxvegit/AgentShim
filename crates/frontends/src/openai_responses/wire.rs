@@ -93,6 +93,10 @@ pub enum InputItem {
         call_id: String,
         output: String,
     },
+    /// Reasoning item from a previous turn (multi-turn input). Mirrors the
+    /// real OpenAI Responses shape: `summary` and `content` are part-arrays,
+    /// not flattened strings. Decoded into `ContentBlock::Reasoning` on the
+    /// preceding assistant message in T2.
     Reasoning {
         #[serde(default)]
         id: Option<String>,
@@ -105,12 +109,14 @@ pub enum InputItem {
     },
 }
 
+/// Inbound part inside a `reasoning` item's `summary` array.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningSummaryPart {
     SummaryText { text: String },
 }
 
+/// Inbound part inside a `reasoning` item's `content` array.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningContentPart {
