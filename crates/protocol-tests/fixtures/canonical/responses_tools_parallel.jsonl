@@ -1,0 +1,15 @@
+{"type":"response_start","id":"resp_t2","model":"gpt-4o","created_at_unix":1700000000}
+{"type":"message_start","role":"assistant"}
+{"type":"content_block_start","index":0,"kind":"tool_call"}
+{"type":"tool_call_start","index":0,"id":"call_aa","name":"get_weather"}
+{"type":"tool_call_arguments_delta","index":0,"json_fragment":"{\"city\":\""}
+{"type":"tool_call_arguments_delta","index":0,"json_fragment":"Tokyo\"}"}
+{"type":"tool_call_stop","index":0}
+{"type":"content_block_stop","index":0}
+{"type":"content_block_start","index":1,"kind":"tool_call"}
+{"type":"tool_call_start","index":1,"id":"call_bb","name":"get_time"}
+{"type":"tool_call_arguments_delta","index":1,"json_fragment":"{}"}
+{"type":"tool_call_stop","index":1}
+{"type":"content_block_stop","index":1}
+{"type":"message_stop","stop_reason":"tool_use","stop_sequence":null}
+{"type":"response_stop","usage":{"input_tokens":20,"output_tokens":15,"estimated":false}}

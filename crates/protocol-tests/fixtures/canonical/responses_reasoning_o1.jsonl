@@ -1,0 +1,11 @@
+{"type":"response_start","id":"resp_t3","model":"o1-mini","created_at_unix":1700000000}
+{"type":"message_start","role":"assistant"}
+{"type":"content_block_start","index":0,"kind":"reasoning"}
+{"type":"reasoning_delta","index":0,"text":"Let me think "}
+{"type":"reasoning_delta","index":0,"text":"step by step."}
+{"type":"content_block_stop","index":0}
+{"type":"content_block_start","index":1,"kind":"text"}
+{"type":"text_delta","index":1,"text":"The answer is 42."}
+{"type":"content_block_stop","index":1}
+{"type":"message_stop","stop_reason":"end_turn","stop_sequence":null}
+{"type":"response_stop","usage":{"input_tokens":12,"output_tokens":20,"estimated":false}}
