@@ -726,18 +726,15 @@ mod tests {
 
         // Reasoning lands on output_index 0 with rs_ prefix.
         assert!(body.contains(r#""output_index":0,"item":{"type":"reasoning","id":"rs_0""#));
-        assert!(body
-            .contains(r#""item_id":"rs_0","output_index":0,"delta":"thinking""#));
+        assert!(body.contains(r#""item_id":"rs_0","output_index":0,"delta":"thinking""#));
         assert!(body.contains(r#""item_id":"rs_0","output_index":0,"text":"thinking""#));
 
         // Text lands on output_index 1 with msg_ prefix and round-trips correctly.
         assert!(body.contains(r#""output_index":1,"item":{"type":"message","id":"msg_1""#));
-        assert!(body.contains(
-            r#""item_id":"msg_1","output_index":1,"content_index":0,"delta":"answer""#
-        ));
-        assert!(body.contains(
-            r#""item_id":"msg_1","output_index":1,"content_index":0,"text":"answer""#
-        ));
+        assert!(body
+            .contains(r#""item_id":"msg_1","output_index":1,"content_index":0,"delta":"answer""#));
+        assert!(body
+            .contains(r#""item_id":"msg_1","output_index":1,"content_index":0,"text":"answer""#));
 
         // Reasoning events come before text events in the stream.
         let reasoning_added = body
