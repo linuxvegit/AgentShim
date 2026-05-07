@@ -188,13 +188,17 @@ async fn e2e_responses_to_anthropic_streaming() {
     );
 
     // ── response.completed must carry usage from the upstream message ─────
+    // TEXT_SSE pins input_tokens=5 (message_start.usage) and output_tokens=2
+    // (message_delta.usage); the encoder accumulates those into the
+    // response.completed frame. Assert literal values so this can't pass on
+    // `"input_tokens":0`.
     assert!(
-        accumulated.contains("\"input_tokens\":"),
-        "missing input_tokens on response.completed\n{accumulated}"
+        accumulated.contains("\"input_tokens\":5"),
+        "expected input_tokens=5 in body, got: {accumulated}"
     );
     assert!(
-        accumulated.contains("\"output_tokens\":"),
-        "missing output_tokens on response.completed\n{accumulated}"
+        accumulated.contains("\"output_tokens\":2"),
+        "expected output_tokens=2 in body, got: {accumulated}"
     );
 
     // ── mockito confirms exactly one /v1/messages call: the route worked ──
