@@ -1,5 +1,5 @@
-pub const EDITOR_VERSION: &str = "AgentShim/0.2.0";
-pub const EDITOR_PLUGIN_VERSION: &str = "AgentShim/0.2.0";
+pub const EDITOR_VERSION: &str = "AgentShim/0.3.0";
+pub const EDITOR_PLUGIN_VERSION: &str = "AgentShim/0.3.0";
 pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 pub const OPENAI_INTENT: &str = "conversation-panel";
 pub const USER_AGENT: &str = "GitHubCopilotChat/0.20.0";
