@@ -18,13 +18,12 @@
 //! a single `output_text.done`, lifecycle events fire in the right order,
 //! and `response.completed` carries usage).
 
-use agent_shim_core::{
-    BackendTarget, CanonicalRequest, ContentBlock, ExtensionMap, FrontendInfo, FrontendKind,
-    FrontendModel, GenerationOptions, Message, RequestId,
-};
+use agent_shim_core::FrontendKind;
 use agent_shim_frontends::{openai_responses::OpenAiResponses, FrontendProtocol, FrontendResponse};
-use agent_shim_protocol_tests::collect_sse;
-use agent_shim_providers::{anthropic::AnthropicProvider, BackendProvider};
+use agent_shim_protocol_tests::{
+    collect_sse, make_anthropic_provider, make_anthropic_target, make_canonical_request, TEST_CLOCK,
+};
+use agent_shim_providers::BackendProvider;
 
 /// Anthropic SSE response body — the upstream emits the assistant's text
 /// in two `text_delta` chunks (`"Hello"` then `", world!"`). The Responses
@@ -47,54 +46,8 @@ const TEXT_SSE: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
 );
 
-fn make_provider(base_url: String) -> AnthropicProvider {
-    AnthropicProvider::new(
-        "anthropic",
-        base_url,
-        "test-key",
-        "2023-06-01",
-        Default::default(),
-        30,
-    )
-    .unwrap()
-}
-
-fn make_target() -> BackendTarget {
-    BackendTarget {
-        provider: "anthropic".to_string(),
-        model: "claude-opus-4-7".to_string(),
-        policy: Default::default(),
-    }
-}
-
-/// Build a `CanonicalRequest` shaped as if it came from the OpenAI Responses
-/// frontend. The provider's canonical path (`complete()`) is what we want to
-/// exercise — gating on `FrontendKind::OpenAiResponses` is verified by the
-/// passthrough tests.
-fn make_req(stream: bool, frontend_kind: FrontendKind) -> CanonicalRequest {
-    CanonicalRequest {
-        id: RequestId::new(),
-        frontend: FrontendInfo {
-            kind: frontend_kind,
-            requested_model: FrontendModel::from("gpt-4o"),
-        },
-        model: FrontendModel::from("gpt-4o"),
-        system: vec![],
-        messages: vec![Message::user(vec![ContentBlock::text("hello")])],
-        tools: vec![],
-        tool_choice: Default::default(),
-        generation: GenerationOptions::default(),
-        response_format: None,
-        stream,
-        metadata: Default::default(),
-        inbound_anthropic_headers: vec![],
-        resolved_policy: Default::default(),
-        extensions: ExtensionMap::new(),
-    }
-}
-
 #[tokio::test]
-async fn responses_to_anthropic_text_round_trip_emits_well_formed_responses_sse() {
+async fn responses_to_anthropic_text_round_trip() {
     let mut server = mockito::Server::new_async().await;
 
     let mock = server
@@ -108,16 +61,19 @@ async fn responses_to_anthropic_text_round_trip_emits_well_formed_responses_sse(
         .await;
 
     // Provider produces a CanonicalStream from the upstream Anthropic SSE.
-    let provider = make_provider(server.url());
+    let provider = make_anthropic_provider(server.url());
     let canonical_stream = provider
-        .complete(make_req(true, FrontendKind::OpenAiResponses), make_target())
+        .complete(
+            make_canonical_request(true, FrontendKind::OpenAiResponses),
+            make_anthropic_target(),
+        )
         .await
         .expect("provider returned a canonical stream");
 
     // Pipe the canonical stream through the OpenAI Responses encoder.
     let frontend = OpenAiResponses {
         keepalive: None,
-        clock_override: Some(1700000000),
+        clock_override: Some(TEST_CLOCK),
     };
     let response_stream = frontend.encode_stream(canonical_stream);
     let body = match response_stream {

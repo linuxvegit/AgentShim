@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 agent-shim-core = { path = "../core" }
 agent-shim-frontends = { path = "../frontends" }
+agent-shim-providers = { path = "../providers" }
 agent-shim-router = { path = "../router" }
 serde.workspace = true
 serde_json.workspace = true
@@ -21,7 +22,6 @@ bytes.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 
 [dev-dependencies]
-agent-shim-providers = { path = "../providers" }
 mockito.workspace = true
 pretty_assertions = "1"
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
