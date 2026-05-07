@@ -555,6 +555,22 @@ mod tests {
         if let StreamEvent::MessageStop { stop_reason, .. } = stop {
             assert_eq!(*stop_reason, StopReason::ToolUse);
         }
+
+        // Regression: tool_use streaming MUST emit ToolCallStop ahead of ContentBlockStop.
+        // The unary path always did; the streaming path used to silently drop ToolCallStop
+        // because no test (and only the OpenAI Responses encoder) actually consumed it.
+        let tool_stop_idx = out
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ToolCallStop { index: 0 }))
+            .expect("streaming tool_use must emit ToolCallStop {index: 0}");
+        let block_stop_idx = out
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 }))
+            .expect("streaming tool_use must emit ContentBlockStop {index: 0}");
+        assert!(
+            tool_stop_idx < block_stop_idx,
+            "ToolCallStop must precede ContentBlockStop"
+        );
     }
 
     #[tokio::test]
