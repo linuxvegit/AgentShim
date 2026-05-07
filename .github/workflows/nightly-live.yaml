@@ -1,0 +1,52 @@
+name: nightly-live
+
+# Plan 04 T11. Nightly opt-in end-to-end suite that drives real upstream
+# providers — Anthropic, DeepSeek, Gemini — via test files gated on the
+# `live` cargo feature. Designed to run off-peak so the feature flag and
+# secret presence are the only failure surfaces at scheduled time.
+#
+# The job is committed even if the live tests are still being authored;
+# secrets gate stops it from running for forks and during PR builds.
+
+on:
+  schedule:
+    # 07:17 UTC ≈ 02:17 ET / 23:17 PT — well off the hour and outside
+    # working windows on every common timezone the team runs in. The
+    # off-the-hour minute keeps us out of the global cron stampede that
+    # hits :00.
+    - cron: "17 7 * * *"
+  # Manual trigger so we can re-run after a flake without waiting 24h.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-e2e:
+    name: Live e2e against real upstreams
+    runs-on: ubuntu-latest
+    # Don't run on forks. Live tests need real API keys; without secrets
+    # they'd false-fail every PR clone. The `if` here defends the schedule
+    # too in case the workflow is ever vendored elsewhere.
+    if: github.repository == 'linuxvegit/AgentShim'
+    env:
+      AGENT_SHIM_E2E: "1"
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      # Per-provider tests live in `crates/protocol-tests/tests/{anthropic,
+      # deepseek,gemini}_live.rs`. Each test should runtime-skip itself
+      # (eprintln + early return) when its API key env var is missing,
+      # so a tenant that hasn't provisioned all three secrets still gets
+      # signal from the ones that are wired up.
+      - name: Run live tests
+        # The `live` feature is the build-time gate; AGENT_SHIM_E2E is the
+        # runtime gate. Both must be on for tests to actually fire. This
+        # belt-and-braces design keeps `cargo test --workspace` (default
+        # CI run) from accidentally calling out to billed APIs.
+        run: cargo nextest run --features live --test '*_live'

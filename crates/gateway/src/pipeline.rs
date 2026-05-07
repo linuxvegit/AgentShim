@@ -23,9 +23,11 @@ use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::Mutex;
 
-use agent_shim_core::{BackendTarget, CanonicalStream, StreamEvent, Usage};
+use agent_shim_core::{
+    BackendTarget, CanonicalRequest, CanonicalStream, ContentBlock, StreamEvent, Usage,
+};
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
-use agent_shim_providers::BackendProvider;
+use agent_shim_providers::{BackendProvider, ProviderCapabilities, ProviderError};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -169,6 +171,23 @@ pub async fn dispatch(
     // and logging both read from `resolved_policy` so the merge rule lives in
     // exactly one place (RoutePolicy::resolve).
     canonical.resolved_policy = target.policy.resolve(&canonical);
+
+    // Capability gate. Reject before any network call when the request asks
+    // for a feature the target provider can't deliver — today this is just
+    // vision (image blocks against a text-only backend). The check has to
+    // run after decode (so we can scan content blocks) but before
+    // run_stream / run_unary (so we never reach the upstream).
+    check_capabilities(&canonical, provider.capabilities()).map_err(|e| {
+        tracing::warn!(
+            provider = %target.provider,
+            error = %e,
+            "capability mismatch — rejecting before upstream call"
+        );
+        HandlerError::CapabilityMismatch {
+            kind: spec.frontend.kind(),
+            message: e.to_string(),
+        }
+    })?;
 
     let is_stream = canonical.stream;
     let max_tokens = canonical.generation.max_tokens;
@@ -425,6 +444,39 @@ fn extract_model_from_body(body: &[u8]) -> Result<String, HandlerError> {
     Ok(m.model)
 }
 
+/// Reject the request before dispatch when the inbound canonical body asks
+/// for a feature the target provider cannot service. Today this is just
+/// vision (any `ContentBlock::Image` against a backend whose
+/// `capabilities.vision == false`); future capability mismatches add new
+/// branches here.
+///
+/// Plan 04 D6: the check runs at the gateway boundary, not inside each
+/// provider, so the error envelope is shaped by the inbound frontend (not
+/// whichever upstream happened to be wired). Returning `Err` here aborts
+/// before any network I/O, which is also what the mockito-based test in
+/// Plan 04 T9 asserts (zero hits on the upstream mock).
+fn check_capabilities(
+    req: &CanonicalRequest,
+    caps: &ProviderCapabilities,
+) -> Result<(), ProviderError> {
+    if request_has_image(req) && !caps.vision {
+        return Err(ProviderError::CapabilityMismatch(
+            "target provider does not support vision (image blocks present in request)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Scan every message's content blocks for an `Image` variant. Used by the
+/// capability gate; pulled out so unit tests can exercise the predicate
+/// against handcrafted requests without spinning up a full pipeline.
+fn request_has_image(req: &CanonicalRequest) -> bool {
+    req.messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .any(|b| matches!(b, ContentBlock::Image(_)))
+}
+
 struct StreamLogger {
     endpoint_label: &'static str,
     model_alias: String,
@@ -506,5 +558,109 @@ mod tests {
         assert!(!names.iter().any(|n| n.contains("api-key")));
         assert!(!names.iter().any(|n| n.contains("auth-token")));
         assert!(!names.contains(&"content-type"));
+    }
+
+    // ── capability gate ───────────────────────────────────────────────
+
+    use agent_shim_core::{
+        media::BinarySource, request::RequestMetadata, ContentBlock, ExtensionMap, FrontendInfo,
+        FrontendKind, FrontendModel, GenerationOptions, ImageBlock, Message, MessageRole,
+        RequestId, ResolvedPolicy,
+    };
+
+    /// Build a CanonicalRequest carrying a single user message whose content
+    /// blocks come from the caller. Keeps every other field at its default
+    /// — the gate only inspects `messages[*].content`, so this is enough.
+    fn req_with_content(blocks: Vec<ContentBlock>) -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::AnthropicMessages,
+                requested_model: FrontendModel::from("test-model"),
+            },
+            model: FrontendModel::from("test-model"),
+            system: vec![],
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: blocks,
+                name: None,
+                extensions: ExtensionMap::new(),
+            }],
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: RequestMetadata::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: ResolvedPolicy::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
+
+    fn img_block() -> ContentBlock {
+        ContentBlock::Image(ImageBlock {
+            source: BinarySource::Url {
+                url: "https://example.com/cat.png".into(),
+            },
+            extensions: Default::default(),
+        })
+    }
+
+    #[test]
+    fn request_has_image_detects_image_block() {
+        let req = req_with_content(vec![ContentBlock::text("hi"), img_block()]);
+        assert!(request_has_image(&req));
+    }
+
+    #[test]
+    fn request_has_image_returns_false_for_text_only() {
+        let req = req_with_content(vec![ContentBlock::text("hi")]);
+        assert!(!request_has_image(&req));
+    }
+
+    #[test]
+    fn check_capabilities_passes_when_no_image_and_no_vision() {
+        // Provider without vision is still fine for a text-only request.
+        let caps = ProviderCapabilities {
+            streaming: true,
+            tool_use: false,
+            vision: false,
+            json_mode: false,
+        };
+        let req = req_with_content(vec![ContentBlock::text("hi")]);
+        assert!(check_capabilities(&req, &caps).is_ok());
+    }
+
+    #[test]
+    fn check_capabilities_passes_when_image_and_vision() {
+        let caps = ProviderCapabilities {
+            streaming: true,
+            tool_use: false,
+            vision: true,
+            json_mode: false,
+        };
+        let req = req_with_content(vec![ContentBlock::text("describe"), img_block()]);
+        assert!(check_capabilities(&req, &caps).is_ok());
+    }
+
+    #[test]
+    fn check_capabilities_rejects_image_against_text_only_provider() {
+        let caps = ProviderCapabilities {
+            streaming: true,
+            tool_use: false,
+            vision: false,
+            json_mode: false,
+        };
+        let req = req_with_content(vec![img_block()]);
+        let err = check_capabilities(&req, &caps).unwrap_err();
+        // Variant + message both observable so future refactors can't quietly
+        // turn this into a different error class.
+        match err {
+            ProviderError::CapabilityMismatch(msg) => {
+                assert!(msg.contains("vision"), "message must mention vision: {msg}");
+            }
+            other => panic!("expected CapabilityMismatch, got {other:?}"),
+        }
     }
 }

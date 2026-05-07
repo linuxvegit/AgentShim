@@ -1,7 +1,8 @@
 use agent_shim_core::{
-    content::{ContentBlock, ReasoningBlock, RedactedReasoningBlock, TextBlock},
+    content::{ContentBlock, ImageBlock, ReasoningBlock, RedactedReasoningBlock, TextBlock},
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
+    media::BinarySource,
     message::{Message, SystemInstruction, SystemSource},
     request::{CanonicalRequest, GenerationOptions, ReasoningOptions, RequestMetadata},
     target::{FrontendInfo, FrontendKind, FrontendModel},
@@ -169,17 +170,37 @@ fn inbound_block_to_canonical(block: InboundContentBlock) -> Result<ContentBlock
             source,
             cache_control,
         } => {
-            // Store as unsupported with raw value; image plumbing lives in the backend
-            let mut raw = serde_json::json!({ "type": "image", "source": source });
-            if let Some(cc) = cache_control {
-                raw["cache_control"] = cc;
+            // Anthropic's wire `source` shapes:
+            //   {"type":"base64","media_type":"image/png","data":"<base64>"}
+            //   {"type":"url","url":"https://..."}
+            // Both match `BinarySource`'s JSON layout 1:1, so deserialize
+            // straight through. If a future Anthropic format ships an
+            // unrecognised `source.type`, fall back to the historic
+            // pass-through-as-Unsupported behaviour so the request still
+            // reaches the upstream untouched (the backend will reject it
+            // with a real error rather than this gateway losing fidelity).
+            let mut extensions = ExtensionMap::new();
+            if let Some(cc) = cache_control.clone() {
+                extensions.insert("cache_control", cc);
             }
-            Ok(ContentBlock::Unsupported(
-                agent_shim_core::content::UnsupportedBlock {
-                    origin: "anthropic_messages".into(),
-                    raw,
-                },
-            ))
+            match serde_json::from_value::<BinarySource>(source.clone()) {
+                Ok(bin) => Ok(ContentBlock::Image(ImageBlock {
+                    source: bin,
+                    extensions,
+                })),
+                Err(_) => {
+                    let mut raw = serde_json::json!({ "type": "image", "source": source });
+                    if let Some(cc) = cache_control {
+                        raw["cache_control"] = cc;
+                    }
+                    Ok(ContentBlock::Unsupported(
+                        agent_shim_core::content::UnsupportedBlock {
+                            origin: "anthropic_messages".into(),
+                            raw,
+                        },
+                    ))
+                }
+            }
         }
         InboundContentBlock::ToolUse {
             id,
@@ -345,5 +366,109 @@ mod tests {
                 name: "search".into()
             }
         );
+    }
+
+    // ── image blocks (Plan 04 T2) ─────────────────────────────────────
+
+    #[test]
+    fn decode_image_base64_source_yields_canonical_image_block() {
+        // Anthropic wire shape:
+        //   {"type":"image","source":{"type":"base64","media_type":"image/png","data":"<b64>"}}
+        // Per Plan 04 T2 the decoder must turn this into a real
+        // `ContentBlock::Image` (not `Unsupported`) so the capability gate
+        // sees it.
+        let body = br#"{
+            "model":"claude-3-5-sonnet-20241022",
+            "max_tokens":256,
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"text","text":"describe"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0K"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        let blocks = &req.messages[0].content;
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    // base64 of "iVBORw0K" decodes to a recognisable PNG header.
+                    assert_eq!(&data[..4], b"\x89PNG");
+                }
+                other => panic!("expected Base64, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_image_url_source_yields_canonical_image_block() {
+        let body = br#"{
+            "model":"claude-3-5-sonnet-20241022",
+            "max_tokens":256,
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"image","source":{"type":"url","url":"https://example.com/cat.png"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Url { url } => assert_eq!(url, "https://example.com/cat.png"),
+                other => panic!("expected Url, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_image_with_unrecognised_source_falls_back_to_unsupported() {
+        // Future Anthropic format — gateway shouldn't crash; preserves
+        // raw block so the upstream can decide.
+        let body = br#"{
+            "model":"claude-3-5-sonnet-20241022",
+            "max_tokens":256,
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"image","source":{"type":"future_format","blob":"abc"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Unsupported(u) => {
+                assert_eq!(u.origin, "anthropic_messages");
+                assert_eq!(u.raw["type"], "image");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_image_carries_cache_control_into_extensions() {
+        let body = br#"{
+            "model":"claude-3-5-sonnet-20241022",
+            "max_tokens":256,
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"image","source":{"type":"url","url":"https://example.com/x.png"},"cache_control":{"type":"ephemeral"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Image(img) => {
+                let cc = img.extensions.get("cache_control");
+                assert!(cc.is_some(), "cache_control must round-trip via extensions");
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
     }
 }

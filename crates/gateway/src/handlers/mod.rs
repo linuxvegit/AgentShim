@@ -10,8 +10,8 @@ use futures::StreamExt;
 use thiserror::Error;
 
 use agent_shim_core::{
-    CanonicalResponse, ContentBlock, ResponseId, StopReason, StreamEvent, ToolCallArguments,
-    ToolCallBlock, ToolCallId, Usage,
+    CanonicalResponse, ContentBlock, FrontendKind, ResponseId, StopReason, StreamEvent,
+    ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
 };
 use agent_shim_frontends::{FrontendError, FrontendResponse};
 use agent_shim_providers::ProviderError;
@@ -25,10 +25,42 @@ pub enum HandlerError {
     Provider(#[from] ProviderError),
     #[error("frontend error: {0}")]
     Frontend(#[from] FrontendError),
+    /// Surfaced when the gateway capability gate rejects a request because the
+    /// target provider can't service a feature the inbound asked for (e.g.
+    /// image blocks routed to a text-only backend). Carrying the frontend
+    /// kind here lets `IntoResponse` shape the JSON error envelope to match
+    /// what the client SDK expects (Anthropic-style vs OpenAI-style),
+    /// instead of returning the generic `{"error":{"message":...}}` body
+    /// other variants use.
+    #[error("capability mismatch: {message}")]
+    CapabilityMismatch { kind: FrontendKind, message: String },
 }
 
 impl IntoResponse for HandlerError {
     fn into_response(self) -> Response {
+        // CapabilityMismatch is the only variant that needs frontend-shaped
+        // body formatting today. Pull it out first so the rest of the match
+        // can stay as a flat status-code lookup.
+        if let HandlerError::CapabilityMismatch { kind, message } = &self {
+            let body = match kind {
+                FrontendKind::AnthropicMessages => serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": message,
+                    },
+                }),
+                FrontendKind::OpenAiChat | FrontendKind::OpenAiResponses => serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "code": "capability_mismatch",
+                    },
+                }),
+            };
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+
         let status = match &self {
             HandlerError::Route(RouteError::NoRoute { .. }) => StatusCode::NOT_FOUND,
             HandlerError::Provider(ProviderError::Upstream { status, .. }) => {
@@ -37,12 +69,17 @@ impl IntoResponse for HandlerError {
             HandlerError::Provider(ProviderError::UnknownProvider(_)) => StatusCode::BAD_GATEWAY,
             HandlerError::Provider(ProviderError::Network(_)) => StatusCode::BAD_GATEWAY,
             HandlerError::Provider(ProviderError::CapabilityMismatch(_)) => {
-                StatusCode::UNPROCESSABLE_ENTITY
+                // Reachable only if a provider raises CapabilityMismatch
+                // mid-request (the gateway gate catches the
+                // image-vs-vision case earlier and routes through the
+                // dedicated `HandlerError::CapabilityMismatch` arm).
+                StatusCode::BAD_REQUEST
             }
             HandlerError::Frontend(FrontendError::InvalidBody(_)) => StatusCode::BAD_REQUEST,
             HandlerError::Frontend(FrontendError::Unsupported(_)) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
+            HandlerError::CapabilityMismatch { .. } => unreachable!("handled above"),
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 

@@ -75,6 +75,7 @@ dependencies = [
  "agent-shim-core",
  "async-trait",
  "axum",
+ "base64",
  "bytes",
  "futures",
  "futures-util",

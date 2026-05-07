@@ -65,7 +65,16 @@ impl CopilotProvider {
             capabilities: ProviderCapabilities {
                 streaming: true,
                 tool_use: true,
-                vision: false,
+                // Plan 04 T4: Copilot models that route through the Chat
+                // Completions API accept image_url parts the same way an
+                // OpenAI-compatible upstream does — the encoder shape is
+                // identical because both go through canonical_to_chat. Flag
+                // vision on so the gateway capability gate lets image
+                // requests through. Models that DON'T support vision
+                // (text-only Copilot SKUs) will surface the rejection at
+                // the upstream rather than the gateway, which matches how
+                // unsupported-tool-use is handled today.
+                vision: true,
                 json_mode: true,
             },
         })
@@ -86,7 +95,7 @@ impl CopilotProvider {
             capabilities: ProviderCapabilities {
                 streaming: true,
                 tool_use: true,
-                vision: false,
+                vision: true,
                 json_mode: true,
             },
         })

@@ -157,7 +157,10 @@ mod tests {
     #[test]
     fn build_succeeds_without_keylog() {
         let result = build_with_keylog(Duration::from_secs(30), false);
-        assert!(result.is_ok(), "default build path must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "default build path must succeed: {result:?}"
+        );
     }
 
     #[test]

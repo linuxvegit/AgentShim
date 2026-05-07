@@ -1,7 +1,8 @@
 use agent_shim_core::{
-    content::{ContentBlock, UnsupportedBlock},
+    content::{ContentBlock, ImageBlock, UnsupportedBlock},
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
+    media::BinarySource,
     message::{Message, MessageRole, SystemInstruction},
     request::{
         CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
@@ -10,6 +11,8 @@ use agent_shim_core::{
     target::{FrontendInfo, FrontendKind, FrontendModel},
     tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use serde_json::Value;
 
 use super::mapping::{role_to_canonical, RoleClass};
@@ -17,6 +20,39 @@ use super::wire::{
     ChatCompletionsRequest, InboundContentPart, InboundMessageContent, InboundToolChoice,
 };
 use crate::FrontendError;
+
+/// Decode an OpenAI Chat `image_url.url` string into a canonical
+/// `BinarySource`. Returns `None` for shapes we can't safely interpret —
+/// the caller falls back to wrapping the part as `Unsupported` so the
+/// request still flows through (the upstream provider's own validation
+/// will surface the real error).
+///
+/// Recognised shapes:
+///   * `data:<mime>;base64,<payload>` → `BinarySource::Base64`
+///   * `http://...` / `https://...`   → `BinarySource::Url`
+fn image_url_to_binary_source(url: &str) -> Option<BinarySource> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        // The URL is a data URI. The OpenAI shape we care about is always
+        // `data:<media_type>;base64,<payload>`; if `;base64,` is missing the
+        // payload is plain percent-encoded data which we don't support yet.
+        let (header, payload) = rest.split_once(',')?;
+        let (media_type, encoding) = header.split_once(';').unwrap_or((header, ""));
+        if encoding != "base64" {
+            return None;
+        }
+        let bytes = STANDARD.decode(payload).ok()?;
+        return Some(BinarySource::Base64 {
+            media_type: media_type.to_string(),
+            data: Bytes::from(bytes),
+        });
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(BinarySource::Url {
+            url: url.to_string(),
+        });
+    }
+    None
+}
 
 pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let req: ChatCompletionsRequest =
@@ -39,13 +75,19 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
                 .map(|p| match p {
                     InboundContentPart::Text { text } => ContentBlock::text(text),
                     InboundContentPart::ImageUrl { image_url } => {
-                        ContentBlock::Unsupported(UnsupportedBlock {
-                            origin: "openai_chat".into(),
-                            raw: serde_json::json!({
-                                "type": "image_url",
-                                "image_url": { "url": image_url.url }
+                        match image_url_to_binary_source(&image_url.url) {
+                            Some(source) => ContentBlock::Image(ImageBlock {
+                                source,
+                                extensions: ExtensionMap::new(),
                             }),
-                        })
+                            None => ContentBlock::Unsupported(UnsupportedBlock {
+                                origin: "openai_chat".into(),
+                                raw: serde_json::json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": image_url.url }
+                                }),
+                            }),
+                        }
                     }
                 })
                 .collect(),
@@ -325,5 +367,125 @@ mod tests {
             req.response_format,
             Some(ResponseFormat::JsonObject)
         ));
+    }
+
+    // ── image_url parts (Plan 04 T3) ──────────────────────────────────
+
+    #[test]
+    fn decode_image_url_with_https_yields_canonical_url_image_block() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"text","text":"describe"},
+                    {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        let blocks = &req.messages[0].content;
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Url { url } => assert_eq!(url, "https://example.com/cat.png"),
+                other => panic!("expected Url, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_image_url_with_data_uri_yields_canonical_base64_image_block() {
+        // Bytes b"\x89PNG\r\n" base64-encode to "iVBORw0K". Check the data
+        // URI parser handles `data:<mime>;base64,<payload>` correctly.
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0K"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(&data[..4], b"\x89PNG");
+                }
+                other => panic!("expected Base64, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_image_url_with_unrecognised_scheme_falls_back_to_unsupported() {
+        // `file://` and bare relative paths can't be turned into either a
+        // URL or a base64 blob — the decoder must NOT silently fabricate
+        // a URL. Falling back to Unsupported keeps the upstream's error
+        // path authoritative.
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"image_url","image_url":{"url":"file:///tmp/cat.png"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Unsupported(u) => assert_eq!(u.origin, "openai_chat"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_image_url_with_data_uri_lacking_base64_marker_is_unsupported() {
+        // `data:text/plain,Hello` is a valid data URI but not base64-encoded.
+        // We don't have a percent-decoder for that path; fall back rather
+        // than guess.
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[{
+                "role":"user",
+                "content":[
+                    {"type":"image_url","image_url":{"url":"data:text/plain,Hello"}}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Unsupported(u) => assert_eq!(u.origin, "openai_chat"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_url_to_binary_source_https() {
+        let s = image_url_to_binary_source("https://x.test/a.png");
+        assert!(matches!(s, Some(BinarySource::Url { .. })));
+    }
+
+    #[test]
+    fn image_url_to_binary_source_data_uri() {
+        let s = image_url_to_binary_source("data:image/png;base64,iVBORw0K").unwrap();
+        match s {
+            BinarySource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(&data[..4], b"\x89PNG");
+            }
+            _ => panic!("expected base64"),
+        }
+    }
+
+    #[test]
+    fn image_url_to_binary_source_rejects_garbage() {
+        assert!(image_url_to_binary_source("ftp://example.com/x").is_none());
+        assert!(image_url_to_binary_source("data:image/png;base64,@@@@").is_none());
+        assert!(image_url_to_binary_source("just-a-string").is_none());
     }
 }
