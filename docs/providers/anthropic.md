@@ -81,6 +81,43 @@ Tool definitions, tool choice, and tool-call argument deltas all work
 across this seam. `cache_control`, `thinking.signature`, and other
 Anthropic-only fields are dropped (see "Lossy fields" below).
 
+### OpenAI Responses frontend → Anthropic backend (canonical translation)
+
+```yaml
+routes:
+  - frontend: openai_responses
+    model: claude-opus-4-7
+    upstream: anthropic
+    upstream_model: claude-opus-4-7
+```
+
+Codex and any other agent that speaks OpenAI's `/v1/responses` API can
+talk to Claude direct. The pipeline is **canonical-path-only** — there
+is no `proxy_raw` fallback for this pair, even though both protocols
+carry Anthropic-friendly concepts. Every request is decoded into a
+`CanonicalRequest` and re-encoded into Messages JSON.
+
+```
+POST /v1/responses → OpenAiResponses::decode_request → CanonicalRequest
+                  → AnthropicProvider::complete (canonical path)
+                  → CanonicalStream
+                  → OpenAiResponses::encode_stream
+                  → SSE bytes
+```
+
+Anthropic `thinking` blocks become canonical `Reasoning` blocks and
+surface on the encoded stream as `response.reasoning.delta` /
+`response.reasoning.done` events (Plan 01 T3 reasoning round-trip).
+`tool_use` blocks become Responses `function_call` output_items; the
+Anthropic `tool_use_id` is preserved verbatim as the Responses
+`call_id`, so tool-result correlation works in both directions.
+
+This path is **lossy** for Anthropic-only fields per the "Lossy fields"
+section below — `thinking.signature` deltas and `cache_control` markers
+are dropped. Routes that need byte-perfect fidelity on those fields
+should use the Anthropic Messages frontend instead. (Spec D2:
+[`docs/superpowers/specs/2026-05-07-phase-3-responses-frontend-design.md`](../superpowers/specs/2026-05-07-phase-3-responses-frontend-design.md).)
+
 ### Per-route `anthropic-beta` default
 
 ```yaml
