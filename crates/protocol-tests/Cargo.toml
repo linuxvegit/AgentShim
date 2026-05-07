@@ -21,5 +21,8 @@ bytes.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 
 [dev-dependencies]
+agent-shim-providers = { path = "../providers" }
+mockito.workspace = true
 pretty_assertions = "1"
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

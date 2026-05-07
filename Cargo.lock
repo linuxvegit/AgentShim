@@ -108,10 +108,12 @@ version = "0.3.0-dev"
 dependencies = [
  "agent-shim-core",
  "agent-shim-frontends",
+ "agent-shim-providers",
  "agent-shim-router",
  "bytes",
  "futures",
  "futures-util",
+ "mockito",
  "pretty_assertions",
  "rand 0.8.6",
  "serde",
