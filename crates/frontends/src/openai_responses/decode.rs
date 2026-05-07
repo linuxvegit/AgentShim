@@ -267,6 +267,33 @@ fn decode_items(
     Ok((system, out))
 }
 
+/// Joins reasoning text from the typed `reasoning` input item. Prefers the
+/// richer `content` array; falls back to `summary` when `content` is empty
+/// or missing. Returns an empty string when both are empty — the caller
+/// still emits the block so round-trip semantics are preserved.
+fn extract_reasoning_text(
+    content: Option<Vec<ReasoningContentPart>>,
+    summary: Option<Vec<ReasoningSummaryPart>>,
+) -> String {
+    let from_content: String = content
+        .into_iter()
+        .flatten()
+        .map(|p| match p {
+            ReasoningContentPart::ReasoningText { text } => text,
+        })
+        .collect();
+    if !from_content.is_empty() {
+        return from_content;
+    }
+    summary
+        .into_iter()
+        .flatten()
+        .map(|p| match p {
+            ReasoningSummaryPart::SummaryText { text } => text,
+        })
+        .collect()
+}
+
 fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBlock> {
     match content {
         None => vec![],
@@ -287,35 +314,6 @@ fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBl
             })
             .collect(),
     }
-}
-
-/// Joins reasoning text from the typed `reasoning` input item. Prefers the
-/// richer `content` array; falls back to `summary` when `content` is empty
-/// or missing. Returns an empty string when both are empty — the caller
-/// still emits the block so round-trip semantics are preserved.
-fn extract_reasoning_text(
-    content: Option<Vec<ReasoningContentPart>>,
-    summary: Option<Vec<ReasoningSummaryPart>>,
-) -> String {
-    let from_content: String = content
-        .into_iter()
-        .flatten()
-        .map(|p| match p {
-            ReasoningContentPart::ReasoningText { text } => text,
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    if !from_content.is_empty() {
-        return from_content;
-    }
-    summary
-        .into_iter()
-        .flatten()
-        .map(|p| match p {
-            ReasoningSummaryPart::SummaryText { text } => text,
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn decode_tools(
