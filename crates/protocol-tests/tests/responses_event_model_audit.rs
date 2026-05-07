@@ -1,20 +1,23 @@
 use agent_shim_frontends::{openai_responses::OpenAiResponses, FrontendProtocol, FrontendResponse};
 use agent_shim_protocol_tests::{collect_sse, fixture, replay_jsonl};
 
-#[tokio::test]
-async fn responses_text_simple_emits_expected_sse_events() {
+async fn render(fixture_name: &str) -> String {
     let frontend = OpenAiResponses {
         keepalive: None,
         clock_override: Some(1700000000),
     };
-    let stream = replay_jsonl(fixture("responses_text_simple.jsonl"), None);
-
+    let stream = replay_jsonl(fixture(fixture_name), None);
     let response = frontend.encode_stream(stream);
     let body = match response {
         FrontendResponse::Stream { stream, .. } => collect_sse(stream).await,
         FrontendResponse::Unary { .. } => panic!("expected stream"),
     };
-    let text = std::str::from_utf8(&body).unwrap();
+    String::from_utf8(body.to_vec()).expect("utf8 sse")
+}
+
+#[tokio::test]
+async fn responses_text_simple_emits_expected_sse_events() {
+    let text = render("responses_text_simple.jsonl").await;
 
     // response.created with the encoder-prefixed id.
     assert!(
@@ -106,18 +109,7 @@ async fn responses_text_simple_emits_expected_sse_events() {
 
 #[tokio::test]
 async fn responses_tools_parallel_emits_expected_sse_events() {
-    let frontend = OpenAiResponses {
-        keepalive: None,
-        clock_override: Some(1700000000),
-    };
-    let stream = replay_jsonl(fixture("responses_tools_parallel.jsonl"), None);
-
-    let response = frontend.encode_stream(stream);
-    let body = match response {
-        FrontendResponse::Stream { stream, .. } => collect_sse(stream).await,
-        FrontendResponse::Unary { .. } => panic!("expected stream"),
-    };
-    let text = std::str::from_utf8(&body).unwrap();
+    let text = render("responses_tools_parallel.jsonl").await;
 
     // response.created with the encoder-prefixed id.
     assert!(
@@ -206,18 +198,7 @@ async fn responses_tools_parallel_emits_expected_sse_events() {
 
 #[tokio::test]
 async fn responses_reasoning_o1_emits_expected_sse_events() {
-    let frontend = OpenAiResponses {
-        keepalive: None,
-        clock_override: Some(1700000000),
-    };
-    let stream = replay_jsonl(fixture("responses_reasoning_o1.jsonl"), None);
-
-    let response = frontend.encode_stream(stream);
-    let body = match response {
-        FrontendResponse::Stream { stream, .. } => collect_sse(stream).await,
-        FrontendResponse::Unary { .. } => panic!("expected stream"),
-    };
-    let text = std::str::from_utf8(&body).unwrap();
+    let text = render("responses_reasoning_o1.jsonl").await;
 
     // response.created with the encoder-prefixed id.
     assert!(
@@ -228,22 +209,6 @@ async fn responses_reasoning_o1_emits_expected_sse_events() {
     assert!(
         text.contains("\"resp_resp_t3\""),
         "missing prefixed response id\n{}",
-        text
-    );
-
-    // First output_item.added is the reasoning item with rs_0 id.
-    let reasoning_added_idx = text
-        .find("event: response.output_item.added")
-        .expect("reasoning output_item.added present");
-    let reasoning_added_window = &text[reasoning_added_idx..];
-    assert!(
-        reasoning_added_window.contains("\"type\":\"reasoning\""),
-        "reasoning output_item.added missing type=reasoning\n{}",
-        text
-    );
-    assert!(
-        reasoning_added_window.contains("\"id\":\"rs_0\""),
-        "reasoning output_item.added missing id=rs_0\n{}",
         text
     );
 
@@ -276,37 +241,15 @@ async fn responses_reasoning_o1_emits_expected_sse_events() {
         text
     );
 
-    // First output_item.done is the completed reasoning item.
-    let item_done_idx = text
-        .find("event: response.output_item.done")
-        .expect("first output_item.done present");
-    let item_done_window = &text[item_done_idx..];
+    // Reasoning item references rs_0; message item references msg_1.
     assert!(
-        item_done_window.contains("\"type\":\"reasoning\""),
-        "first output_item.done missing type=reasoning\n{}",
+        text.contains("\"id\":\"rs_0\""),
+        "missing rs_0 id on reasoning item\n{}",
         text
     );
     assert!(
-        item_done_window.contains("\"status\":\"completed\""),
-        "first output_item.done missing completed status\n{}",
-        text
-    );
-
-    // After the reasoning completes, a message item is added with id msg_1.
-    // Search past the reasoning item-added position to find the next output_item.added.
-    let after_reasoning = &text[reasoning_added_idx + 1..];
-    let message_added_relative = after_reasoning
-        .find("event: response.output_item.added")
-        .expect("second output_item.added (message) present");
-    let message_added_window = &after_reasoning[message_added_relative..];
-    assert!(
-        message_added_window.contains("\"type\":\"message\""),
-        "second output_item.added missing type=message\n{}",
-        text
-    );
-    assert!(
-        message_added_window.contains("\"id\":\"msg_1\""),
-        "second output_item.added missing id=msg_1\n{}",
+        text.contains("\"id\":\"msg_1\""),
+        "missing msg_1 id on message item\n{}",
         text
     );
 
@@ -332,5 +275,37 @@ async fn responses_reasoning_o1_emits_expected_sse_events() {
         text.contains("\"input_tokens\":12,\"output_tokens\":20"),
         "missing usage on response.completed\n{}",
         text
+    );
+
+    // Split by SSE event boundary so we can index per-event and assert true ordering.
+    // Each entry is one event block (event: name\ndata: {...}).
+    let events: Vec<&str> = text.split("event: ").skip(1).collect();
+
+    let reasoning_added_pos = events
+        .iter()
+        .position(|e| {
+            e.starts_with("response.output_item.added") && e.contains(r#""type":"reasoning""#)
+        })
+        .expect("reasoning output_item.added present");
+    let reasoning_done_pos = events
+        .iter()
+        .position(|e| {
+            e.starts_with("response.output_item.done") && e.contains(r#""type":"reasoning""#)
+        })
+        .expect("reasoning output_item.done present");
+    let message_added_pos = events
+        .iter()
+        .position(|e| {
+            e.starts_with("response.output_item.added") && e.contains(r#""type":"message""#)
+        })
+        .expect("message output_item.added present");
+
+    assert!(
+        reasoning_added_pos < reasoning_done_pos,
+        "reasoning must close before its done event"
+    );
+    assert!(
+        reasoning_done_pos < message_added_pos,
+        "reasoning must complete before message begins"
     );
 }
