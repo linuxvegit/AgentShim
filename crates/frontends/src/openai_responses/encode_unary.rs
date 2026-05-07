@@ -8,6 +8,27 @@ use agent_shim_core::{
 };
 use bytes::Bytes;
 
+/// Flush any accumulated text fragments as a completed Message output item.
+///
+/// No-op if `text_parts` is empty. Advances `msg_index` only when a flush
+/// actually emits an item.
+fn flush_text(output: &mut Vec<OutputItem>, text_parts: &mut Vec<String>, msg_index: &mut u32) {
+    if text_parts.is_empty() {
+        return;
+    }
+    let text: String = std::mem::take(text_parts).into_iter().collect();
+    output.push(OutputItem::Message {
+        id: format!("msg_{msg_index}"),
+        role: "assistant",
+        status: "completed",
+        content: vec![OutputContent::OutputText {
+            text,
+            annotations: vec![],
+        }],
+    });
+    *msg_index += 1;
+}
+
 pub fn encode(response: CanonicalResponse) -> Result<Bytes, FrontendError> {
     encode_with_clock(response, None)
 }
@@ -32,19 +53,7 @@ pub fn encode_with_clock(
             ContentBlock::Text(t) => text_parts.push(t.text),
             ContentBlock::ToolCall(tc) => {
                 // Flush accumulated text as a message item first
-                if !text_parts.is_empty() {
-                    output.push(OutputItem::Message {
-                        id: format!("msg_{msg_index}"),
-                        role: "assistant",
-                        status: "completed",
-                        content: vec![OutputContent::OutputText {
-                            text: text_parts.join(""),
-                            annotations: vec![],
-                        }],
-                    });
-                    msg_index += 1;
-                    text_parts.clear();
-                }
+                flush_text(&mut output, &mut text_parts, &mut msg_index);
 
                 let arguments = match tc.arguments {
                     ToolCallArguments::Complete { value } => {
@@ -63,19 +72,7 @@ pub fn encode_with_clock(
             }
             ContentBlock::Reasoning(rb) => {
                 // Flush accumulated text as a message item first
-                if !text_parts.is_empty() {
-                    output.push(OutputItem::Message {
-                        id: format!("msg_{msg_index}"),
-                        role: "assistant",
-                        status: "completed",
-                        content: vec![OutputContent::OutputText {
-                            text: text_parts.join(""),
-                            annotations: vec![],
-                        }],
-                    });
-                    msg_index += 1;
-                    text_parts.clear();
-                }
+                flush_text(&mut output, &mut text_parts, &mut msg_index);
 
                 output.push(OutputItem::Reasoning {
                     id: format!("rs_{msg_index}"),
@@ -92,17 +89,7 @@ pub fn encode_with_clock(
     }
 
     // Flush remaining text
-    if !text_parts.is_empty() {
-        output.push(OutputItem::Message {
-            id: format!("msg_{msg_index}"),
-            role: "assistant",
-            status: "completed",
-            content: vec![OutputContent::OutputText {
-                text: text_parts.join(""),
-                annotations: vec![],
-            }],
-        });
-    }
+    flush_text(&mut output, &mut text_parts, &mut msg_index);
 
     let status = status_from_stop_reason(&response.stop_reason);
 
