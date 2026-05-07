@@ -93,6 +93,28 @@ pub enum InputItem {
         call_id: String,
         output: String,
     },
+    Reasoning {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        summary: Option<Vec<ReasoningSummaryPart>>,
+        #[serde(default)]
+        content: Option<Vec<ReasoningContentPart>>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningSummaryPart {
+    SummaryText { text: String },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningContentPart {
+    ReasoningText { text: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,6 +182,11 @@ pub enum OutputItem {
         arguments: String,
         status: &'static str,
     },
+    Reasoning {
+        id: String,
+        status: &'static str,
+        content: Vec<OutputContent>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +196,11 @@ pub enum OutputContent {
         text: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         annotations: Vec<Value>,
+    },
+    Reasoning {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
 }
 
@@ -237,4 +269,18 @@ pub struct FunctionCallArgsDone {
     pub item_id: String,
     pub output_index: u32,
     pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasoningDeltaPayload {
+    pub item_id: String,
+    pub output_index: u32,
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasoningDonePayload {
+    pub item_id: String,
+    pub output_index: u32,
+    pub text: String,
 }

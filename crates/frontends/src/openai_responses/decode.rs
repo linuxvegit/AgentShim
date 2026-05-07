@@ -233,6 +233,9 @@ fn decode_items(
                     extensions: ExtensionMap::new(),
                 });
             }
+            // Reasoning items are accepted but not yet decoded; T2 will wire
+            // these into ContentBlock::Reasoning on the assistant message.
+            InputItem::Reasoning { .. } => {}
         }
     }
     Ok((system, out))
