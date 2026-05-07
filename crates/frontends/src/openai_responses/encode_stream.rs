@@ -790,13 +790,24 @@ mod tests {
         let body = collect_stream(Box::pin(stream::iter(events))).await;
 
         // Assert: response.completed payload carries `"output":[]` literally.
+        // Clamp the slice to the end of the actual SSE frame (delimited by a
+        // blank line) so a stray `"output":[]` in any future post-completed
+        // event cannot satisfy the assertion.
         let completed_pos = body
             .find("event: response.completed")
             .expect("response.completed event present");
         let completed_block = &body[completed_pos..];
+        let frame_end = completed_block
+            .find("\n\n")
+            .unwrap_or(completed_block.len());
+        let completed_frame = &completed_block[..frame_end];
         assert!(
-            completed_block.contains(r#""output":[]"#),
-            "expected empty output array on response.completed, got:\n{completed_block}"
+            completed_frame.contains(r#""output":[]"#),
+            "response.completed must have empty output array; frame was:\n{completed_frame}"
+        );
+        assert!(
+            completed_frame.contains(r#""status":"completed""#),
+            "response.completed must report completed status; frame was:\n{completed_frame}"
         );
     }
 }
