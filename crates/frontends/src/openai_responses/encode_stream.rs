@@ -745,4 +745,58 @@ mod tests {
             .expect("text added present");
         assert!(reasoning_added < text_added);
     }
+
+    #[tokio::test]
+    async fn tool_only_response_completed_has_empty_output_array() {
+        // Plan 01 T6 — gap fill: confirm the encoder always emits an empty
+        // `output: []` on `response.completed`, even when the response is
+        // tool-only (no text). Function-call items are surfaced via
+        // `response.output_item.added` / `output_item.done`, NOT replayed
+        // inside `response.completed`. This test pins that contract.
+
+        // Arrange: a stream with only a function call (no text content).
+        let events: Vec<Result<StreamEvent, StreamError>> = vec![
+            Ok(StreamEvent::ResponseStart {
+                id: ResponseId("resp_tool_only".to_string()),
+                model: "gpt-test".to_string(),
+                created_at_unix: 1,
+            }),
+            Ok(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                kind: ContentBlockKind::ToolCall,
+            }),
+            Ok(StreamEvent::ToolCallStart {
+                index: 0,
+                id: ToolCallId::from_provider("call_x"),
+                name: "lookup".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                json_fragment: "{}".to_string(),
+            }),
+            Ok(StreamEvent::ToolCallStop { index: 0 }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+            Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+                stop_sequence: None,
+            }),
+            Ok(StreamEvent::ResponseStop { usage: None }),
+        ];
+
+        // Act
+        let body = collect_stream(Box::pin(stream::iter(events))).await;
+
+        // Assert: response.completed payload carries `"output":[]` literally.
+        let completed_pos = body
+            .find("event: response.completed")
+            .expect("response.completed event present");
+        let completed_block = &body[completed_pos..];
+        assert!(
+            completed_block.contains(r#""output":[]"#),
+            "expected empty output array on response.completed, got:\n{completed_block}"
+        );
+    }
 }

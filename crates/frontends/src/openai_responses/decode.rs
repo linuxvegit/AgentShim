@@ -446,6 +446,32 @@ mod tests {
     }
 
     #[test]
+    fn decode_tool_choice_specific_function_name() {
+        // Plan 01 T6 — gap fill: the typed `{type:"function",name:"..."}` shape
+        // of `InboundToolChoice` was previously untested. The string-mode shape
+        // (auto/none/required) is exercised implicitly by request fixtures
+        // omitting `tool_choice`, but the typed-name path requires explicit
+        // coverage so it does not silently regress.
+
+        // Arrange: a request that pins a specific tool by name.
+        let body = br#"{
+            "model": "gpt-4o",
+            "input": "Hi",
+            "tools": [{"type":"function","name":"search","parameters":{"type":"object"}}],
+            "tool_choice": {"type":"function","name":"search"}
+        }"#;
+
+        // Act
+        let req = decode(body).unwrap();
+
+        // Assert: tool_choice resolves to ToolChoice::Specific with the chosen name.
+        match req.tool_choice {
+            ToolChoice::Specific { name } => assert_eq!(name, "search"),
+            other => panic!("expected ToolChoice::Specific, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn reasoning_items_attach_to_preceding_assistant_message() {
         // Case 1: reasoning AFTER an assistant message attaches to it.
         let body = br#"{
