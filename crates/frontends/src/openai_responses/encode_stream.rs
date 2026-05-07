@@ -9,8 +9,8 @@ use parking_lot::Mutex;
 use super::mapping::status_from_stop_reason;
 use super::wire::{
     ContentPartAdded, ContentPartDone, FunctionCallArgsDelta, FunctionCallArgsDone, OutputContent,
-    OutputItem, OutputItemAdded, OutputItemDone, ResponseObject, TextDeltaPayload, TextDonePayload,
-    UsageOut,
+    OutputItem, OutputItemAdded, OutputItemDone, ReasoningDeltaPayload, ReasoningDonePayload,
+    ResponseObject, TextDeltaPayload, TextDonePayload, UsageOut,
 };
 use crate::sse;
 
@@ -21,6 +21,8 @@ struct EncoderState {
     output_index: u32,
     /// Accumulated text per output_index
     text_buf: std::collections::HashMap<u32, String>,
+    /// Accumulated reasoning text per output_index
+    reasoning_buf: std::collections::HashMap<u32, String>,
     /// Accumulated tool call arguments per output_index
     tool_args_buf: std::collections::HashMap<u32, String>,
     /// Item ID per output_index
@@ -42,6 +44,7 @@ impl EncoderState {
             created_at: 0,
             output_index: 0,
             text_buf: std::collections::HashMap::new(),
+            reasoning_buf: std::collections::HashMap::new(),
             tool_args_buf: std::collections::HashMap::new(),
             item_ids: std::collections::HashMap::new(),
             tool_meta: std::collections::HashMap::new(),
@@ -162,6 +165,28 @@ pub fn encode(
                     ) {
                         chunks.push(Ok(b));
                     }
+                } else if kind == ContentBlockKind::Reasoning {
+                    let mut s = state.lock();
+                    let oi = s.next_output_index();
+                    let item_id = format!("rs_{oi}");
+                    s.canonical_to_output.insert(index, oi);
+                    s.item_ids.insert(oi, item_id.clone());
+                    s.reasoning_buf.insert(oi, String::new());
+
+                    let item = OutputItem::Reasoning {
+                        id: item_id,
+                        status: "in_progress",
+                        content: vec![],
+                    };
+                    if let Some(b) = emit(
+                        "response.output_item.added",
+                        &OutputItemAdded {
+                            output_index: oi,
+                            item,
+                        },
+                    ) {
+                        chunks.push(Ok(b));
+                    }
                 }
             }
 
@@ -190,6 +215,37 @@ pub fn encode(
                     chunks.push(Ok(b));
                 }
                 state.lock().text_buf.entry(oi).or_default().push_str(&text);
+            }
+
+            StreamEvent::ReasoningDelta { index, text } => {
+                let (oi, item_id) = {
+                    let s = state.lock();
+                    let Some(oi) = s.canonical_to_output.get(&index).copied() else {
+                        chunks.push(Err(crate::FrontendError::Encode(format!(
+                            "reasoning delta for unknown content block index: {index}"
+                        ))));
+                        return futures_util::stream::iter(chunks);
+                    };
+                    let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
+                    (oi, item_id)
+                };
+
+                if let Some(b) = emit(
+                    "response.reasoning.delta",
+                    &ReasoningDeltaPayload {
+                        item_id,
+                        output_index: oi,
+                        delta: text.clone(),
+                    },
+                ) {
+                    chunks.push(Ok(b));
+                }
+                state
+                    .lock()
+                    .reasoning_buf
+                    .entry(oi)
+                    .or_default()
+                    .push_str(&text);
             }
 
             StreamEvent::ToolCallStart { index, id, name } => {
@@ -304,6 +360,34 @@ pub fn encode(
                     ) {
                         chunks.push(Ok(b));
                     }
+                } else if let Some(reasoning_text) = s.reasoning_buf.remove(&oi) {
+                    if let Some(b) = emit(
+                        "response.reasoning.done",
+                        &ReasoningDonePayload {
+                            item_id: item_id.clone(),
+                            output_index: oi,
+                            text: reasoning_text.clone(),
+                        },
+                    ) {
+                        chunks.push(Ok(b));
+                    }
+                    let done_item = OutputItem::Reasoning {
+                        id: item_id,
+                        status: "completed",
+                        content: vec![OutputContent::Reasoning {
+                            text: reasoning_text,
+                            summary: None,
+                        }],
+                    };
+                    if let Some(b) = emit(
+                        "response.output_item.done",
+                        &OutputItemDone {
+                            output_index: oi,
+                            item: done_item,
+                        },
+                    ) {
+                        chunks.push(Ok(b));
+                    }
                 }
             }
 
@@ -404,9 +488,7 @@ pub fn encode(
                 }
             }
 
-            StreamEvent::MessageStart { .. }
-            | StreamEvent::ReasoningDelta { .. }
-            | StreamEvent::RawProviderEvent(_) => {}
+            StreamEvent::MessageStart { .. } | StreamEvent::RawProviderEvent(_) => {}
         }
 
         futures_util::stream::iter(chunks)
@@ -527,5 +609,143 @@ mod tests {
         assert!(body.contains(r#""output_index":0,"content_index":0,"delta":"B""#));
         assert!(body.contains(r#""output_index":1,"delta":"{}""#));
         assert!(body.contains(r#""usage":{"input_tokens":7,"output_tokens":9,"total_tokens":16}"#));
+    }
+
+    #[tokio::test]
+    async fn reasoning_delta_emits_responses_events() {
+        let events: Vec<Result<StreamEvent, StreamError>> = vec![
+            Ok(StreamEvent::ResponseStart {
+                id: ResponseId("resp_r".to_string()),
+                model: "gpt-test".to_string(),
+                created_at_unix: 1,
+            }),
+            Ok(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                kind: ContentBlockKind::Reasoning,
+            }),
+            Ok(StreamEvent::ReasoningDelta {
+                index: 0,
+                text: "first ".to_string(),
+            }),
+            Ok(StreamEvent::ReasoningDelta {
+                index: 0,
+                text: "part".to_string(),
+            }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+            Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            }),
+            Ok(StreamEvent::ResponseStop { usage: None }),
+        ];
+
+        let body = collect_stream(Box::pin(stream::iter(events))).await;
+
+        // Locate each event in order and confirm they appear sequentially.
+        let added_idx = body
+            .find("event: response.output_item.added")
+            .expect("output_item.added present");
+        let delta1_idx = body[added_idx..]
+            .find("event: response.reasoning.delta")
+            .map(|p| p + added_idx)
+            .expect("first reasoning.delta present");
+        let delta2_idx = body[delta1_idx + 1..]
+            .find("event: response.reasoning.delta")
+            .map(|p| p + delta1_idx + 1)
+            .expect("second reasoning.delta present");
+        let done_idx = body[delta2_idx..]
+            .find("event: response.reasoning.done")
+            .map(|p| p + delta2_idx)
+            .expect("reasoning.done present");
+        let item_done_idx = body[done_idx..]
+            .find("event: response.output_item.done")
+            .map(|p| p + done_idx)
+            .expect("output_item.done present");
+
+        // Reasoning item is added with rs_ prefix and in_progress status.
+        assert!(body[added_idx..delta1_idx].contains(r#""type":"reasoning""#));
+        assert!(body[added_idx..delta1_idx].contains(r#""id":"rs_0""#));
+        assert!(body[added_idx..delta1_idx].contains(r#""status":"in_progress""#));
+
+        // Each delta carries the right payload.
+        assert!(body[delta1_idx..delta2_idx].contains(r#""delta":"first ""#));
+        assert!(body[delta1_idx..delta2_idx].contains(r#""item_id":"rs_0""#));
+        assert!(body[delta2_idx..done_idx].contains(r#""delta":"part""#));
+
+        // reasoning.done carries the accumulated text.
+        assert!(body[done_idx..item_done_idx].contains(r#""text":"first part""#));
+        assert!(body[done_idx..item_done_idx].contains(r#""item_id":"rs_0""#));
+
+        // output_item.done finalizes with status "completed" and content array.
+        let tail = &body[item_done_idx..];
+        assert!(tail.contains(r#""type":"reasoning""#));
+        assert!(tail.contains(r#""status":"completed""#));
+        assert!(tail.contains(r#""text":"first part""#));
+    }
+
+    #[tokio::test]
+    async fn reasoning_then_text_use_separate_output_indexes() {
+        let events: Vec<Result<StreamEvent, StreamError>> = vec![
+            Ok(StreamEvent::ResponseStart {
+                id: ResponseId("resp_rt".to_string()),
+                model: "gpt-test".to_string(),
+                created_at_unix: 1,
+            }),
+            Ok(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                kind: ContentBlockKind::Reasoning,
+            }),
+            Ok(StreamEvent::ReasoningDelta {
+                index: 0,
+                text: "thinking".to_string(),
+            }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 1,
+                kind: ContentBlockKind::Text,
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 1,
+                text: "answer".to_string(),
+            }),
+            Ok(StreamEvent::ContentBlockStop { index: 1 }),
+            Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            }),
+            Ok(StreamEvent::ResponseStop { usage: None }),
+        ];
+
+        let body = collect_stream(Box::pin(stream::iter(events))).await;
+
+        // Reasoning lands on output_index 0 with rs_ prefix.
+        assert!(body.contains(r#""output_index":0,"item":{"type":"reasoning","id":"rs_0""#));
+        assert!(body
+            .contains(r#""item_id":"rs_0","output_index":0,"delta":"thinking""#));
+        assert!(body.contains(r#""item_id":"rs_0","output_index":0,"text":"thinking""#));
+
+        // Text lands on output_index 1 with msg_ prefix and round-trips correctly.
+        assert!(body.contains(r#""output_index":1,"item":{"type":"message","id":"msg_1""#));
+        assert!(body.contains(
+            r#""item_id":"msg_1","output_index":1,"content_index":0,"delta":"answer""#
+        ));
+        assert!(body.contains(
+            r#""item_id":"msg_1","output_index":1,"content_index":0,"text":"answer""#
+        ));
+
+        // Reasoning events come before text events in the stream.
+        let reasoning_added = body
+            .find(r#""output_index":0,"item":{"type":"reasoning""#)
+            .expect("reasoning added present");
+        let text_added = body
+            .find(r#""output_index":1,"item":{"type":"message""#)
+            .expect("text added present");
+        assert!(reasoning_added < text_added);
     }
 }
