@@ -1,5 +1,5 @@
 use agent_shim_core::{
-    content::{ContentBlock, UnsupportedBlock},
+    content::{ContentBlock, ReasoningBlock, UnsupportedBlock},
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
     message::{Message, MessageRole, SystemInstruction, SystemSource},
@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::wire::{
     InboundTool, InboundToolChoice, InputContentPart, InputField, InputItem, InputMessage,
-    InputMessageContent, ResponsesRequest,
+    InputMessageContent, ReasoningContentPart, ReasoningSummaryPart, ResponsesRequest,
 };
 use crate::FrontendError;
 
@@ -233,9 +233,65 @@ fn decode_items(
                     extensions: ExtensionMap::new(),
                 });
             }
+            // Reasoning items become `ContentBlock::Reasoning` attached to
+            // the preceding assistant message. If the previous message in
+            // `out` is not an assistant message (or `out` is empty), a new
+            // assistant message is created to hold the reasoning block. The
+            // `id` and `status` fields are accepted but ignored — the
+            // canonical model does not carry per-block IDs from input; we
+            // synthesize them on encode.
+            InputItem::Reasoning {
+                summary, content, ..
+            } => {
+                let text = extract_reasoning_text(content, summary);
+                let block = ContentBlock::Reasoning(ReasoningBlock {
+                    text,
+                    extensions: ExtensionMap::new(),
+                });
+                match out.last_mut() {
+                    Some(msg) if msg.role == MessageRole::Assistant => {
+                        msg.content.push(block);
+                    }
+                    _ => {
+                        out.push(Message {
+                            role: MessageRole::Assistant,
+                            content: vec![block],
+                            name: None,
+                            extensions: ExtensionMap::new(),
+                        });
+                    }
+                }
+            }
         }
     }
     Ok((system, out))
+}
+
+/// Joins reasoning text from the typed `reasoning` input item. Prefers the
+/// richer `content` array; falls back to `summary` when `content` is empty
+/// or missing. Returns an empty string when both are empty — the caller
+/// still emits the block so round-trip semantics are preserved.
+fn extract_reasoning_text(
+    content: Option<Vec<ReasoningContentPart>>,
+    summary: Option<Vec<ReasoningSummaryPart>>,
+) -> String {
+    let from_content: String = content
+        .into_iter()
+        .flatten()
+        .map(|p| match p {
+            ReasoningContentPart::ReasoningText { text } => text,
+        })
+        .collect();
+    if !from_content.is_empty() {
+        return from_content;
+    }
+    summary
+        .into_iter()
+        .flatten()
+        .map(|p| match p {
+            ReasoningSummaryPart::SummaryText { text } => text,
+        })
+        .collect()
 }
 
 fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBlock> {
@@ -387,5 +443,120 @@ mod tests {
         let body = br#"{"model":"gpt-4o","input":"Hi","max_output_tokens":1024}"#;
         let req = decode(body).unwrap();
         assert_eq!(req.generation.max_tokens, Some(1024));
+    }
+
+    #[test]
+    fn decode_tool_choice_specific_function_name() {
+        // Plan 01 T6 — gap fill: the typed `{type:"function",name:"..."}` shape
+        // of `InboundToolChoice` was previously untested. The string-mode shape
+        // (auto/none/required) is exercised implicitly by request fixtures
+        // omitting `tool_choice`, but the typed-name path requires explicit
+        // coverage so it does not silently regress.
+
+        // Arrange: a request that pins a specific tool by name.
+        let body = br#"{
+            "model": "gpt-4o",
+            "input": "Hi",
+            "tools": [{"type":"function","name":"search","parameters":{"type":"object"}}],
+            "tool_choice": {"type":"function","name":"search"}
+        }"#;
+
+        // Act
+        let req = decode(body).unwrap();
+
+        // Assert: tool_choice resolves to ToolChoice::Specific with the chosen name.
+        match req.tool_choice {
+            ToolChoice::Specific { name } => assert_eq!(name, "search"),
+            other => panic!("expected ToolChoice::Specific, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_items_attach_to_preceding_assistant_message() {
+        // Case 1: reasoning AFTER an assistant message attaches to it.
+        let body = br#"{
+            "model": "gpt-4o",
+            "input": [
+                {"type":"message","role":"user","content":"hello"},
+                {"type":"message","role":"assistant","content":"hi there"},
+                {"type":"reasoning","id":"rs_1","summary":[],"content":[
+                    {"type":"reasoning_text","text":"thought A"},
+                    {"type":"reasoning_text","text":" + B"}
+                ]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[1].role, MessageRole::Assistant);
+        assert_eq!(req.messages[1].content.len(), 2);
+        match &req.messages[1].content[1] {
+            ContentBlock::Reasoning(r) => assert_eq!(r.text, "thought A + B"),
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+
+        // Case 2: reasoning AS FIRST item creates a new assistant message,
+        // and a subsequent assistant message item is NOT merged into it.
+        let body = br#"{
+            "model": "gpt-4o",
+            "input": [
+                {"type":"reasoning","content":[{"type":"reasoning_text","text":"pre-think"}]},
+                {"type":"message","role":"assistant","content":"the answer"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, MessageRole::Assistant);
+        assert_eq!(req.messages[0].content.len(), 1);
+        match &req.messages[0].content[0] {
+            ContentBlock::Reasoning(r) => assert_eq!(r.text, "pre-think"),
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+        assert_eq!(req.messages[1].role, MessageRole::Assistant);
+        match &req.messages[1].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "the answer"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+
+        // Case 3: content array present → text comes from content (joined),
+        // even when a summary is also provided.
+        let body = br#"{
+            "model": "gpt-4o",
+            "input": [
+                {"type":"message","role":"assistant","content":"hi"},
+                {"type":"reasoning",
+                 "summary":[{"type":"summary_text","text":"summary-only"}],
+                 "content":[
+                    {"type":"reasoning_text","text":"part1 "},
+                    {"type":"reasoning_text","text":"part2"}
+                 ]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].content.len(), 2);
+        match &req.messages[0].content[1] {
+            ContentBlock::Reasoning(r) => assert_eq!(r.text, "part1 part2"),
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
+
+        // Case 4: empty content but summary present → fall back to summary.
+        let body = br#"{
+            "model": "gpt-4o",
+            "input": [
+                {"type":"message","role":"assistant","content":"hi"},
+                {"type":"reasoning",
+                 "summary":[
+                    {"type":"summary_text","text":"sum-A"},
+                    {"type":"summary_text","text":"/sum-B"}
+                 ],
+                 "content":[]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        match &req.messages[0].content[1] {
+            ContentBlock::Reasoning(r) => assert_eq!(r.text, "sum-A/sum-B"),
+            other => panic!("expected Reasoning block, got {other:?}"),
+        }
     }
 }
