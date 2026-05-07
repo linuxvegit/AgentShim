@@ -300,6 +300,22 @@ async fn canonical_path_tool_call_stream_yields_tool_events() {
         assert_eq!(*stop_reason, StopReason::ToolUse);
     }
 
+    // Regression: streaming tool_use blocks must emit ToolCallStop ahead of
+    // ContentBlockStop, matching unary parity and the Responses encoder's
+    // contract. Earlier versions of the streaming parser silently dropped this.
+    let tool_stop_idx = events
+        .iter()
+        .position(|e| matches!(e, StreamEvent::ToolCallStop { index: 0 }))
+        .expect("streaming tool_use must emit ToolCallStop {index: 0}");
+    let block_stop_idx = events
+        .iter()
+        .position(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 }))
+        .expect("streaming tool_use must emit ContentBlockStop {index: 0}");
+    assert!(
+        tool_stop_idx < block_stop_idx,
+        "ToolCallStop must precede ContentBlockStop; got tool_stop={tool_stop_idx}, block_stop={block_stop_idx}"
+    );
+
     mock.assert_async().await;
 }
 
