@@ -19,6 +19,18 @@
 //! losslessly. This mirrors the [`crate::usage::StopReason::Other`] precedent.
 use serde::{Deserialize, Serialize};
 
+// Wire-string constants — referenced by both the `From<String>` parser and the
+// `From<Self> for String` formatter so a typo on either side is impossible.
+const WIRE_HATE_SPEECH: &str = "HARM_CATEGORY_HATE_SPEECH";
+const WIRE_HARASSMENT: &str = "HARM_CATEGORY_HARASSMENT";
+const WIRE_DANGEROUS_CONTENT: &str = "HARM_CATEGORY_DANGEROUS_CONTENT";
+const WIRE_SEXUALLY_EXPLICIT: &str = "HARM_CATEGORY_SEXUALLY_EXPLICIT";
+
+const WIRE_NEGLIGIBLE: &str = "NEGLIGIBLE";
+const WIRE_LOW: &str = "LOW";
+const WIRE_MEDIUM: &str = "MEDIUM";
+const WIRE_HIGH: &str = "HIGH";
+
 /// A single safety classification produced by the upstream model.
 ///
 /// Multiple ratings are typically returned per response; one per safety
@@ -55,10 +67,10 @@ pub enum SafetyCategory {
 impl From<String> for SafetyCategory {
     fn from(s: String) -> Self {
         match s.as_str() {
-            "HARM_CATEGORY_HATE_SPEECH" => SafetyCategory::HateSpeech,
-            "HARM_CATEGORY_HARASSMENT" => SafetyCategory::Harassment,
-            "HARM_CATEGORY_DANGEROUS_CONTENT" => SafetyCategory::DangerousContent,
-            "HARM_CATEGORY_SEXUALLY_EXPLICIT" => SafetyCategory::SexuallyExplicit,
+            WIRE_HATE_SPEECH => SafetyCategory::HateSpeech,
+            WIRE_HARASSMENT => SafetyCategory::Harassment,
+            WIRE_DANGEROUS_CONTENT => SafetyCategory::DangerousContent,
+            WIRE_SEXUALLY_EXPLICIT => SafetyCategory::SexuallyExplicit,
             _ => SafetyCategory::Other(s),
         }
     }
@@ -67,10 +79,10 @@ impl From<String> for SafetyCategory {
 impl From<SafetyCategory> for String {
     fn from(c: SafetyCategory) -> Self {
         match c {
-            SafetyCategory::HateSpeech => "HARM_CATEGORY_HATE_SPEECH".to_owned(),
-            SafetyCategory::Harassment => "HARM_CATEGORY_HARASSMENT".to_owned(),
-            SafetyCategory::DangerousContent => "HARM_CATEGORY_DANGEROUS_CONTENT".to_owned(),
-            SafetyCategory::SexuallyExplicit => "HARM_CATEGORY_SEXUALLY_EXPLICIT".to_owned(),
+            SafetyCategory::HateSpeech => WIRE_HATE_SPEECH.to_owned(),
+            SafetyCategory::Harassment => WIRE_HARASSMENT.to_owned(),
+            SafetyCategory::DangerousContent => WIRE_DANGEROUS_CONTENT.to_owned(),
+            SafetyCategory::SexuallyExplicit => WIRE_SEXUALLY_EXPLICIT.to_owned(),
             SafetyCategory::Other(s) => s,
         }
     }
@@ -98,10 +110,10 @@ pub enum SafetyLevel {
 impl From<String> for SafetyLevel {
     fn from(s: String) -> Self {
         match s.as_str() {
-            "NEGLIGIBLE" => SafetyLevel::Negligible,
-            "LOW" => SafetyLevel::Low,
-            "MEDIUM" => SafetyLevel::Medium,
-            "HIGH" => SafetyLevel::High,
+            WIRE_NEGLIGIBLE => SafetyLevel::Negligible,
+            WIRE_LOW => SafetyLevel::Low,
+            WIRE_MEDIUM => SafetyLevel::Medium,
+            WIRE_HIGH => SafetyLevel::High,
             _ => SafetyLevel::Other(s),
         }
     }
@@ -110,10 +122,10 @@ impl From<String> for SafetyLevel {
 impl From<SafetyLevel> for String {
     fn from(l: SafetyLevel) -> Self {
         match l {
-            SafetyLevel::Negligible => "NEGLIGIBLE".to_owned(),
-            SafetyLevel::Low => "LOW".to_owned(),
-            SafetyLevel::Medium => "MEDIUM".to_owned(),
-            SafetyLevel::High => "HIGH".to_owned(),
+            SafetyLevel::Negligible => WIRE_NEGLIGIBLE.to_owned(),
+            SafetyLevel::Low => WIRE_LOW.to_owned(),
+            SafetyLevel::Medium => WIRE_MEDIUM.to_owned(),
+            SafetyLevel::High => WIRE_HIGH.to_owned(),
             SafetyLevel::Other(s) => s,
         }
     }
