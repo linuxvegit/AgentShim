@@ -235,6 +235,11 @@ pub struct RetryConfig {
     pub retry_on: Vec<String>,
 }
 
+// Required so `#[serde(default)]` on the `retry: RetryConfig` field in
+// `RouteEntry` works when the whole `retry:` block is omitted. The per-field
+// `default = "..."` attrs only fire when a field key is missing while parsing
+// THIS struct's own deserialization — they do not run when the entire struct
+// is absent from the parent.
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
@@ -248,6 +253,12 @@ impl Default for RetryConfig {
     }
 }
 
+// §4.5 D12 — Phase 4 retry/breaker defaults. Source of truth:
+// docs/superpowers/specs/2026-05-08-phase-4-resiliency-design.md §4.5.
+// Changing any value here is a contract change, not a tunable: it ships in
+// v0.4.0 release notes and may break operators relying on the documented
+// defaults. Loosen tunables via the `retry:`/`breaker:` blocks in YAML, not
+// by editing these constants.
 fn default_max_attempts() -> u32 {
     2
 }
@@ -288,6 +299,9 @@ pub struct BreakerConfig {
     pub open_cooldown_secs: u64,
 }
 
+// Required so `#[serde(default)]` on the `breaker: BreakerConfig` field in
+// `RouteEntry` works when the whole `breaker:` block is omitted. See the note
+// above `impl Default for RetryConfig` for the full rationale.
 impl Default for BreakerConfig {
     fn default() -> Self {
         Self {

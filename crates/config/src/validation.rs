@@ -13,6 +13,8 @@ pub enum ValidationError {
     UnknownFrontend(String),
     #[error("upstream {0}: {1}")]
     InvalidUpstream(String, String),
+    #[error("invalid route: {0}")]
+    InvalidRoute(String),
 }
 
 const VALID_FRONTENDS: &[&str] = &[
@@ -23,6 +25,32 @@ const VALID_FRONTENDS: &[&str] = &[
     "openai_responses",
     "responses",
 ];
+
+/// Returns true if `name` resolves to a configured upstream block.
+///
+/// Direct lookup wins. As a legacy back-compat case (carried from v0.3),
+/// the virtual name `"copilot"` resolves whenever any
+/// `UpstreamConfig::GithubCopilot` block is configured, regardless of its key
+/// in `cfg.upstreams`. Operators upgrading from v0.3 may have routes that say
+/// `upstream: copilot` while the actual upstream entry is keyed
+/// `github_copilot:` (or any other name).
+///
+/// Both [`validate`] and [`validate_routes`] go through this helper so the two
+/// never disagree on what counts as "configured".
+fn upstream_is_configured(cfg: &GatewayConfig, name: &str) -> bool {
+    if cfg.upstreams.contains_key(name) {
+        return true;
+    }
+    if name == "copilot"
+        && cfg
+            .upstreams
+            .values()
+            .any(|u| matches!(u, UpstreamConfig::GithubCopilot))
+    {
+        return true;
+    }
+    false
+}
 
 pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
     if cfg.server.port == 0 {
@@ -47,16 +75,8 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
             vec![]
         };
         for name in &referenced {
-            if !cfg.upstreams.contains_key(name) {
-                // allow "copilot" as a special upstream name when copilot config present
-                let is_copilot = name == "copilot"
-                    && cfg
-                        .upstreams
-                        .values()
-                        .any(|u| matches!(u, UpstreamConfig::GithubCopilot));
-                if !is_copilot {
-                    return Err(ValidationError::UnknownUpstream(name.clone()));
-                }
+            if !upstream_is_configured(cfg, name) {
+                return Err(ValidationError::UnknownUpstream(name.clone()));
             }
         }
         let key = (route.frontend.clone(), route.model.clone());
@@ -95,6 +115,11 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
             )?;
         }
     }
+
+    // Phase 4 (Plan 04 P01) per-route validation. Wired into the canonical
+    // entry point so `gateway::commands::serve`/`validate_config` (and any
+    // other caller of `validate()`) get the new rules for free.
+    validate_routes(cfg).map_err(ValidationError::InvalidRoute)?;
 
     Ok(())
 }
@@ -141,21 +166,27 @@ fn validate_oai_style_upstream(
 /// Phase 4 (Plan 04 P01) per-route validation. Enforces:
 /// 1. Each route uses **exactly one** upstream shape (singular OR array).
 /// 2. Singular form requires both `upstream` and `upstream_model`.
-/// 3. Every referenced upstream name resolves to a configured upstream.
+/// 3. Every referenced upstream name resolves to a configured upstream
+///    (via [`upstream_is_configured`], which honors the legacy `copilot`
+///    virtual name).
 /// 4. Retry policy fields are sane (`max_attempts >= 1`,
 ///    `total_budget_ms >= initial_backoff_ms`, `multiplier > 1.0`).
 /// 5. Breaker policy fields are sane (`failure_threshold_pct` in `1..=100`,
 ///    `min_requests >= 1`).
 ///
+/// Returns on first failure; rerun after each fix to surface subsequent issues.
+///
 /// Returns a human-readable `String` so config-load callers can surface the
-/// message verbatim. The `validate()` entry point above returns
-/// `ValidationError` instead; both can be called.
+/// message verbatim. The `validate()` entry point wraps these into
+/// `ValidationError::InvalidRoute` and is the canonical config-load call site;
+/// callers that already hold a `&GatewayConfig` may invoke `validate_routes`
+/// directly.
 pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
     for (i, route) in cfg.routes.iter().enumerate() {
         let has_singular = route.upstream.is_some() || route.upstream_model.is_some();
         let has_array = !route.upstreams.is_empty();
 
-        // Rule 1: exactly one shape per route.
+        // Rule 1: exactly one shape per route (singular OR array, never both, never neither).
         match (has_singular, has_array) {
             (true, true) => {
                 return Err(format!(
@@ -170,6 +201,7 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
                 ));
             }
             (true, false) => {
+                // Rule 2: singular form requires BOTH `upstream` and `upstream_model`.
                 if route.upstream.is_none() || route.upstream_model.is_none() {
                     return Err(format!(
                         "route[{i}] '{}/{}' singular form requires both `upstream` and `upstream_model`",
@@ -180,14 +212,16 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
             (false, true) => {} // valid array form
         }
 
-        // Rule 2: every referenced upstream name must be configured.
+        // Rule 3: every referenced upstream name must be configured. Honors the
+        // legacy `copilot` virtual name so v0.3 configs keep working — see
+        // `upstream_is_configured` for the full back-compat rule.
         let upstream_names: Vec<&str> = if has_array {
             route.upstreams.iter().map(|u| u.name.as_str()).collect()
         } else {
             vec![route.upstream.as_deref().unwrap()]
         };
         for name in upstream_names {
-            if !cfg.upstreams.contains_key(name) {
+            if !upstream_is_configured(cfg, name) {
                 return Err(format!(
                     "route[{i}] '{}/{}' references unknown upstream '{}'",
                     route.frontend, route.model, name
@@ -195,8 +229,8 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
             }
         }
 
-        // Rule 3: retry policy sanity.
-        if route.retry.max_attempts < 1 {
+        // Rule 4: retry policy sanity.
+        if route.retry.max_attempts == 0 {
             return Err(format!("route[{i}] retry.max_attempts must be >= 1"));
         }
         if route.retry.total_budget_ms < route.retry.initial_backoff_ms {
@@ -212,14 +246,14 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
             ));
         }
 
-        // Rule 4: breaker policy sanity.
+        // Rule 5: breaker policy sanity.
         if !(1..=100).contains(&route.breaker.failure_threshold_pct) {
             return Err(format!(
                 "route[{i}] breaker.failure_threshold_pct ({}) must be in 1..=100",
                 route.breaker.failure_threshold_pct
             ));
         }
-        if route.breaker.min_requests < 1 {
+        if route.breaker.min_requests == 0 {
             return Err(format!("route[{i}] breaker.min_requests must be >= 1"));
         }
     }
@@ -664,5 +698,54 @@ mod tests {
         );
         let err = validate_routes(&cfg).unwrap_err();
         assert!(err.contains("multiplier"));
+    }
+
+    /// Wiring regression for review-issue #1: an invalid YAML must be rejected
+    /// by the canonical `validate()` entry point — not just by direct
+    /// `validate_routes` calls. Without this, `agent-shim serve --config` would
+    /// happily accept multiplier=1.0 in production.
+    #[test]
+    fn validate_rejects_invalid_route_via_canonical_entry() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            retry:
+              multiplier: 1.0
+        "#,
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidRoute(msg)) => {
+                assert!(msg.contains("multiplier"), "got: {msg}");
+            }
+            other => panic!("expected InvalidRoute, got {other:?}"),
+        }
+    }
+
+    /// Regression for review-issue #3 (copilot virtual-name consistency):
+    /// `validate_routes` must accept `upstream: copilot` whenever any
+    /// `github_copilot` upstream block is configured, matching the legacy
+    /// behavior of `validate()`. Both validators share `upstream_is_configured`.
+    #[test]
+    fn validate_routes_accepts_copilot_virtual_name() {
+        let mut cfg = minimal_config();
+        // Upstream block is keyed `github_copilot` (not `copilot`).
+        cfg.upstreams
+            .insert("github_copilot".to_string(), UpstreamConfig::GithubCopilot);
+        let route: RouteEntry = serde_yaml::from_str(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: copilot
+            upstream_model: gpt-4o
+        "#,
+        )
+        .expect("route YAML parses");
+        cfg.routes.push(route);
+        validate_routes(&cfg).expect("copilot virtual name should resolve");
+        // And the canonical entry point agrees.
+        validate(&cfg).expect("validate() should also pass");
     }
 }
