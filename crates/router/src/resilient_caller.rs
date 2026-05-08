@@ -75,7 +75,7 @@ impl ResilientCaller {
                 }
                 Err(e) => {
                     let eligibility = fallback_eligibility_with_overrides(&e, &policy.retry_on);
-                    let tag = error_tag(&e);
+                    let tag = crate::fallback::error_tag(&e);
                     tried.push(TriedUpstream {
                         provider: target.provider.clone(),
                         model: target.model.clone(),
@@ -113,19 +113,6 @@ impl ResilientCaller {
             tried,
             last_error: last_error.expect("loop only exits with last_error set on Err path"),
         })
-    }
-}
-
-fn error_tag(e: &ProviderError) -> &'static str {
-    match e {
-        ProviderError::Network(_) => "network",
-        ProviderError::Upstream { status, .. } if *status >= 500 => "upstream_5xx",
-        ProviderError::Upstream { status, .. } if *status == 429 => "upstream_429",
-        ProviderError::Upstream { .. } => "upstream_4xx",
-        ProviderError::Decode(_) => "decode",
-        ProviderError::Encode(_) => "encode",
-        ProviderError::CapabilityMismatch(_) => "capability",
-        ProviderError::UnknownProvider(_) => "unknown_provider",
     }
 }
 

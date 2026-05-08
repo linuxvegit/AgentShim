@@ -73,7 +73,7 @@ pub fn fallback_eligibility_with_overrides(
     }
 }
 
-fn error_tag(e: &ProviderError) -> &'static str {
+pub(crate) fn error_tag(e: &ProviderError) -> &'static str {
     match e {
         ProviderError::Network(_) => "network",
         ProviderError::Upstream { status, .. } if *status >= 500 => "upstream_5xx",
