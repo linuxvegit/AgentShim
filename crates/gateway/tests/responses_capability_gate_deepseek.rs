@@ -38,7 +38,9 @@ use agent_shim_providers::{
     BackendProvider, ProviderCapabilities, ProviderError, ProviderRegistry,
 };
 use agent_shim_router::model_index::ModelIndex;
-use agent_shim_router::{ModelResolver, Router as RouterTrait, StaticRouter};
+use agent_shim_router::{
+    ModelResolver, ProviderLookup, ResilientCaller, Router as RouterTrait, StaticRouter,
+};
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -142,13 +144,27 @@ fn make_app_state() -> AppState {
     assert_eq!(chain[0].provider, "text-only-stub");
     let _ = RoutePolicy::default(); // silence unused-import lint when policy isn't touched
 
+    // Build the resilient caller against the same provider registry the
+    // gateway exposes to the pipeline. The stub is wrapped in an
+    // `Arc<ProviderRegistry>` so the lookup adapter shares its instance.
+    let providers = Arc::new(registry);
+    struct Lookup(Arc<ProviderRegistry>);
+    impl ProviderLookup for Lookup {
+        fn get(&self, name: &str) -> Option<Arc<dyn BackendProvider>> {
+            self.0.get(name)
+        }
+    }
+    let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(Lookup(Arc::clone(&providers)));
+    let resilient_caller = Arc::new(ResilientCaller::new(provider_lookup));
+
     AppState {
         config: Arc::new(cfg),
         anthropic,
         openai,
         openai_responses,
-        providers: Arc::new(registry),
+        providers,
         resolver,
+        resilient_caller,
     }
 }
 

@@ -27,8 +27,8 @@ use agent_shim_core::{
     BackendTarget, CanonicalRequest, CanonicalStream, ContentBlock, StreamEvent, Usage,
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
-use agent_shim_providers::{BackendProvider, ProviderCapabilities, ProviderError};
-use agent_shim_router::{retry_with_policy, RetryPolicy};
+use agent_shim_providers::{ProviderCapabilities, ProviderError};
+use agent_shim_router::RetryPolicy;
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -102,41 +102,56 @@ pub async fn dispatch(
             tracing::warn!(model = %model_alias, error = %e, "no route");
             HandlerError::Route(e)
         })?;
-    // Plan 02 T2 transitional shim: `ModelResolver::resolve` now returns the
-    // full fallback chain (`Vec<BackendTarget>`), but the pipeline still
-    // operates on a single target. Plan 02 T6 rewires this to consume the
-    // chain via `ResilientCaller`. The chain is non-empty by router invariant
-    // (singular routes produce 1-element vecs; array routes are validated to
-    // be non-empty by `validate_routes`).
-    let target = chain
-        .into_iter()
-        .next()
-        .expect("ModelResolver::resolve never returns an empty chain on Ok");
 
-    // Look up the per-route retry policy (from `retry:` block in YAML or
-    // §4.5/D12 defaults). Phase 4 P01 T5: every provider call below the
-    // pipeline goes through retry_with_policy. Routes without a configured
-    // retry block fall back to RetryConfig::default() — equivalent to the
-    // documented defaults (max_attempts=2, exp backoff with jitter).
-    let retry_policy = RetryPolicy::from(
-        &state
-            .resolver
-            .find_retry_policy(spec.frontend.kind(), &model_alias)
-            .unwrap_or_default(),
-    );
+    // Plan 04 P02 D2: route-level retry block governs every chain element
+    // uniformly. Build one `RetryPolicy` and clone it per chain position so
+    // `ResilientCaller::complete` can apply it independently to each
+    // upstream's retry budget.
+    let route_retry_config = state
+        .resolver
+        .find_retry_policy(spec.frontend.kind(), &model_alias)
+        .unwrap_or_default();
+    let retry_policy = RetryPolicy::from(&route_retry_config);
+    let policies: Vec<RetryPolicy> = (0..chain.len()).map(|_| retry_policy.clone()).collect();
 
-    let upstream_model = target.model.clone();
+    // The chain is non-empty by router invariant (singular routes produce
+    // 1-element vecs; array routes are validated to be non-empty by
+    // `validate_routes`). The capability gate, the request log line, and
+    // the proxy_raw short-circuit all run against `chain[0]`'s provider —
+    // chain-element-aware capability checking is intentionally out of
+    // scope for v0.4 (potential P03+ extension).
+    let first_target = chain
+        .first()
+        .expect("ModelResolver::resolve never returns an empty chain on Ok")
+        .clone();
+    let upstream_model = first_target.model.clone();
 
-    let provider = state.providers.get(&target.provider).ok_or_else(|| {
-        tracing::error!(provider = %target.provider, "provider not registered");
+    let first_provider = state.providers.get(&first_target.provider).ok_or_else(|| {
+        tracing::error!(provider = %first_target.provider, "provider not registered");
         HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-            target.provider.clone(),
+            first_target.provider.clone(),
         ))
     })?;
 
     // Raw-passthrough short-circuit: only the Responses frontend uses this.
     // We don't know reasoning_effort etc. without decoding the body, so log
-    // the route default as the best approximation.
+    // the route default as the best approximation. The passthrough path is
+    // single-upstream by nature: it bypasses the canonical decode/encode
+    // round-trip and so cannot itself participate in chain fallback.
+    //
+    // Plan 04 P02 T6: when proxy_raw returns `Err`, fall through to the
+    // canonical decode path so the chain walk (`ResilientCaller`) gets the
+    // chance to try chain[1..]. The cost is an extra attempt at chain[0]
+    // via `complete()` — likely also failing — before fallback fires, but
+    // proxy_raw failures are rare and the alternative (terminating on
+    // chain[0]'s passthrough error and skipping fallback) violates the
+    // user-visible contract that a non-empty `upstreams: [...]` chain
+    // tries every element on eligible failures.
+    //
+    // `Ok(None)` (proxy_raw not applicable for this frontend) and `Err(_)`
+    // both fall through. Successful proxy_raw returns the stream as-is —
+    // resilience-layer handling for that case is intentionally out of
+    // scope for v0.4.
     if spec.try_proxy_raw {
         tracing::info!(
             "→ {} | model: {} → {} | bodyBytes: {} | reasoning_default: {}",
@@ -144,39 +159,48 @@ pub async fn dispatch(
             model_alias,
             upstream_model,
             body_bytes,
-            target
+            first_target
                 .policy
                 .default_reasoning_effort
                 .map(|e| e.as_str())
                 .unwrap_or("none"),
         );
 
-        if let Some((content_type, byte_stream)) = provider
-            .proxy_raw(body.clone(), target.clone(), spec.frontend.kind())
+        match first_provider
+            .proxy_raw(body.clone(), first_target.clone(), spec.frontend.kind())
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "proxy_raw failed");
-                HandlerError::Provider(e)
-            })?
         {
-            tracing::info!(
-                "← {} (passthrough) | model: {} → {} | {:.1}s",
-                spec.endpoint_label,
-                model_alias,
-                upstream_model,
-                started.elapsed().as_secs_f64()
-            );
-            let body_stream = Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
-            let mut r = Response::new(body_stream);
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
-            );
-            return Ok(r);
+            Ok(Some((content_type, byte_stream))) => {
+                tracing::info!(
+                    "← {} (passthrough) | model: {} → {} | {:.1}s",
+                    spec.endpoint_label,
+                    model_alias,
+                    upstream_model,
+                    started.elapsed().as_secs_f64()
+                );
+                let body_stream =
+                    Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
+                let mut r = Response::new(body_stream);
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
+                );
+                return Ok(r);
+            }
+            Ok(None) => {
+                // Frontend not supported by this provider's passthrough —
+                // continue to canonical decode below.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proxy_raw failed; falling through to canonical chain walk"
+                );
+            }
         }
 
-        // Passthrough not supported — fall through with a fresh decode.
+        // Passthrough not used (or failed) — fall through with a fresh decode.
         let canonical = spec
             .frontend
             .decode_request(&body)
@@ -192,17 +216,21 @@ pub async fn dispatch(
 
     // Snapshot the merged route policy onto the canonical request. Providers
     // and logging both read from `resolved_policy` so the merge rule lives in
-    // exactly one place (RoutePolicy::resolve).
-    canonical.resolved_policy = target.policy.resolve(&canonical);
+    // exactly one place (RoutePolicy::resolve). v0.4 D2: route-level policy
+    // is uniform across the chain; resolving against `chain[0]`'s policy is
+    // correct because every chain element shares the same `RoutePolicy`.
+    canonical.resolved_policy = first_target.policy.resolve(&canonical);
 
     // Capability gate. Reject before any network call when the request asks
     // for a feature the target provider can't deliver — today this is just
     // vision (image blocks against a text-only backend). The check has to
-    // run after decode (so we can scan content blocks) but before
-    // run_stream / run_unary (so we never reach the upstream).
-    check_capabilities(&canonical, provider.capabilities()).map_err(|e| {
+    // run after decode (so we can scan content blocks) but before the chain
+    // walk (so we never reach the upstream). The check inspects only
+    // `chain[0]`'s capabilities; chain-element-aware gating is out of
+    // scope for v0.4.
+    check_capabilities(&canonical, first_provider.capabilities()).map_err(|e| {
         tracing::warn!(
-            provider = %target.provider,
+            provider = %first_target.provider,
             error = %e,
             "capability mismatch — rejecting before upstream call"
         );
@@ -246,30 +274,39 @@ pub async fn dispatch(
             .unwrap_or_default(),
     );
 
+    // Walk the chain via `ResilientCaller`: per-element retry, eligible
+    // errors fall through to the next chain element, terminal errors
+    // short-circuit. All resilience-shaped errors flow through the
+    // `from_resilience_error` bridge so the response envelope is shaped
+    // by the inbound frontend dialect.
+    let frontend_kind = spec.frontend.kind();
     if is_stream {
         run_stream(
             spec,
-            provider,
+            state,
             canonical,
-            target,
+            chain,
+            policies,
             RunContext {
                 model_alias,
                 upstream_model,
                 started,
-                retry_policy,
+                frontend_kind,
             },
         )
+        .await
     } else {
         run_unary(
             spec,
-            provider,
+            state,
             canonical,
-            target,
+            chain,
+            policies,
             RunContext {
                 model_alias,
                 upstream_model,
                 started,
-                retry_policy,
+                frontend_kind,
             },
         )
         .await
@@ -281,18 +318,18 @@ struct RunContext {
     model_alias: String,
     upstream_model: String,
     started: std::time::Instant,
-    /// Effective retry policy resolved from the route's `retry:` block (or
-    /// the §4.5/D12 default when the block is absent). Threaded into both
-    /// branches so the provider call site can wrap `provider.complete()` in
-    /// `retry_with_policy`. Phase 4 P01 T5.
-    retry_policy: RetryPolicy,
+    /// The inbound frontend's wire dialect. Threaded into the run helpers
+    /// so resilience-error → HandlerError mapping can shape the response
+    /// envelope per the client's expected schema.
+    frontend_kind: agent_shim_core::FrontendKind,
 }
 
-fn run_stream(
+async fn run_stream(
     spec: PipelineSpec<'_>,
-    provider: Arc<dyn BackendProvider>,
-    canonical: agent_shim_core::CanonicalRequest,
-    target: BackendTarget,
+    state: &AppState,
+    canonical: CanonicalRequest,
+    chain: Vec<BackendTarget>,
+    policies: Vec<RetryPolicy>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let label = spec.endpoint_label;
@@ -300,8 +337,20 @@ fn run_stream(
         model_alias,
         upstream_model,
         started,
-        retry_policy,
+        frontend_kind,
     } = ctx;
+
+    // Walk the chain. `ResilientCaller::complete` returns a single
+    // `CanonicalStream` from whichever upstream succeeded; downstream
+    // encoding is unchanged from the pre-T6 single-upstream world.
+    let upstream_stream = state
+        .resilient_caller
+        .complete(chain, canonical, policies)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "resilient call failed");
+            HandlerError::from_resilience_error(e, frontend_kind)
+        })?;
 
     if spec.log_streaming_usage_on_drop {
         // Anthropic-style: log final usage when the SSE stream is dropped.
@@ -314,7 +363,6 @@ fn run_stream(
             started,
         };
 
-        let upstream_stream = spawn_provider_stream(provider, canonical, target, retry_policy);
         let logging_stream = upstream_stream.map(move |event| {
             if let Ok(ref ev) = event {
                 match ev {
@@ -355,7 +403,6 @@ fn run_stream(
         }
     } else {
         // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        let upstream_stream = spawn_provider_stream(provider, canonical, target, retry_policy);
         let frontend_response = spec.frontend.encode_stream(upstream_stream);
         tracing::info!(
             "← {} (stream) | model: {} → {} | {:.1}s",
@@ -370,22 +417,26 @@ fn run_stream(
 
 async fn run_unary(
     spec: PipelineSpec<'_>,
-    provider: Arc<dyn BackendProvider>,
-    canonical: agent_shim_core::CanonicalRequest,
-    target: BackendTarget,
+    state: &AppState,
+    canonical: CanonicalRequest,
+    chain: Vec<BackendTarget>,
+    policies: Vec<RetryPolicy>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let RunContext {
         model_alias,
         upstream_model,
         started,
-        retry_policy,
+        frontend_kind,
     } = ctx;
-    let stream = retry_with_policy(provider, target, canonical, &retry_policy)
+
+    let stream = state
+        .resilient_caller
+        .complete(chain, canonical, policies)
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "provider call failed after retries");
-            HandlerError::Provider(e)
+            tracing::error!(error = %e, "resilient call failed");
+            HandlerError::from_resilience_error(e, frontend_kind)
         })?;
     let response = collect_stream(stream).await?;
     let (input, output) = match &response.usage {
@@ -428,47 +479,6 @@ fn capture_anthropic_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-/// Spawn the upstream provider call on a background task and return a
-/// CanonicalStream the frontend can encode lazily.
-///
-/// The provider call is wrapped in `retry_with_policy` so transient errors
-/// (network/5xx/429 by default) trigger a silent retry within the configured
-/// budget. The retry happens BEFORE the first byte is forwarded — once the
-/// upstream stream is open, we forward events as-is. Mid-stream failures
-/// surface to the client as `StreamError::Upstream`; restarting after partial
-/// SSE output isn't safe and is explicitly out of scope for P01.
-pub(crate) fn spawn_provider_stream(
-    provider: Arc<dyn BackendProvider>,
-    canonical: agent_shim_core::CanonicalRequest,
-    target: BackendTarget,
-    retry_policy: RetryPolicy,
-) -> CanonicalStream {
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
-
-    tokio::spawn(async move {
-        match retry_with_policy(provider, target, canonical, &retry_policy).await {
-            Ok(mut upstream) => {
-                while let Some(event) = upstream.next().await {
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "provider call failed after retries");
-                let _ = tx
-                    .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
-                    .await;
-            }
-        }
-    });
-
-    Box::pin(futures::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|item| (item, rx))
-    }))
 }
 
 /// Peek at the JSON body to extract the `model` field for raw-passthrough

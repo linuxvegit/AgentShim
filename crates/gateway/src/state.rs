@@ -11,10 +11,28 @@ use agent_shim_providers::{
     anthropic, deepseek, gemini,
     github_copilot::{self, credential_store},
     openai_compatible::{self},
-    ProviderRegistry,
+    BackendProvider, ProviderRegistry,
 };
 use agent_shim_router::model_index::ModelIndex;
-use agent_shim_router::{ModelResolver, Router, StaticRouter};
+use agent_shim_router::{ModelResolver, ProviderLookup, ResilientCaller, Router, StaticRouter};
+
+/// Adapter that lets `ResilientCaller` (in the router crate) look up
+/// providers via the gateway's `ProviderRegistry` (in the providers crate).
+///
+/// The orphan rule forbids implementing the foreign `ProviderLookup` trait
+/// directly on the foreign `ProviderRegistry` type, so this thin wrapper
+/// lives here in the gateway — the only crate that depends on both. It
+/// holds an `Arc<ProviderRegistry>` so the wrapper itself is cheap to
+/// share between the resilience layer and the regular request pipeline.
+struct GatewayProviderLookup {
+    registry: Arc<ProviderRegistry>,
+}
+
+impl ProviderLookup for GatewayProviderLookup {
+    fn get(&self, name: &str) -> Option<Arc<dyn BackendProvider>> {
+        self.registry.get(name)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,6 +44,11 @@ pub struct AppState {
     /// Resolves `(frontend, model_alias)` → `BackendTarget`. Owns both the
     /// static route table and the fuzzy model index as internal seams.
     pub resolver: Arc<ModelResolver>,
+    /// Resilience-layer entry point. Wraps the same provider registry
+    /// behind a `ProviderLookup` adapter, then walks the chain from the
+    /// resolver per request, applying retry+fallback per chain element.
+    /// Plan 04 P02 T6 wires this into `pipeline::dispatch`.
+    pub resilient_caller: Arc<ResilientCaller>,
 }
 
 impl AppState {
@@ -102,13 +125,20 @@ impl AppState {
         let model_index = Arc::new(ModelIndex::new(discovered));
         let resolver = Arc::new(ModelResolver::new(static_router, model_index));
 
+        let providers = Arc::new(registry);
+        let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(GatewayProviderLookup {
+            registry: Arc::clone(&providers),
+        });
+        let resilient_caller = Arc::new(ResilientCaller::new(provider_lookup));
+
         Self {
             config: Arc::new(config),
             anthropic,
             openai,
             openai_responses,
-            providers: Arc::new(registry),
+            providers,
             resolver,
+            resilient_caller,
         }
     }
 }

@@ -18,14 +18,6 @@ use agent_shim_providers::ProviderError;
 use agent_shim_router::{RateLimitDimension, ResilienceError, RouteError};
 
 #[derive(Debug, Error)]
-// Resilience variants (NoUpstreamSucceeded, TerminalUpstream,
-// AllBreakersOpen, RateLimited) and `from_resilience_error` are landed
-// now so HandlerError mapping is stable across plans, but the binary's
-// `pipeline.rs` doesn't construct them until P02 T6 (and AllBreakersOpen
-// / RateLimited not until P03/P04). The library lib build sees them
-// used via the `error_envelopes.rs` integration tests; the bin build
-// would otherwise warn dead_code. Drop this allow once T6 lands.
-#[allow(dead_code)]
 pub enum HandlerError {
     #[error("route error: {0}")]
     Route(#[from] RouteError),
@@ -88,7 +80,6 @@ impl HandlerError {
     /// frontend-agnostic — it doesn't know which dialect the client is
     /// speaking. The pipeline (P02 T6) supplies it from the request context
     /// so `IntoResponse` can emit the correct error envelope.
-    #[allow(dead_code)] // P02 T6 wires the call site in pipeline.rs.
     pub fn from_resilience_error(e: ResilienceError, kind: FrontendKind) -> Self {
         match e {
             ResilienceError::NoUpstreamSucceeded { tried, last_error } => {
