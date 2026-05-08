@@ -1,9 +1,9 @@
 //! Retry policy and exponential-backoff math (Plan 04 P01).
 //!
 //! `compute_backoff` is pure (deterministic given a seeded RNG) so it can be
-//! property-tested. The retry loop itself lives in `retry_with_policy`, which
-//! drives a `BackendProvider::complete()` call up to `policy.max_attempts`
-//! times within `policy.total_budget_ms`.
+//! property-tested. The retry loop itself lives in `retry_with_policy`
+//! (arrives in T4), which drives a `BackendProvider::complete()` call up to
+//! `policy.max_attempts` times within `policy.total_budget_ms`.
 
 use std::time::Duration;
 
@@ -40,7 +40,7 @@ impl From<&agent_shim_config::RetryConfig> for RetryPolicy {
 /// Output is bounded to `[base × (1 - jitter%/100), base × (1 + jitter%/100)]`
 /// where `base = initial_backoff_ms × multiplier^(attempt-1)`.
 pub fn compute_backoff<R: Rng>(attempt: u32, policy: &RetryPolicy, rng: &mut R) -> Duration {
-    debug_assert!(attempt >= 1, "attempt is 1-indexed");
+    assert!(attempt >= 1, "attempt is 1-indexed");
     let exponent = (attempt - 1) as i32;
     let base_ms = policy.initial_backoff_ms as f64 * policy.multiplier.powi(exponent);
     let jitter_factor = if policy.jitter_pct == 0.0 {
@@ -118,5 +118,24 @@ mod tests {
                 "attempt={attempt} got={got}ms expected [{lo}, {hi}]"
             );
         }
+    }
+
+    /// Pin actual jitter variation: the property test only confirms outputs
+    /// stay in `[lo, hi]`. A buggy implementation that always returned `base_ms`
+    /// (no jitter applied) would still pass the proptest. This guards against
+    /// that regression by demanding observable variation across seeds.
+    #[test]
+    fn compute_backoff_jitter_actually_varies_output() {
+        use std::collections::HashSet;
+        let policy = default_policy(); // jitter_pct = 25.0
+        let outputs: HashSet<u64> = (0..16u64)
+            .map(|s| {
+                compute_backoff(3, &policy, &mut SmallRng::seed_from_u64(s)).as_millis() as u64
+            })
+            .collect();
+        assert!(
+            outputs.len() > 1,
+            "jitter produced identical results across 16 seeds: {outputs:?}"
+        );
     }
 }

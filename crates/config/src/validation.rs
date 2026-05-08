@@ -170,8 +170,10 @@ fn validate_oai_style_upstream(
 ///    (via [`upstream_is_configured`], which honors the legacy `copilot`
 ///    virtual name).
 /// 4. Retry policy fields are sane (`max_attempts >= 1`,
-///    `total_budget_ms >= initial_backoff_ms`, `multiplier > 1.0`).
-/// 5. Breaker policy fields are sane (`failure_threshold_pct` in `1..=100`,
+///    `total_budget_ms >= initial_backoff_ms`, `multiplier > 1.0` and finite).
+/// 5. `retry.jitter_pct` is finite and within `0.0..=100.0` (negative or
+///    non-finite values would crash `rand::gen_range` on every retry).
+/// 6. Breaker policy fields are sane (`failure_threshold_pct` in `1..=100`,
 ///    `min_requests >= 1`).
 ///
 /// Returns on first failure; rerun after each fix to surface subsequent issues.
@@ -239,14 +241,27 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
                 route.retry.total_budget_ms, route.retry.initial_backoff_ms
             ));
         }
-        if route.retry.multiplier <= 1.0 {
+        if !route.retry.multiplier.is_finite() || route.retry.multiplier <= 1.0 {
             return Err(format!(
                 "route[{i}] retry.multiplier ({}) must be > 1.0 for exponential backoff",
                 route.retry.multiplier
             ));
         }
 
-        // Rule 5: breaker policy sanity.
+        // Rule 5: jitter_pct must be a finite, non-negative number <= 100.
+        // (rand::gen_range panics on inverted/empty ranges, so a negative or
+        // NaN jitter would crash the gateway on every retry attempt.)
+        if !route.retry.jitter_pct.is_finite()
+            || route.retry.jitter_pct < 0.0
+            || route.retry.jitter_pct > 100.0
+        {
+            return Err(format!(
+                "route[{i}] retry.jitter_pct ({}) must be in 0.0..=100.0 (finite, non-negative)",
+                route.retry.jitter_pct
+            ));
+        }
+
+        // Rule 6: breaker policy sanity.
         if !(1..=100).contains(&route.breaker.failure_threshold_pct) {
             return Err(format!(
                 "route[{i}] breaker.failure_threshold_pct ({}) must be in 1..=100",
@@ -747,5 +762,55 @@ mod tests {
         validate_routes(&cfg).expect("copilot virtual name should resolve");
         // And the canonical entry point agrees.
         validate(&cfg).expect("validate() should also pass");
+    }
+
+    // ── Plan 04 P01 T2 followup: jitter_pct + NaN multiplier rules ──────────
+
+    #[test]
+    fn rejects_negative_jitter_pct() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            retry:
+              jitter_pct: -25.0
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("jitter_pct"));
+    }
+
+    #[test]
+    fn rejects_jitter_pct_above_100() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            retry:
+              jitter_pct: 150.0
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("jitter_pct"));
+    }
+
+    #[test]
+    fn rejects_nan_multiplier() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            retry:
+              multiplier: .nan
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("multiplier"));
     }
 }
