@@ -145,10 +145,10 @@ fn make_app_state() -> AppState {
     // Sanity check: verify our hand-built route resolves to the stub.
     // This avoids debugging a cryptic 404 if the route table ever drifts
     // out from under the test.
-    let target = resolver
+    let chain = resolver
         .resolve(FrontendKind::AnthropicMessages, "text-only-model")
         .expect("test setup: anthropic route must resolve");
-    assert_eq!(target.provider, "text-only-stub");
+    assert_eq!(chain[0].provider, "text-only-stub");
     let _ = RoutePolicy::default(); // silence unused-import lint when policy isn't touched
 
     AppState {

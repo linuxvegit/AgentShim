@@ -95,13 +95,23 @@ pub async fn dispatch(
         alias
     };
 
-    let target = state
+    let chain = state
         .resolver
         .resolve(spec.frontend.kind(), &model_alias)
         .map_err(|e| {
             tracing::warn!(model = %model_alias, error = %e, "no route");
             HandlerError::Route(e)
         })?;
+    // Plan 02 T2 transitional shim: `ModelResolver::resolve` now returns the
+    // full fallback chain (`Vec<BackendTarget>`), but the pipeline still
+    // operates on a single target. Plan 02 T6 rewires this to consume the
+    // chain via `ResilientCaller`. The chain is non-empty by router invariant
+    // (singular routes produce 1-element vecs; array routes are validated to
+    // be non-empty by `validate_routes`).
+    let target = chain
+        .into_iter()
+        .next()
+        .expect("ModelResolver::resolve never returns an empty chain on Ok");
 
     // Look up the per-route retry policy (from `retry:` block in YAML or
     // §4.5/D12 defaults). Phase 4 P01 T5: every provider call below the

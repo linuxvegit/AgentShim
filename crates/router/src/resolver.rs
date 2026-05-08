@@ -35,43 +35,38 @@ impl ModelResolver {
         }
     }
 
-    /// Resolve the inbound `(frontend, model_alias)` to a final
-    /// [`BackendTarget`]. Looks up the static route, then upgrades
-    /// `target.model` to the canonical form discovered from the upstream if
-    /// fuzzy matching finds a hit. Logs the upgrade at info level.
+    /// Resolve the inbound `(frontend, model_alias)` to the full fallback
+    /// chain of [`BackendTarget`]s. Looks up the static route (which may
+    /// already be a multi-element fallback chain for `upstreams: [...]`
+    /// routes), then upgrades each `target.model` to the canonical form
+    /// discovered from that target's upstream if fuzzy matching finds a hit.
+    /// Logs each upgrade at info level.
     ///
-    /// Plan 02 T1 transitional shim: `Router::resolve` now returns
-    /// `Vec<BackendTarget>` (the full fallback chain). Until Plan 02 T2
-    /// refactors this method to return the chain, we collapse to the head
-    /// element so the gateway pipeline keeps building. This is safe because
-    /// the chain is non-empty by construction (singular routes produce
+    /// The chain is guaranteed non-empty on `Ok` — singular routes produce
     /// 1-element vecs; array routes are validated to be non-empty by
-    /// `validate_routes`).
+    /// `validate_routes`. Fuzzy upgrade is per-element because each chain
+    /// element can target a different provider whose discovered model list
+    /// is independent.
     pub fn resolve(
         &self,
         frontend: FrontendKind,
         model_alias: &str,
-    ) -> Result<BackendTarget, RouteError> {
-        let chain = self.static_router.resolve(frontend, model_alias)?;
-        // Chain is non-empty by router invariant; pick the head until T2.
-        let mut target = chain
-            .into_iter()
-            .next()
-            .expect("StaticRouter::resolve never returns an empty chain on Ok");
-
-        if let Some(canonical) = self.model_index.resolve(&target.provider, &target.model) {
-            if canonical != target.model {
-                tracing::info!(
-                    requested = %target.model,
-                    resolved = %canonical,
-                    provider = %target.provider,
-                    "fuzzy model match"
-                );
-                target.model = canonical.to_string();
+    ) -> Result<Vec<BackendTarget>, RouteError> {
+        let mut chain = self.static_router.resolve(frontend, model_alias)?;
+        for target in chain.iter_mut() {
+            if let Some(canonical) = self.model_index.resolve(&target.provider, &target.model) {
+                if canonical != target.model {
+                    tracing::info!(
+                        requested = %target.model,
+                        resolved = %canonical,
+                        provider = %target.provider,
+                        "fuzzy model match"
+                    );
+                    target.model = canonical.to_string();
+                }
             }
         }
-
-        Ok(target)
+        Ok(chain)
     }
 
     /// Look up the per-route retry policy. Delegates to the static router.
@@ -133,9 +128,11 @@ mod tests {
     fn static_route_only_passes_target_through() {
         let cfg = cfg_with_route("openai_chat", "gpt-4o", "openai", "gpt-4o-2024-11-20");
         let resolver = resolver_with(cfg, "openai", &[]);
-        let target = resolver
+        let chain = resolver
             .resolve(FrontendKind::OpenAiChat, "gpt-4o")
             .unwrap();
+        assert_eq!(chain.len(), 1);
+        let target = &chain[0];
         assert_eq!(target.provider, "openai");
         assert_eq!(target.model, "gpt-4o-2024-11-20");
     }
@@ -149,10 +146,11 @@ mod tests {
             "claude-sonnet-4-5",
         );
         let resolver = resolver_with(cfg, "copilot", &["claude-sonnet-4-5-20250514"]);
-        let target = resolver
+        let chain = resolver
             .resolve(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
             .unwrap();
-        assert_eq!(target.model, "claude-sonnet-4-5-20250514");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].model, "claude-sonnet-4-5-20250514");
     }
 
     #[test]
@@ -160,10 +158,11 @@ mod tests {
         let cfg = cfg_with_route("openai_chat", "gpt-4o", "openai", "gpt-4o");
         // ModelIndex has data only for a different provider — no upgrade.
         let resolver = resolver_with(cfg, "copilot", &["gpt-4o-2024-11-20"]);
-        let target = resolver
+        let chain = resolver
             .resolve(FrontendKind::OpenAiChat, "gpt-4o")
             .unwrap();
-        assert_eq!(target.model, "gpt-4o");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].model, "gpt-4o");
     }
 
     #[test]
@@ -174,5 +173,64 @@ mod tests {
             .resolve(FrontendKind::OpenAiChat, "no-such-model")
             .unwrap_err();
         assert!(matches!(err, RouteError::NoRoute { .. }));
+    }
+
+    #[test]
+    fn fuzzy_upgrade_applies_to_each_chain_element() {
+        // Multi-upstream route: each element targets a different provider, and
+        // each provider has its own canonical model name. Fuzzy upgrade must
+        // run per-element so chain[0] resolves against `openai`'s discovered
+        // list and chain[1] resolves against `copilot`'s.
+        use agent_shim_config::UpstreamRef;
+        let cfg = GatewayConfig {
+            server: Default::default(),
+            logging: Default::default(),
+            upstreams: Default::default(),
+            routes: vec![RouteEntry {
+                frontend: "openai_chat".into(),
+                model: "gpt-4o".into(),
+                upstream: None,
+                upstream_model: None,
+                upstreams: vec![
+                    UpstreamRef {
+                        name: "openai".into(),
+                        model: "gpt-4o".into(),
+                    },
+                    UpstreamRef {
+                        name: "copilot".into(),
+                        model: "gpt-4o".into(),
+                    },
+                ],
+                reasoning_effort: None,
+                anthropic_beta: None,
+                retry: RetryConfig::default(),
+                breaker: BreakerConfig::default(),
+            }],
+            copilot: None,
+        };
+        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+
+        let mut map = HashMap::new();
+        map.insert("openai".to_string(), {
+            let mut s = BTreeSet::new();
+            s.insert("gpt-4o-2024-11-20".to_string());
+            s
+        });
+        map.insert("copilot".to_string(), {
+            let mut s = BTreeSet::new();
+            s.insert("gpt-4o-2024-08-06".to_string());
+            s
+        });
+        let index = Arc::new(ModelIndex::new(map));
+        let resolver = ModelResolver::new(router, index);
+
+        let chain = resolver
+            .resolve(FrontendKind::OpenAiChat, "gpt-4o")
+            .unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider, "openai");
+        assert_eq!(chain[0].model, "gpt-4o-2024-11-20"); // openai upgrade
+        assert_eq!(chain[1].provider, "copilot");
+        assert_eq!(chain[1].model, "gpt-4o-2024-08-06"); // copilot upgrade
     }
 }

@@ -136,10 +136,10 @@ fn make_app_state() -> AppState {
 
     // Sanity check: route lookup hits the stub. Avoids a cryptic 404 if
     // the route table ever drifts out from under the test.
-    let target = resolver
+    let chain = resolver
         .resolve(FrontendKind::OpenAiResponses, "text-only-model")
         .expect("test setup: openai_responses route must resolve");
-    assert_eq!(target.provider, "text-only-stub");
+    assert_eq!(chain[0].provider, "text-only-stub");
     let _ = RoutePolicy::default(); // silence unused-import lint when policy isn't touched
 
     AppState {
