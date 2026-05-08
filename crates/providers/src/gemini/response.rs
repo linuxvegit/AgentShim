@@ -110,12 +110,15 @@ pub(crate) fn parse_unary(
     let canonical_ratings = wire_to_canonical_safety_ratings(&safety_ratings);
     let content = attach_extensions(content_blocks, safety_ratings, citation_metadata);
 
-    let usage = resp.usage_metadata.map(usage_metadata_to_usage).map(|mut u| {
-        if !canonical_ratings.is_empty() {
-            u.safety_ratings = Some(canonical_ratings.clone());
-        }
-        u
-    });
+    let usage = resp
+        .usage_metadata
+        .map(usage_metadata_to_usage)
+        .map(|mut u| {
+            if !canonical_ratings.is_empty() {
+                u.safety_ratings = Some(canonical_ratings.clone());
+            }
+            u
+        });
     // If the candidate carried safety ratings but the response had no
     // usage_metadata (e.g. SAFETY block on a 0-token candidate), surface a
     // minimal Usage so the canonical field still travels.
