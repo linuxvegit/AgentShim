@@ -14,6 +14,7 @@ agent-shim-config = { path = "../config" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
 
 [dev-dependencies]
 proptest = { workspace = true }

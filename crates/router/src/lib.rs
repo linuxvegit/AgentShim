@@ -5,6 +5,7 @@ pub mod fallback;
 pub mod model_index;
 pub mod rate_limit;
 pub mod resolver;
+pub mod retry;
 pub mod static_routes;
 
 use thiserror::Error;
@@ -25,4 +26,5 @@ pub trait Router: Send + Sync {
 }
 
 pub use resolver::ModelResolver;
+pub use retry::{compute_backoff, RetryPolicy};
 pub use static_routes::StaticRouter;

@@ -156,6 +156,7 @@ dependencies = [
  "agent-shim-config",
  "agent-shim-core",
  "proptest",
+ "rand 0.8.6",
  "serde",
  "thiserror 1.0.69",
  "tracing",
