@@ -25,6 +25,7 @@ pub trait Router: Send + Sync {
     fn resolve(&self, frontend: FrontendKind, model: &str) -> Result<BackendTarget, RouteError>;
 }
 
+pub use fallback::{fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility};
 pub use resolver::ModelResolver;
 pub use retry::{compute_backoff, RetryPolicy};
 pub use static_routes::StaticRouter;
