@@ -47,3 +47,22 @@ can emit an appropriate error to the client.
 
 The provider does **not** retry automatically. Retry logic belongs in the
 caller or at the infrastructure layer (e.g. a load balancer).
+
+### Resilience behavior (v0.4+)
+
+The Phase 4 retry/fallback layer treats this provider's errors as
+follows:
+
+| Error pattern | Default eligibility |
+|---|---|
+| Connect/DNS/TLS failures (`Network`) | **Eligible** (retry / fall back) |
+| HTTP 5xx (`Upstream{status>=500}`) | **Eligible** |
+| HTTP 429 (`Upstream{status=429}`) | **Eligible** |
+| HTTP 401/403/422 etc. | **Terminal** (return to client) |
+| Decode errors (malformed bytes) | **Terminal** |
+
+Provider-specific notes:
+
+* OpenAI-compatible upstreams (OpenAI, DeepSeek, Together, Fireworks,
+  etc.) typically use HTTP 503 for overload and HTTP 429 for
+  rate-limit. Both are eligible by default.

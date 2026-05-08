@@ -211,3 +211,23 @@ error.
 
 The provider does **not** retry automatically. Retry logic belongs in
 the caller or at the infrastructure layer.
+
+### Resilience behavior (v0.4+)
+
+The Phase 4 retry/fallback layer treats this provider's errors as
+follows:
+
+| Error pattern | Default eligibility |
+|---|---|
+| Connect/DNS/TLS failures (`Network`) | **Eligible** (retry / fall back) |
+| HTTP 5xx (`Upstream{status>=500}`) | **Eligible** |
+| HTTP 429 (`Upstream{status=429}`) | **Eligible** |
+| HTTP 401/403/422 etc. | **Terminal** (return to client) |
+| Decode errors (malformed bytes) | **Terminal** |
+
+Provider-specific notes:
+
+* Anthropic emits HTTP **529 (overloaded)** during sustained load. 529
+  is in the 5xx range so the default classifier treats it as eligible —
+  fallback chains will move to the next upstream. Operators rarely need
+  to override.

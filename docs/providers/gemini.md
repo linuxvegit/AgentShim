@@ -329,3 +329,23 @@ the upstream status.
 
 The provider does **not** retry automatically. Retry logic belongs in
 the caller or at the infrastructure layer.
+
+### Resilience behavior (v0.4+)
+
+The Phase 4 retry/fallback layer treats this provider's errors as
+follows:
+
+| Error pattern | Default eligibility |
+|---|---|
+| Connect/DNS/TLS failures (`Network`) | **Eligible** (retry / fall back) |
+| HTTP 5xx (`Upstream{status>=500}`) | **Eligible** |
+| HTTP 429 (`Upstream{status=429}`) | **Eligible** |
+| HTTP 401/403/422 etc. | **Terminal** (return to client) |
+| Decode errors (malformed bytes) | **Terminal** |
+
+Provider-specific notes:
+
+* AI Studio occasionally returns HTTP 400 with a `SAFETY` block reason
+  on prompts that fail Gemini's safety filter. These are **terminal**
+  under the default classifier — the request itself violated policy,
+  and the next upstream would likely reject it the same way.

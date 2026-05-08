@@ -230,3 +230,15 @@ the upstream status.
 
 The provider does **not** retry automatically. Retry logic belongs in
 the caller or at the infrastructure layer.
+
+### Resilience behavior (v0.4+)
+
+DeepSeek uses the OpenAI-compatible wire shape; see "Resilience
+behavior" in [`openai-compatible.md`](openai-compatible.md) for the
+full default eligibility table.
+
+Provider-specific notes:
+
+* DeepSeek is `vision: false`, so image-bearing requests are rejected
+  by the capability gate (v0.3) — these errors are terminal (no
+  fallback).
