@@ -600,6 +600,7 @@ fn usage_metadata_to_usage(meta: UsageMetadata) -> Usage {
         cache_read_input_tokens: None,
         estimated: false,
         provider_raw: None,
+        safety_ratings: None,
     }
 }
 

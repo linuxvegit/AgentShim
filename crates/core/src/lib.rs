@@ -11,6 +11,7 @@ pub mod message;
 pub mod policy;
 pub mod request;
 pub mod response;
+pub mod safety;
 pub mod stream;
 pub mod target;
 pub mod tool;
@@ -29,6 +30,7 @@ pub use request::{
     ResponseFormat,
 };
 pub use response::CanonicalResponse;
+pub use safety::{SafetyCategory, SafetyLevel, SafetyRating};
 pub use stream::*;
 pub use target::{BackendTarget, FrontendInfo, FrontendKind, FrontendModel};
 pub use tool::*;
