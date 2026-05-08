@@ -15,7 +15,10 @@ agent-shim-providers = { path = "../providers" }
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+tokio = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }

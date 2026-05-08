@@ -156,10 +156,13 @@ dependencies = [
  "agent-shim-config",
  "agent-shim-core",
  "agent-shim-providers",
+ "async-trait",
+ "futures",
  "proptest",
  "rand 0.8.6",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 
