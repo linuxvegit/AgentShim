@@ -34,15 +34,29 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         if !VALID_FRONTENDS.contains(&route.frontend.as_str()) {
             return Err(ValidationError::UnknownFrontend(route.frontend.clone()));
         }
-        if !cfg.upstreams.contains_key(&route.upstream) {
-            // allow "copilot" as a special upstream name when copilot config present
-            let is_copilot = route.upstream == "copilot"
-                && cfg
-                    .upstreams
-                    .values()
-                    .any(|u| matches!(u, UpstreamConfig::GithubCopilot));
-            if !is_copilot {
-                return Err(ValidationError::UnknownUpstream(route.upstream.clone()));
+        // Collect every upstream name the route references, regardless of
+        // whether it uses the singular or array shape. Validation of "exactly
+        // one shape" lives in `validate_routes` below.
+        let referenced: Vec<String> = if !route.upstreams.is_empty() {
+            route.upstreams.iter().map(|u| u.name.clone()).collect()
+        } else if let Some(name) = route.upstream.as_ref() {
+            vec![name.clone()]
+        } else {
+            // No upstream configured at all — surfaced as a clearer error by
+            // `validate_routes`. Skip the unknown-upstream check here.
+            vec![]
+        };
+        for name in &referenced {
+            if !cfg.upstreams.contains_key(name) {
+                // allow "copilot" as a special upstream name when copilot config present
+                let is_copilot = name == "copilot"
+                    && cfg
+                        .upstreams
+                        .values()
+                        .any(|u| matches!(u, UpstreamConfig::GithubCopilot));
+                if !is_copilot {
+                    return Err(ValidationError::UnknownUpstream(name.clone()));
+                }
             }
         }
         let key = (route.frontend.clone(), route.model.clone());
@@ -124,6 +138,94 @@ fn validate_oai_style_upstream(
     Ok(())
 }
 
+/// Phase 4 (Plan 04 P01) per-route validation. Enforces:
+/// 1. Each route uses **exactly one** upstream shape (singular OR array).
+/// 2. Singular form requires both `upstream` and `upstream_model`.
+/// 3. Every referenced upstream name resolves to a configured upstream.
+/// 4. Retry policy fields are sane (`max_attempts >= 1`,
+///    `total_budget_ms >= initial_backoff_ms`, `multiplier > 1.0`).
+/// 5. Breaker policy fields are sane (`failure_threshold_pct` in `1..=100`,
+///    `min_requests >= 1`).
+///
+/// Returns a human-readable `String` so config-load callers can surface the
+/// message verbatim. The `validate()` entry point above returns
+/// `ValidationError` instead; both can be called.
+pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
+    for (i, route) in cfg.routes.iter().enumerate() {
+        let has_singular = route.upstream.is_some() || route.upstream_model.is_some();
+        let has_array = !route.upstreams.is_empty();
+
+        // Rule 1: exactly one shape per route.
+        match (has_singular, has_array) {
+            (true, true) => {
+                return Err(format!(
+                    "route[{i}] '{}/{}' specifies both `upstream`/`upstream_model` and `upstreams`; pick one form",
+                    route.frontend, route.model
+                ));
+            }
+            (false, false) => {
+                return Err(format!(
+                    "route[{i}] '{}/{}' has no upstream configured; provide either `upstream`+`upstream_model` or `upstreams`",
+                    route.frontend, route.model
+                ));
+            }
+            (true, false) => {
+                if route.upstream.is_none() || route.upstream_model.is_none() {
+                    return Err(format!(
+                        "route[{i}] '{}/{}' singular form requires both `upstream` and `upstream_model`",
+                        route.frontend, route.model
+                    ));
+                }
+            }
+            (false, true) => {} // valid array form
+        }
+
+        // Rule 2: every referenced upstream name must be configured.
+        let upstream_names: Vec<&str> = if has_array {
+            route.upstreams.iter().map(|u| u.name.as_str()).collect()
+        } else {
+            vec![route.upstream.as_deref().unwrap()]
+        };
+        for name in upstream_names {
+            if !cfg.upstreams.contains_key(name) {
+                return Err(format!(
+                    "route[{i}] '{}/{}' references unknown upstream '{}'",
+                    route.frontend, route.model, name
+                ));
+            }
+        }
+
+        // Rule 3: retry policy sanity.
+        if route.retry.max_attempts < 1 {
+            return Err(format!("route[{i}] retry.max_attempts must be >= 1"));
+        }
+        if route.retry.total_budget_ms < route.retry.initial_backoff_ms {
+            return Err(format!(
+                "route[{i}] retry.total_budget_ms ({}) must be >= initial_backoff_ms ({})",
+                route.retry.total_budget_ms, route.retry.initial_backoff_ms
+            ));
+        }
+        if route.retry.multiplier <= 1.0 {
+            return Err(format!(
+                "route[{i}] retry.multiplier ({}) must be > 1.0 for exponential backoff",
+                route.retry.multiplier
+            ));
+        }
+
+        // Rule 4: breaker policy sanity.
+        if !(1..=100).contains(&route.breaker.failure_threshold_pct) {
+            return Err(format!(
+                "route[{i}] breaker.failure_threshold_pct ({}) must be in 1..=100",
+                route.breaker.failure_threshold_pct
+            ));
+        }
+        if route.breaker.min_requests < 1 {
+            return Err(format!("route[{i}] breaker.min_requests must be >= 1"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,10 +262,13 @@ mod tests {
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
             model: "gpt-4".to_string(),
-            upstream: "nonexistent".to_string(),
-            upstream_model: "gpt-4".to_string(),
+            upstream: Some("nonexistent".to_string()),
+            upstream_model: Some("gpt-4".to_string()),
+            upstreams: vec![],
             reasoning_effort: None,
             anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
         });
         assert!(matches!(
             validate(&cfg),
@@ -186,18 +291,24 @@ mod tests {
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
             model: "gpt-4".to_string(),
-            upstream: "upstream1".to_string(),
-            upstream_model: "gpt-4".to_string(),
+            upstream: Some("upstream1".to_string()),
+            upstream_model: Some("gpt-4".to_string()),
+            upstreams: vec![],
             reasoning_effort: None,
             anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
         });
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
             model: "gpt-4".to_string(),
-            upstream: "upstream1".to_string(),
-            upstream_model: "gpt-4".to_string(),
+            upstream: Some("upstream1".to_string()),
+            upstream_model: Some("gpt-4".to_string()),
+            upstreams: vec![],
             reasoning_effort: None,
             anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
         });
         assert!(matches!(
             validate(&cfg),
@@ -220,10 +331,13 @@ mod tests {
         cfg.routes.push(RouteEntry {
             frontend: "unknown_protocol".to_string(),
             model: "gpt-4".to_string(),
-            upstream: "upstream1".to_string(),
-            upstream_model: "gpt-4".to_string(),
+            upstream: Some("upstream1".to_string()),
+            upstream_model: Some("gpt-4".to_string()),
+            upstreams: vec![],
             reasoning_effort: None,
             anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
         });
         assert!(matches!(
             validate(&cfg),
@@ -457,5 +571,98 @@ mod tests {
             }
             other => panic!("expected InvalidUpstream, got {other:?}"),
         }
+    }
+
+    // ── Plan 04 P01 T1: validate_routes coverage ────────────────────────────
+
+    /// Build a `GatewayConfig` with a single configured upstream `openai` and
+    /// one route parsed from the supplied YAML snippet. The helper backs the
+    /// 5 validate_routes test cases below.
+    fn make_cfg_with_route_yaml(route_yaml: &str) -> GatewayConfig {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "openai".to_string(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+                base_url: "https://api.openai.com".to_string(),
+                api_key: Secret::new("sk-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+            }),
+        );
+        let route: RouteEntry = serde_yaml::from_str(route_yaml).expect("route YAML parses");
+        cfg.routes.push(route);
+        cfg
+    }
+
+    #[test]
+    fn rejects_route_with_both_shapes() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            upstreams:
+              - {name: copilot, model: gpt-4o}
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("specifies both"));
+    }
+
+    #[test]
+    fn rejects_route_with_no_upstream() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("no upstream configured"));
+    }
+
+    #[test]
+    fn rejects_unknown_upstream_reference() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstreams:
+              - {name: nonexistent, model: gpt-4o}
+        "#,
+        );
+        // make_cfg_with_route_yaml configures only "openai" in cfg.upstreams.
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("nonexistent"));
+    }
+
+    #[test]
+    fn accepts_well_formed_array_route() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstreams:
+              - {name: openai, model: gpt-4o-2024-11-20}
+        "#,
+        );
+        validate_routes(&cfg).expect("valid config");
+    }
+
+    #[test]
+    fn rejects_multiplier_le_one() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            retry:
+              multiplier: 1.0
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("multiplier"));
     }
 }
