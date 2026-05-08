@@ -9,6 +9,9 @@ use agent_shim_core::{
 };
 use agent_shim_providers::anthropic::AnthropicProvider;
 use agent_shim_providers::gemini::GeminiProvider;
+use agent_shim_providers::github_copilot::credential_store::StoredCredentials;
+use agent_shim_providers::github_copilot::CopilotProvider;
+use agent_shim_providers::openai_compatible::OpenAiCompatibleProvider;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 
@@ -97,6 +100,59 @@ pub fn make_gemini_target() -> BackendTarget {
     BackendTarget {
         provider: "gemini".to_string(),
         model: "gemini-2.0-flash".to_string(),
+        policy: Default::default(),
+    }
+}
+
+/// Build an [`OpenAiCompatibleProvider`] pointed at the given mockito
+/// base URL, with the test API key, no default headers, and a 30s
+/// timeout.
+///
+/// Used by Plan 04 T4 cross-protocol vision cells (and future
+/// Responses-flavoured cells) to drive the OAI-compat upstream from a
+/// `frontend.kind = OpenAiResponses` request, which routes through the
+/// canonical Chat Completions encoder.
+pub fn make_oai_compat_provider(base_url: String) -> OpenAiCompatibleProvider {
+    OpenAiCompatibleProvider::new("openai", base_url, "test-key", BTreeMap::new(), 30)
+        .expect("OpenAiCompatibleProvider::new is infallible for these inputs")
+}
+
+/// Build a [`BackendTarget`] pointing at `gpt-4o` on the `openai`
+/// provider.
+pub fn make_oai_compat_target() -> BackendTarget {
+    BackendTarget {
+        provider: "openai".to_string(),
+        model: "gpt-4o".to_string(),
+        policy: Default::default(),
+    }
+}
+
+/// Build a [`CopilotProvider`] pointed at the given mockito base URL.
+///
+/// Copilot's `complete()` calls the token manager up-front, so tests
+/// using this helper must also stand up a mockito mock for
+/// `GET /copilot_internal/v2/token` that returns a token whose
+/// `endpoints.api` points back at the SAME mockito server (so
+/// downstream Chat / Responses calls land on the same mock).
+///
+/// The provider is constructed with `spawn_with_creds`, which preloads
+/// dummy GitHub OAuth credentials and bypasses on-disk credential
+/// loading entirely — only the upstream HTTP exchange is exercised.
+pub fn make_copilot_provider(base_url: String) -> CopilotProvider {
+    let creds = StoredCredentials {
+        github_oauth_token: "gho_test".to_string(),
+        created_at_unix: 0,
+    };
+    CopilotProvider::spawn_with_creds(creds, base_url)
+        .expect("CopilotProvider::spawn_with_creds is infallible for these inputs")
+}
+
+/// Build a [`BackendTarget`] pointing at `gpt-4o` on the
+/// `github_copilot` provider.
+pub fn make_copilot_target() -> BackendTarget {
+    BackendTarget {
+        provider: "github_copilot".to_string(),
+        model: "gpt-4o".to_string(),
         policy: Default::default(),
     }
 }
