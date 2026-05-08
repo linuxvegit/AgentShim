@@ -116,6 +116,13 @@ and is rendered into the inbound frontend's error envelope shape:
 
 Both with HTTP 400. See `crates/gateway/src/pipeline.rs::check_capabilities`.
 
+In v0.3, the OpenAI Responses frontend joined the capability matrix —
+Responses cells are now active for OAI-compat, Copilot, Anthropic, and
+Gemini, and the DeepSeek negative cell goes through the same gate as the
+existing Anthropic Messages and OpenAI Chat cells. See
+[ADR-0003](adr/0003-promote-safety-ratings.md) and the Phase 3 plan files
+under `docs/superpowers/plans/`.
+
 ## Extension namespaces
 
 Per ADR-0002 (frozen-core), the canonical model never grows new variants for
@@ -127,11 +134,21 @@ content block's `extensions` map under a per-provider prefix:
 | `cache_control` | Anthropic | `cache_control` |
 | `cache_creation_input_tokens` | Anthropic | (Usage struct field) |
 | `prompt_cache_hit_tokens` | DeepSeek | (Usage struct field) |
-| `safetyRatings` | Gemini | `gemini.safety_ratings` |
+| `safetyRatings` | Gemini | `gemini.safety_ratings` (deprecated; see below) |
 | `citationMetadata` | Gemini | `gemini.citation_metadata` |
 
 When adding a new provider, namespace any new extension keys with
 `<provider_name>.` so they don't collide.
+
+**v0.3 typed-field exception.** v0.3 promoted exactly one extension key
+to a typed canonical field — `Usage.safety_ratings: Option<Vec<SafetyRating>>`,
+the first new core field since v0.1, per
+[ADR-0003](adr/0003-promote-safety-ratings.md). The Gemini provider
+double-writes both the typed field and the legacy
+`extensions["gemini.safety_ratings"]` key for v0.3.0; the extension write
+is removed in v0.3.1 (see the `// REMOVE in v0.3.1` markers in
+`crates/providers/src/gemini/response.rs`). Plan files for v0.3.x and
+v0.4 carry `core changes: NONE` again — the freeze remains the default.
 
 ## The hybrid Anthropic path
 

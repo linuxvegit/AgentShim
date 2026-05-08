@@ -88,6 +88,44 @@ This keeps the cross-protocol seam stable: every frontend can decode
 every provider's canonical events without knowing which provider
 emitted them.
 
+## Promoting an extension key to a typed canonical field
+
+The frozen-core policy is permissive on purpose: it lets a provider
+ship a new field on day one without forcing every other provider, every
+frontend, and every consumer to rev. The expected lifecycle is:
+
+1. **Land as an extension.** New provider-specific data goes onto
+   `extensions["<provider>.<key>"]` with whatever JSON shape the wire
+   uses. ADR-0002 codifies this as the default.
+2. **Wait for cross-provider read patterns.** As long as exactly one
+   provider writes the key and exactly one frontend reads it, it stays
+   an extension forever. Promotion is justified only when multiple
+   frontends (or future providers) end up reading the same key with
+   the same shape.
+3. **Promote via ADR.** When the read pattern crystallizes, write a
+   numbered ADR (next number after the most recent one). ADR-0003 is
+   the canonical template — see
+   [`docs/adr/0003-promote-safety-ratings.md`](adr/0003-promote-safety-ratings.md).
+   The ADR records the typed shape, why open enums (carrying
+   `Other(String)`) over closed enums where appropriate, and what
+   pieces of the legacy wire shape do NOT make the cut.
+4. **Run a one-minor double-write window.** The minor that introduces
+   the typed field also keeps writing the legacy extension key, with
+   `// REMOVE in v<NEXT>` markers at the double-write call sites. The
+   next minor drops the extension write. Consumers get exactly one
+   minor to migrate; the migration is a one-line change (replace
+   `extensions.get("foo.bar")` with `usage.bar.as_ref()`).
+5. **Confirm `core changes: NONE` returns.** The promotion is a
+   one-time exception to the freeze. Plan files after the promotion
+   should again declare `core changes: NONE` — the canonical types
+   stay closed against per-provider growth.
+
+The ADR-0002 → ADR-0003 sequence (`gemini.safety_ratings` →
+`Usage.safety_ratings`) is the worked example. Future promotions
+should follow the same shape: ADR first, typed shape with open enums
+where the wire is open, double-write window, removal in the next
+minor.
+
 ## Test Commands
 
 ```bash

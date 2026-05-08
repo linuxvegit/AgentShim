@@ -1,7 +1,8 @@
 use agent_shim_core::{
-    content::{ContentBlock, ReasoningBlock, UnsupportedBlock},
+    content::{ContentBlock, ImageBlock, ReasoningBlock, UnsupportedBlock},
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
+    media::BinarySource,
     message::{Message, MessageRole, SystemInstruction, SystemSource},
     request::{
         CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
@@ -9,6 +10,8 @@ use agent_shim_core::{
     target::{FrontendInfo, FrontendKind, FrontendModel},
     tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use serde_json::Value;
 
 use super::wire::{
@@ -16,6 +19,39 @@ use super::wire::{
     InputMessageContent, ReasoningContentPart, ReasoningSummaryPart, ResponsesRequest,
 };
 use crate::FrontendError;
+
+/// Decode an OpenAI Responses `input_image.image_url` string into a canonical
+/// [`BinarySource`].
+///
+/// Mirrors the OpenAI Chat decoder's `image_url_to_binary_source`. The
+/// Responses wire shape differs from Chat — `image_url` is a bare string
+/// here, not the `{ "url": "..." }` object Chat uses — but the string
+/// payload itself follows the same rules:
+///
+///   * `data:<media_type>;base64,<payload>` → [`BinarySource::Base64`]
+///   * `http://...` / `https://...`         → [`BinarySource::Url`]
+///   * anything else                        → `None` (caller wraps as
+///     `Unsupported` so the upstream's own validation can reject it)
+fn image_url_to_binary_source(url: &str) -> Option<BinarySource> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (header, payload) = rest.split_once(',')?;
+        let (media_type, encoding) = header.split_once(';').unwrap_or((header, ""));
+        if encoding != "base64" {
+            return None;
+        }
+        let bytes = STANDARD.decode(payload).ok()?;
+        return Some(BinarySource::Base64 {
+            media_type: media_type.to_string(),
+            data: Bytes::from(bytes),
+        });
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(BinarySource::Url {
+            url: url.to_string(),
+        });
+    }
+    None
+}
 
 pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let req: ResponsesRequest =
@@ -303,13 +339,25 @@ fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBl
             .map(|p| match p {
                 InputContentPart::InputText { text } => ContentBlock::text(text),
                 InputContentPart::InputImage { image_url } => {
-                    ContentBlock::Unsupported(UnsupportedBlock {
-                        origin: "openai_responses".into(),
-                        raw: serde_json::json!({
-                            "type": "input_image",
-                            "image_url": image_url
+                    // Plan 04 T4: input_image parts must surface as canonical
+                    // `ContentBlock::Image` so providers' outbound encoders
+                    // can render them in their native wire shapes (Anthropic
+                    // `image`, Gemini `fileData`/`inlineData`, OAI-compat
+                    // `image_url`). Wrapping as `Unsupported` would silently
+                    // drop the image at the provider boundary.
+                    match image_url_to_binary_source(&image_url) {
+                        Some(source) => ContentBlock::Image(ImageBlock {
+                            source,
+                            extensions: ExtensionMap::new(),
                         }),
-                    })
+                        None => ContentBlock::Unsupported(UnsupportedBlock {
+                            origin: "openai_responses".into(),
+                            raw: serde_json::json!({
+                                "type": "input_image",
+                                "image_url": image_url
+                            }),
+                        }),
+                    }
                 }
             })
             .collect(),
@@ -557,6 +605,84 @@ mod tests {
         match &req.messages[0].content[1] {
             ContentBlock::Reasoning(r) => assert_eq!(r.text, "sum-A/sum-B"),
             other => panic!("expected Reasoning block, got {other:?}"),
+        }
+    }
+
+    // ── input_image parts (Plan 04 T4) ─────────────────────────────────
+
+    #[test]
+    fn decode_input_image_with_https_yields_canonical_url_image_block() {
+        // Plan 04 T4: the Responses decoder previously mapped every
+        // input_image to ContentBlock::Unsupported, which silently dropped
+        // the image at the provider boundary. The fix mirrors the OpenAI
+        // Chat decoder — https URLs surface as `BinarySource::Url`.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[{
+                "role":"user",
+                "content":[
+                    {"type":"input_text","text":"describe"},
+                    {"type":"input_image","image_url":"https://example.com/cat.png"}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        let blocks = &req.messages[0].content;
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Url { url } => assert_eq!(url, "https://example.com/cat.png"),
+                other => panic!("expected Url, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_input_image_with_data_uri_yields_canonical_base64_image_block() {
+        // Bytes b"\x89PNG\r\n" base64-encode to "iVBORw0K". Verify the data
+        // URI parser handles `data:<mime>;base64,<payload>` correctly.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[{
+                "role":"user",
+                "content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,iVBORw0K"}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(&data[..4], b"\x89PNG");
+                }
+                other => panic!("expected Base64, got {other:?}"),
+            },
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_input_image_with_unrecognised_scheme_falls_back_to_unsupported() {
+        // Schemes other than http(s) and base64 data URIs cannot be safely
+        // turned into a canonical `BinarySource`; fall back to Unsupported
+        // so the upstream's validation surfaces the real error rather than
+        // the gateway silently fabricating a URL.
+        let body = br#"{
+            "model":"gpt-4o",
+            "input":[{
+                "role":"user",
+                "content":[
+                    {"type":"input_image","image_url":"file:///tmp/cat.png"}
+                ]
+            }]
+        }"#;
+        let req = decode(body).unwrap();
+        match &req.messages[0].content[0] {
+            ContentBlock::Unsupported(u) => assert_eq!(u.origin, "openai_responses"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 }

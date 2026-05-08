@@ -61,6 +61,7 @@ pub(crate) fn map_usage(raw: &Value) -> Usage {
         reasoning_tokens: None,
         estimated: false,
         provider_raw: Some(raw.clone()),
+        safety_ratings: None,
     }
 }
 

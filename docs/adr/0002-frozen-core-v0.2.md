@@ -6,7 +6,7 @@ Phase 2 (v0.2) ships **zero changes** to `agent-shim-core`: no new fields, no ne
 
 We rejected "promote-on-second-use" because predicting the second user is itself a guess. We rejected "pre-canonical-additions" (e.g. typed `gemini_safety_ratings`) because adding fields preemptively for single-provider features is YAGNI and locks the canonical model around v0.2's specific provider mix.
 
-The single documented exception: `extensions["gemini.safety_ratings"]` is a **first-class behavior** — `docs/providers/gemini.md` describes it as a stable contract, not a debug field. Storage stays untyped in v0.2; v0.3 promotes to a typed field once we have empirical cross-provider read patterns.
+The single documented exception: `extensions["gemini.safety_ratings"]` is a **first-class behavior** — `docs/providers/gemini.md` describes it as a stable contract, not a debug field. Storage stays untyped in v0.2; v0.3 promotes to a typed field once we have empirical cross-provider read patterns. **(Superseded for `safety_ratings` by ADR-0003 — promotion landed in v0.3.0.)**
 
 ## Consequences
 

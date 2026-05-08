@@ -67,8 +67,8 @@
 use agent_shim_core::{
     content::{ImageBlock, ReasoningBlock, TextBlock},
     BinarySource, CanonicalResponse, CanonicalStream, ContentBlock, ContentBlockKind, ExtensionMap,
-    MessageRole, ResponseId, StopReason, StreamError, StreamEvent, ToolCallArguments,
-    ToolCallBlock, ToolCallId, Usage,
+    MessageRole, ResponseId, SafetyCategory, SafetyLevel, SafetyRating, StopReason, StreamError,
+    StreamEvent, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -101,13 +101,35 @@ pub(crate) fn parse_unary(
 
     let stop_reason = map_finish_reason(finish_reason.as_deref(), has_tool_call);
 
-    // Hoist provider-specific bits into the assistant block extensions when
-    // there's at least one block to attach them to. If there are zero blocks
-    // (e.g. blocked prompt), we drop them — the canonical response carries
-    // no extension surface.
+    // Convert wire safety ratings to canonical typed form for the new
+    // `Usage.safety_ratings` field. We then call `attach_extensions` which
+    // ALSO writes the wire form into `extensions["gemini.safety_ratings"]`
+    // on the first content block — that's the legacy site flagged for
+    // removal in v0.3.1 (see comment inside `attach_extensions` and
+    // ADR-0003).
+    let canonical_ratings = wire_to_canonical_safety_ratings(&safety_ratings);
     let content = attach_extensions(content_blocks, safety_ratings, citation_metadata);
 
-    let usage = resp.usage_metadata.map(usage_metadata_to_usage);
+    let usage = resp
+        .usage_metadata
+        .map(usage_metadata_to_usage)
+        .map(|mut u| {
+            if !canonical_ratings.is_empty() {
+                u.safety_ratings = Some(canonical_ratings.clone());
+            }
+            u
+        });
+    // If the candidate carried safety ratings but the response had no
+    // usage_metadata (e.g. SAFETY block on a 0-token candidate), surface a
+    // minimal Usage so the canonical field still travels.
+    let usage = match usage {
+        Some(u) => Some(u),
+        None if !canonical_ratings.is_empty() => Some(Usage {
+            safety_ratings: Some(canonical_ratings),
+            ..Usage::default()
+        }),
+        None => None,
+    };
 
     CanonicalResponse {
         id: ResponseId::new(),
@@ -179,6 +201,13 @@ struct StreamState {
     has_tool_call: bool,
     /// Latest usage_metadata seen — emitted on ResponseStop.
     last_usage: Option<UsageMetadata>,
+    /// Latest safety ratings observed on a candidate — folded into the
+    /// final ResponseStop's Usage so the canonical field is populated on
+    /// the streaming path. Stored as canonical (typed) form because that's
+    /// where they ultimately land. The Gemini-specific `blocked` flag is
+    /// dropped here; the streaming path never had an extension write to
+    /// preserve it (and the unary extension write goes away in v0.3.1).
+    last_safety_ratings: Option<Vec<SafetyRating>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -198,6 +227,7 @@ impl StreamState {
             open_block: None,
             has_tool_call: false,
             last_usage: None,
+            last_safety_ratings: None,
         }
     }
 
@@ -233,6 +263,14 @@ impl StreamState {
             return out;
         };
 
+        // Capture safety ratings if present on this candidate. Gemini may
+        // ship them in a chunk separate from the usageMetadata chunk, so we
+        // accumulate independently and combine on ResponseStop.
+        if !candidate.safety_ratings.is_empty() {
+            self.last_safety_ratings =
+                Some(wire_to_canonical_safety_ratings(&candidate.safety_ratings));
+        }
+
         for part in candidate.content.parts {
             self.handle_part(part, &mut out);
         }
@@ -246,7 +284,7 @@ impl StreamState {
                 stop_sequence: None,
             }));
             out.push(Ok(StreamEvent::ResponseStop {
-                usage: self.last_usage.take().map(usage_metadata_to_usage),
+                usage: self.take_final_usage(),
             }));
             self.stopped = true;
         }
@@ -399,10 +437,32 @@ impl StreamState {
             stop_sequence: None,
         }));
         out.push(Ok(StreamEvent::ResponseStop {
-            usage: self.last_usage.take().map(usage_metadata_to_usage),
+            usage: self.take_final_usage(),
         }));
         self.stopped = true;
         out
+    }
+
+    /// Combine the latest usage_metadata and safety_ratings into a single
+    /// canonical Usage for ResponseStop. Used by both the finishReason
+    /// branch and the post-EOF drain in `finalize`. Gemini may deliver
+    /// usage and safety ratings in different chunks, so we drain both
+    /// fields together regardless of which arrived first.
+    fn take_final_usage(&mut self) -> Option<Usage> {
+        let usage = self.last_usage.take().map(usage_metadata_to_usage);
+        let ratings = self.last_safety_ratings.take();
+        match (usage, ratings) {
+            (Some(mut u), Some(r)) => {
+                u.safety_ratings = Some(r);
+                Some(u)
+            }
+            (Some(u), None) => Some(u),
+            (None, Some(r)) => Some(Usage {
+                safety_ratings: Some(r),
+                ..Usage::default()
+            }),
+            (None, None) => None,
+        }
     }
 }
 
@@ -547,6 +607,11 @@ fn attach_extensions(
         return blocks;
     }
     if !safety_ratings.is_empty() {
+        // REMOVE in v0.3.1 — see ADR-0003. Today's double-write keeps
+        // existing consumers compatible while readers migrate to
+        // Usage.safety_ratings. Keep the Gemini-only `blocked` flag
+        // riding on the JSON payload here for one more minor; the
+        // canonical SafetyRating drops it.
         let value = serde_json::to_value(&safety_ratings).unwrap_or(serde_json::Value::Null);
         write_extension(&mut blocks[0], "gemini.safety_ratings", value);
     }
@@ -600,7 +665,26 @@ fn usage_metadata_to_usage(meta: UsageMetadata) -> Usage {
         cache_read_input_tokens: None,
         estimated: false,
         provider_raw: None,
+        safety_ratings: None,
     }
+}
+
+/// Convert wire safety ratings (string-typed, with Gemini-only `blocked`
+/// flag) to canonical typed safety ratings. Used by both the unary and
+/// streaming parser paths so the conversion stays symmetric.
+///
+/// The Gemini-only `blocked: bool` field is dropped on this path — the
+/// canonical [`SafetyRating`] reflects cross-provider semantics. For one
+/// minor version (v0.3.0), the `blocked` flag continues to ride on
+/// `extensions["gemini.safety_ratings"]` via [`attach_extensions`]. v0.3.1
+/// drops the extension and the `blocked` signal with it (ADR-0003).
+fn wire_to_canonical_safety_ratings(wire: &[super::wire::SafetyRating]) -> Vec<SafetyRating> {
+    wire.iter()
+        .map(|r| SafetyRating {
+            category: SafetyCategory::from(r.category.clone()),
+            probability: SafetyLevel::from(r.probability.clone()),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +948,7 @@ mod tests {
             ContentBlock::Text(b) => &b.extensions,
             _ => panic!("expected Text"),
         };
+        // Legacy double-write site (REMOVE in v0.3.1).
         let ratings = ext
             .get("gemini.safety_ratings")
             .expect("gemini.safety_ratings present");
@@ -874,6 +959,79 @@ mod tests {
                 "probability":"NEGLIGIBLE",
                 "blocked": null
             }])
+        );
+
+        // Typed canonical field — must carry the same data minus the
+        // Gemini-only `blocked` flag (per ADR-0003 the canonical
+        // SafetyRating reflects cross-provider semantics only).
+        let usage = canonical
+            .usage
+            .as_ref()
+            .expect("usage synthesised so the typed safety_ratings field can travel");
+        let typed = usage
+            .safety_ratings
+            .as_ref()
+            .expect("Usage.safety_ratings populated alongside the legacy extension write");
+        assert_eq!(typed.len(), 1);
+        assert_eq!(
+            typed[0],
+            agent_shim_core::SafetyRating {
+                category: agent_shim_core::SafetyCategory::Harassment,
+                probability: agent_shim_core::SafetyLevel::Negligible,
+            }
+        );
+    }
+
+    #[test]
+    fn unary_safety_ratings_double_written_with_usage_metadata_present() {
+        // Confirms the typed field rides on the existing Usage when the
+        // upstream included usageMetadata, rather than synthesising a new
+        // one. This is the realistic streaming-friendly shape.
+        let resp = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Content {
+                    role: "model".into(),
+                    parts: vec![part_text("hi")],
+                },
+                finish_reason: Some("STOP".into()),
+                safety_ratings: vec![SafetyRating {
+                    category: "HARM_CATEGORY_DANGEROUS_CONTENT".into(),
+                    probability: "LOW".into(),
+                    blocked: Some(false),
+                }],
+                index: None,
+                citation_metadata: None,
+            }],
+            prompt_feedback: None,
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(2),
+                candidates_token_count: Some(1),
+                thoughts_token_count: None,
+                total_token_count: Some(3),
+            }),
+        };
+        let canonical = parse_unary(resp, "gemini-2.0-flash");
+
+        // Both writes must be present.
+        let block = &canonical.content[0];
+        let ext = match block {
+            ContentBlock::Text(b) => &b.extensions,
+            _ => panic!("expected Text"),
+        };
+        assert!(ext.get("gemini.safety_ratings").is_some());
+
+        let usage = canonical.usage.expect("usage present");
+        // Token counts come from usageMetadata.
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(1));
+        // Typed safety_ratings populated identically (modulo `blocked`).
+        let typed = usage.safety_ratings.expect("typed field populated");
+        assert_eq!(
+            typed,
+            vec![agent_shim_core::SafetyRating {
+                category: agent_shim_core::SafetyCategory::DangerousContent,
+                probability: agent_shim_core::SafetyLevel::Low,
+            }]
         );
     }
 
@@ -1078,5 +1236,109 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, Ok(StreamEvent::ResponseStart { .. }))));
+    }
+
+    #[tokio::test]
+    async fn streaming_safety_ratings_attach_to_response_stop_usage() {
+        // Same chunk carries text + safetyRatings + usageMetadata.
+        let chunks = vec![GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Content {
+                    role: "model".into(),
+                    parts: vec![part_text("ok")],
+                },
+                finish_reason: Some("STOP".into()),
+                safety_ratings: vec![SafetyRating {
+                    category: "HARM_CATEGORY_HARASSMENT".into(),
+                    probability: "MEDIUM".into(),
+                    blocked: None,
+                }],
+                index: None,
+                citation_metadata: None,
+            }],
+            prompt_feedback: None,
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(7),
+                candidates_token_count: Some(3),
+                thoughts_token_count: None,
+                total_token_count: Some(10),
+            }),
+        }];
+        let events = collect_streaming(chunks).await;
+        let last = events.last().unwrap().as_ref().unwrap();
+        match last {
+            StreamEvent::ResponseStop { usage: Some(u) } => {
+                assert_eq!(u.input_tokens, Some(7));
+                let typed = u.safety_ratings.as_ref().expect("typed field populated");
+                assert_eq!(typed.len(), 1);
+                assert_eq!(
+                    typed[0].category,
+                    agent_shim_core::SafetyCategory::Harassment
+                );
+                assert_eq!(typed[0].probability, agent_shim_core::SafetyLevel::Medium);
+            }
+            other => panic!("expected ResponseStop with usage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_safety_ratings_in_separate_chunk_from_usage_still_combine() {
+        // Realistic shape: safetyRatings ride on an early candidate chunk;
+        // usageMetadata + finishReason arrive on the final chunk. The state
+        // machine must combine both at ResponseStop.
+        let chunks = vec![
+            // Chunk 1: text + safetyRatings, no finishReason, no usage.
+            GenerateContentResponse {
+                candidates: vec![Candidate {
+                    content: Content {
+                        role: "model".into(),
+                        parts: vec![part_text("hi")],
+                    },
+                    finish_reason: None,
+                    safety_ratings: vec![SafetyRating {
+                        category: "HARM_CATEGORY_HATE_SPEECH".into(),
+                        probability: "NEGLIGIBLE".into(),
+                        blocked: None,
+                    }],
+                    index: None,
+                    citation_metadata: None,
+                }],
+                prompt_feedback: None,
+                usage_metadata: None,
+            },
+            // Chunk 2: finishReason + usage; no parts and no ratings.
+            GenerateContentResponse {
+                candidates: vec![Candidate {
+                    content: Content {
+                        role: "model".into(),
+                        parts: vec![],
+                    },
+                    finish_reason: Some("STOP".into()),
+                    safety_ratings: vec![],
+                    index: None,
+                    citation_metadata: None,
+                }],
+                prompt_feedback: None,
+                usage_metadata: Some(UsageMetadata {
+                    prompt_token_count: Some(2),
+                    candidates_token_count: Some(1),
+                    thoughts_token_count: None,
+                    total_token_count: Some(3),
+                }),
+            },
+        ];
+        let events = collect_streaming(chunks).await;
+        let last = events.last().unwrap().as_ref().unwrap();
+        match last {
+            StreamEvent::ResponseStop { usage: Some(u) } => {
+                assert_eq!(u.input_tokens, Some(2));
+                let typed = u.safety_ratings.as_ref().expect("typed field populated");
+                assert_eq!(
+                    typed[0].category,
+                    agent_shim_core::SafetyCategory::HateSpeech
+                );
+            }
+            other => panic!("expected ResponseStop with usage, got {other:?}"),
+        }
     }
 }

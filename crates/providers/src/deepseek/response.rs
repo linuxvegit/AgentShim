@@ -730,6 +730,7 @@ mod tests {
                         reasoning_tokens: None,
                         estimated: false,
                         provider_raw: Some(usage_json),
+                        safety_ratings: None,
                     },
                 },
             ]

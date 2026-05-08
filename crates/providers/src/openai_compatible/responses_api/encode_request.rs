@@ -1,8 +1,9 @@
 /// Build an OpenAI Responses API request body from a CanonicalRequest.
 use agent_shim_core::{
-    request::CanonicalRequest, BackendTarget, ContentBlock, MessageRole, ToolCallArguments,
-    ToolChoice,
+    media::BinarySource, request::CanonicalRequest, BackendTarget, ContentBlock, MessageRole,
+    ToolCallArguments, ToolChoice,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
 
 pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
@@ -85,11 +86,11 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
                 }));
             }
         } else {
-            let text = extract_text(&msg.content);
+            let content = build_message_content(&msg.content);
             input.push(json!({
                 "type": "message",
                 "role": role,
-                "content": text,
+                "content": content,
             }));
         }
     }
@@ -179,4 +180,72 @@ fn extract_text_only(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Build the `content` field for a Responses-API `message` input item.
+///
+/// Plan 04 T4: text-only messages still serialize as a bare string (the
+/// shape the upstream has always accepted), but messages carrying any
+/// `ContentBlock::Image` switch to the parts array form
+/// (`[{type:"input_text",...},{type:"input_image",image_url:"..."}]`).
+/// This is the wire shape the OpenAI Responses API documents for vision
+/// — note `image_url` is a STRING here, NOT the `{url:"..."}` object the
+/// Chat Completions API uses.
+///
+/// `BinarySource::Url` round-trips as the original URL; `Base64`/`Bytes`
+/// land as a `data:<mime>;base64,<payload>` data URI;
+/// `ProviderFileId` is dropped with a warn (the Responses API has no
+/// opaque file_id image source today).
+fn build_message_content(blocks: &[ContentBlock]) -> Value {
+    let has_image = blocks.iter().any(|b| matches!(b, ContentBlock::Image(_)));
+    if !has_image {
+        return Value::String(extract_text(blocks));
+    }
+
+    let parts: Vec<Value> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(json!({
+                "type": "input_text",
+                "text": t.text,
+            })),
+            ContentBlock::Image(img) => match &img.source {
+                BinarySource::Url { url } => Some(json!({
+                    "type": "input_image",
+                    "image_url": url,
+                })),
+                BinarySource::Base64 { media_type, data } => {
+                    let b64 = STANDARD.encode(data.as_ref());
+                    Some(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", media_type, b64),
+                    }))
+                }
+                BinarySource::Bytes { media_type, data } => {
+                    // Same wire shape as Base64 — Responses API accepts
+                    // data URIs but not raw byte handles. Encoding here
+                    // keeps round-trips lossless when a frontend hands us
+                    // raw bytes (e.g. multipart upload).
+                    let b64 = STANDARD.encode(data.as_ref());
+                    Some(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", media_type, b64),
+                    }))
+                }
+                BinarySource::ProviderFileId { file_id } => {
+                    tracing::warn!(
+                        file_id = %file_id,
+                        "BinarySource::ProviderFileId not supported by OpenAI Responses \
+                         vision encoder; image part dropped"
+                    );
+                    None
+                }
+            },
+            // Tool calls / tool results are emitted as separate items in
+            // the outer loop, not as message content parts.
+            _ => None,
+        })
+        .collect();
+
+    Value::Array(parts)
 }

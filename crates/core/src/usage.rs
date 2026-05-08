@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::safety::SafetyRating;
+
 /// Token usage for a single request/response pair.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
@@ -12,6 +14,13 @@ pub struct Usage {
     pub estimated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_raw: Option<serde_json::Value>,
+    /// Provider-supplied safety classifications (if any). See [`SafetyRating`].
+    ///
+    /// Defaults to `None` so existing JSON without the field deserialises
+    /// cleanly; `skip_serializing_if = Option::is_none` keeps the wire surface
+    /// unchanged for callers that don't populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_ratings: Option<Vec<SafetyRating>>,
 }
 
 /// Why the model stopped generating.
