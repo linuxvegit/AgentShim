@@ -17,6 +17,7 @@ canonical) modules under `crates/providers/src/gemini/`.
 |---|---|---|
 | `anthropic_messages` | Canonical translation (Gemini Generate Content) | Yes — `thought:true` parts render as `thinking` events |
 | `openai_chat` | Canonical translation (Gemini Generate Content) | No — reasoning is dropped by the OpenAI Chat encoder |
+| `openai_responses` | Canonical translation (Gemini Generate Content) | Yes — `thought:true` parts render as `response.reasoning.{delta,done}` |
 
 ## Config Example
 
@@ -89,6 +90,80 @@ Code displays them as a "thinking" indicator.
 
 `reasoning_effort` is consulted by the request encoder — see "Thinking
 Budget" below.
+
+### OpenAI Responses frontend → Gemini (visible thinking)
+
+```yaml
+routes:
+  - frontend: openai_responses
+    model: gemini-2.5-flash-thinking
+    upstream: gemini
+    upstream_model: gemini-2.5-flash-thinking
+    reasoning_effort: medium
+```
+
+The Responses event model has first-class `response.reasoning.delta` /
+`response.reasoning.done` events, so `thought:true` parts surface to
+the agent end-to-end. See "Responses frontend (v0.3)" below for the
+full description of the surface.
+
+### Responses frontend (v0.3)
+
+As of v0.3.0, OpenAI Responses (`POST /v1/responses`) is wired as a
+first-class inbound frontend for the Gemini backend, alongside the
+existing `openai_chat` and `anthropic_messages` surfaces. The design
+is captured in
+`docs/superpowers/specs/2026-05-07-phase-3-responses-frontend-design.md`
+and executed by Plan 03
+(`docs/superpowers/plans/2026-05-07-03-responses-to-gemini.md`).
+
+**Same encoder + parser.** Phase 3 is a verification milestone, not
+new provider code. The Gemini provider is frontend-agnostic by
+construction — the same `request::build` (canonical → wire) and
+`response::parse_*` (wire → canonical) modules under
+`crates/providers/src/gemini/` serve all three frontends. The
+Responses frontend simply exercises a different encoder/decoder pair
+on the inbound side; the gateway wiring point is identical.
+
+**Thinking budget.** Responses requests carrying
+`reasoning: { effort: "medium" }` flow through the canonical
+`generation.reasoning.effort` field and onto Gemini's
+`generationConfig.thinkingConfig.thinkingBudget` via the same effort
+table documented in "Thinking Budget" below. The three precedence
+sources (explicit `budget_tokens`, route-resolved effort, request
+effort) all apply unchanged. When a budget is emitted,
+`includeThoughts: true` is set so the response carries `thought:true`
+parts.
+
+**Reasoning round-trip.** Gemini's `thought:true` parts → canonical
+`ContentBlock::Reasoning` → the Responses encoder emits
+`response.reasoning.delta` for each text fragment and
+`response.reasoning.done` when the block closes. Unlike the OpenAI
+Chat encoder (which has no reasoning event today and drops the block),
+the Responses event model surfaces reasoning to the agent.
+
+**Tool round-trip.** `function_call` and `function_call_output` items
+in a Responses `input` array decode onto canonical `ToolCall` /
+`ToolResult` blocks, which then encode to Gemini's `functionCall` /
+`functionResponse` parts. Gemini's `functionResponse` requires a
+function `name` (not just a call id) — the existing
+`HashMap<id → name>` lookup over prior `ToolCall` blocks in the same
+request handles this transparently for Responses inputs as well, so
+the same tool-name-recovery path documented in "Tool-Call Translation"
+below applies.
+
+**Safety ratings.** For v0.3.0, Gemini's `candidates[].safetyRatings`
+continue to travel as `extensions["gemini.safety_ratings"]` on the
+first content block (per ADR-0002, "Provider-Specific Data
+(Frozen-Core)" below), and are **not** yet surfaced on the encoded
+Responses SSE — there is no `response.completed.safety_ratings` field
+emitted today. v0.3.1 (Plan 04 / ADR-0003) will promote safety ratings
+to a typed canonical `Usage.safety_ratings` field, at which point the
+Responses encoder will land them on `response.completed`. Until then,
+the regression test at
+`crates/protocol-tests/tests/responses_to_gemini_safety_ratings.rs`
+verifies the data is preserved at the parser level and not silently
+dropped.
 
 ## Behavior
 

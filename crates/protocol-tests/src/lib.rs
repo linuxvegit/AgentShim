@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use agent_shim_core::{
     FrontendModel, GenerationOptions, Message, RequestId,
 };
 use agent_shim_providers::anthropic::AnthropicProvider;
+use agent_shim_providers::gemini::GeminiProvider;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 
@@ -78,6 +80,23 @@ pub fn make_anthropic_target() -> BackendTarget {
     BackendTarget {
         provider: "anthropic".to_string(),
         model: "claude-opus-4-7".to_string(),
+        policy: Default::default(),
+    }
+}
+
+/// Build a [`GeminiProvider`] pointed at the given mockito base URL,
+/// with the test API key, no default headers, and a 30s timeout.
+pub fn make_gemini_provider(base_url: String) -> GeminiProvider {
+    GeminiProvider::new("gemini", base_url, "test-key", BTreeMap::new(), 30)
+        .expect("GeminiProvider::new is infallible for these inputs")
+}
+
+/// Build a [`BackendTarget`] pointing at `gemini-2.0-flash` on the
+/// `gemini` provider.
+pub fn make_gemini_target() -> BackendTarget {
+    BackendTarget {
+        provider: "gemini".to_string(),
+        model: "gemini-2.0-flash".to_string(),
         policy: Default::default(),
     }
 }
