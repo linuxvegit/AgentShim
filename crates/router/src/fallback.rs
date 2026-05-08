@@ -25,18 +25,41 @@ pub fn fallback_eligibility(e: &ProviderError) -> FallbackEligibility {
         ProviderError::Network(_) => Eligible,
         ProviderError::Upstream { status, .. } if *status >= 500 => Eligible,
         ProviderError::Upstream { status, .. } if *status == 429 => Eligible,
-        ProviderError::Upstream { .. } => Terminal,           // 4xx (non-429)
-        ProviderError::Decode(_) => Terminal,                 // upstream is broken;
-                                                              // next upstream wouldn't help
-        ProviderError::Encode(_) => Terminal,                 // gateway-side
+        ProviderError::Upstream { .. } => Terminal, // 4xx (non-429)
+        ProviderError::Decode(_) => Terminal,       // upstream is broken;
+        // next upstream wouldn't help
+        ProviderError::Encode(_) => Terminal, // gateway-side
         ProviderError::CapabilityMismatch(_) => Terminal,
-        ProviderError::UnknownProvider(_) => Terminal,        // config bug
+        ProviderError::UnknownProvider(_) => Terminal, // config bug
     }
 }
 
 /// Same logic but consulting a per-route override list. The override list
-/// uses string tags matching the canonical YAML names: `network`,
-/// `upstream_5xx`, `upstream_429`, `decode`, `encode`, `capability`.
+/// uses string tags matching the canonical YAML names:
+///
+/// | Tag                  | Variant              | Typical use in `retry_on:` |
+/// |----------------------|----------------------|----------------------------|
+/// | `network`            | `Network`            | ✅ Recommended             |
+/// | `upstream_5xx`       | `Upstream` (≥500)    | ✅ Recommended             |
+/// | `upstream_429`       | `Upstream` (==429)   | ✅ Recommended             |
+/// | `upstream_4xx`       | `Upstream` (other)   | ⚠️ Rare — see note         |
+/// | `decode`             | `Decode`             | ⚠️ Rare                    |
+/// | `encode`             | `Encode`             | ❌ Don't                   |
+/// | `capability_mismatch`| `CapabilityMismatch` | ❌ Don't                   |
+/// | `unknown_provider`   | `UnknownProvider`    | ❌ Don't                   |
+///
+/// `upstream_4xx`, `encode`, `capability_mismatch`, and `unknown_provider`
+/// are emitted for symmetry but adding them to `retry_on:` rarely helps —
+/// the next upstream would likely return the same class of error.
+///
+/// **Pure overlay semantics:** The override list FULLY REPLACES the default
+/// mapping. An empty `retry_on: []` makes every error terminal. If you want
+/// the defaults plus extras, write the full set out explicitly:
+///
+/// ```yaml
+/// retry:
+///   retry_on: [network, upstream_5xx, upstream_429, decode]  # defaults + decode
+/// ```
 pub fn fallback_eligibility_with_overrides(
     e: &ProviderError,
     retry_on: &[String],
@@ -58,7 +81,7 @@ fn error_tag(e: &ProviderError) -> &'static str {
         ProviderError::Upstream { .. } => "upstream_4xx",
         ProviderError::Decode(_) => "decode",
         ProviderError::Encode(_) => "encode",
-        ProviderError::CapabilityMismatch(_) => "capability",
+        ProviderError::CapabilityMismatch(_) => "capability_mismatch",
         ProviderError::UnknownProvider(_) => "unknown_provider",
     }
 }
@@ -70,25 +93,43 @@ mod tests {
 
     #[test]
     fn classifier_default_mapping() {
-        assert_eq!(fallback_eligibility(&ProviderError::Network("x".into())), Eligible);
         assert_eq!(
-            fallback_eligibility(&ProviderError::Upstream { status: 500, body: "x".into() }),
+            fallback_eligibility(&ProviderError::Network("x".into())),
             Eligible
         );
         assert_eq!(
-            fallback_eligibility(&ProviderError::Upstream { status: 503, body: "x".into() }),
+            fallback_eligibility(&ProviderError::Upstream {
+                status: 500,
+                body: "x".into()
+            }),
             Eligible
         );
         assert_eq!(
-            fallback_eligibility(&ProviderError::Upstream { status: 429, body: "x".into() }),
+            fallback_eligibility(&ProviderError::Upstream {
+                status: 503,
+                body: "x".into()
+            }),
             Eligible
         );
         assert_eq!(
-            fallback_eligibility(&ProviderError::Upstream { status: 400, body: "x".into() }),
+            fallback_eligibility(&ProviderError::Upstream {
+                status: 429,
+                body: "x".into()
+            }),
+            Eligible
+        );
+        assert_eq!(
+            fallback_eligibility(&ProviderError::Upstream {
+                status: 400,
+                body: "x".into()
+            }),
             Terminal
         );
         assert_eq!(
-            fallback_eligibility(&ProviderError::Upstream { status: 401, body: "x".into() }),
+            fallback_eligibility(&ProviderError::Upstream {
+                status: 401,
+                body: "x".into()
+            }),
             Terminal
         );
         assert_eq!(
@@ -119,7 +160,74 @@ mod tests {
         // 5xx no longer in override → terminal under override semantics.
         assert_eq!(
             fallback_eligibility_with_overrides(
-                &ProviderError::Upstream { status: 500, body: "x".into() },
+                &ProviderError::Upstream {
+                    status: 500,
+                    body: "x".into()
+                },
+                &retry_on
+            ),
+            Terminal
+        );
+    }
+
+    #[test]
+    fn error_tags_are_stable_canonical_strings() {
+        // Pin operator-facing strings. Changing any of these is a
+        // breaking change for v0.4.x retry_on overrides.
+        assert_eq!(error_tag(&ProviderError::Network("".into())), "network");
+        assert_eq!(
+            error_tag(&ProviderError::Upstream {
+                status: 500,
+                body: "".into()
+            }),
+            "upstream_5xx"
+        );
+        assert_eq!(
+            error_tag(&ProviderError::Upstream {
+                status: 503,
+                body: "".into()
+            }),
+            "upstream_5xx"
+        );
+        assert_eq!(
+            error_tag(&ProviderError::Upstream {
+                status: 429,
+                body: "".into()
+            }),
+            "upstream_429"
+        );
+        assert_eq!(
+            error_tag(&ProviderError::Upstream {
+                status: 401,
+                body: "".into()
+            }),
+            "upstream_4xx"
+        );
+        assert_eq!(error_tag(&ProviderError::Decode("".into())), "decode");
+        assert_eq!(error_tag(&ProviderError::Encode("".into())), "encode");
+        assert_eq!(
+            error_tag(&ProviderError::CapabilityMismatch("".into())),
+            "capability_mismatch"
+        );
+        assert_eq!(
+            error_tag(&ProviderError::UnknownProvider("".into())),
+            "unknown_provider"
+        );
+    }
+
+    #[test]
+    fn empty_override_list_makes_everything_terminal() {
+        let retry_on: Vec<String> = vec![];
+        assert_eq!(
+            fallback_eligibility_with_overrides(&ProviderError::Network("x".into()), &retry_on),
+            Terminal
+        );
+        assert_eq!(
+            fallback_eligibility_with_overrides(
+                &ProviderError::Upstream {
+                    status: 500,
+                    body: "x".into()
+                },
                 &retry_on
             ),
             Terminal
