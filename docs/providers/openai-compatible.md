@@ -50,7 +50,7 @@ caller or at the infrastructure layer (e.g. a load balancer).
 
 ### Resilience behavior (v0.4+)
 
-The Phase 4 retry/fallback layer treats this provider's errors as
+The v0.4 resilience layer treats this provider's errors as
 follows:
 
 | Error pattern | Default eligibility |

@@ -332,7 +332,7 @@ the caller or at the infrastructure layer.
 
 ### Resilience behavior (v0.4+)
 
-The Phase 4 retry/fallback layer treats this provider's errors as
+The v0.4 resilience layer treats this provider's errors as
 follows:
 
 | Error pattern | Default eligibility |
@@ -345,7 +345,11 @@ follows:
 
 Provider-specific notes:
 
-* AI Studio occasionally returns HTTP 400 with a `SAFETY` block reason
-  on prompts that fail Gemini's safety filter. These are **terminal**
-  under the default classifier — the request itself violated policy,
-  and the next upstream would likely reject it the same way.
+* Gemini surfaces safety blocks as HTTP 200 with `promptFeedback.blockReason`
+  or `candidates[0].finishReason: SAFETY` — not as a `ProviderError`. Safety
+  blocks therefore never reach the fallback classifier; they surface as
+  successful responses with empty content (prompt block) or a `ContentFilter`
+  stop reason (response block). Operators relying on fallback to "rescue"
+  content-filtered prompts should not expect that to work — the next
+  upstream would have to be a different model family. Genuine HTTP 400 from
+  AI Studio (malformed request) is terminal per the table above.

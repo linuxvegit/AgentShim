@@ -214,7 +214,7 @@ the caller or at the infrastructure layer.
 
 ### Resilience behavior (v0.4+)
 
-The Phase 4 retry/fallback layer treats this provider's errors as
+The v0.4 resilience layer treats this provider's errors as
 follows:
 
 | Error pattern | Default eligibility |
