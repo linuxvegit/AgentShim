@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_shim_config::GatewayConfig;
+use agent_shim_config::{GatewayConfig, RetryConfig, RouteEntry};
 use agent_shim_core::{request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy};
 
 use crate::{RouteError, Router};
@@ -26,12 +26,23 @@ struct WildcardTarget {
 pub struct StaticRouter {
     routes: HashMap<RouteKey, BackendTarget>,
     wildcards: HashMap<FrontendKind, WildcardTarget>,
+    /// Source `RouteEntry` indexed by `(frontend, model)` so the gateway
+    /// pipeline can recover per-route resilience policy (`retry`, `breaker`)
+    /// after `resolve` collapses a route into a `BackendTarget`. Phase 4
+    /// (Plan 04 P01 T5) — the retry loop in `pipeline.rs` reads from here
+    /// via [`StaticRouter::find_retry_policy`].
+    route_entries: HashMap<RouteKey, RouteEntry>,
+    /// Wildcard variant of `route_entries`. Keyed by frontend only because
+    /// wildcards match any model for a frontend.
+    wildcard_entries: HashMap<FrontendKind, RouteEntry>,
 }
 
 impl StaticRouter {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
         let mut routes = HashMap::new();
         let mut wildcards = HashMap::new();
+        let mut route_entries = HashMap::new();
+        let mut wildcard_entries = HashMap::new();
         for entry in &cfg.routes {
             let frontend = match entry.frontend.as_str() {
                 "anthropic_messages" | "anthropic" => FrontendKind::AnthropicMessages,
@@ -56,15 +67,32 @@ impl StaticRouter {
                 default_reasoning_effort,
                 default_anthropic_beta: entry.anthropic_beta.clone(),
             };
+
+            // Determine the (provider, model) pair from either the singular
+            // (v0.3) or array (v0.4) form. `validate_routes` already enforced
+            // exactly one shape per route, so we can trust the first hit.
+            // P01 T5 only consumes the primary upstream; Plan 02's
+            // `ResilientCaller` walks the rest of the chain.
+            let (provider, upstream_model) = if !entry.upstreams.is_empty() {
+                let first = &entry.upstreams[0];
+                (first.name.clone(), first.model.clone())
+            } else {
+                (
+                    entry.upstream.clone().unwrap_or_default(),
+                    entry.upstream_model.clone().unwrap_or_default(),
+                )
+            };
+
             if entry.model == "*" {
                 wildcards.insert(
                     frontend,
                     WildcardTarget {
-                        provider: entry.upstream.clone(),
-                        upstream_model: entry.upstream_model.clone(),
+                        provider,
+                        upstream_model,
                         policy,
                     },
                 );
+                wildcard_entries.insert(frontend, entry.clone());
                 continue;
             }
             let key = RouteKey {
@@ -72,13 +100,41 @@ impl StaticRouter {
                 model: entry.model.clone(),
             };
             let target = BackendTarget {
-                provider: entry.upstream.clone(),
-                model: entry.upstream_model.clone(),
+                provider,
+                model: upstream_model,
                 policy,
             };
-            routes.insert(key, target);
+            routes.insert(key.clone(), target);
+            route_entries.insert(key, entry.clone());
         }
-        Self { routes, wildcards }
+        Self {
+            routes,
+            wildcards,
+            route_entries,
+            wildcard_entries,
+        }
+    }
+
+    /// Look up the per-route retry policy for this `(frontend, model)`.
+    ///
+    /// Returns `Some(retry)` if a static route (specific or wildcard) was
+    /// configured for the pair, `None` if no route matches. Callers can fall
+    /// back to `RetryConfig::default()` on `None` — the default policy is the
+    /// §4.5/D12 contract from the Phase 4 design.
+    ///
+    /// Specific `(frontend, model)` routes win over wildcards, mirroring the
+    /// resolution order in `Router::resolve`.
+    pub fn find_retry_policy(&self, frontend: FrontendKind, model: &str) -> Option<RetryConfig> {
+        let key = RouteKey {
+            frontend,
+            model: model.to_string(),
+        };
+        if let Some(entry) = self.route_entries.get(&key) {
+            return Some(entry.retry.clone());
+        }
+        self.wildcard_entries
+            .get(&frontend)
+            .map(|entry| entry.retry.clone())
     }
 }
 
@@ -108,12 +164,16 @@ impl Router for StaticRouter {
             model: model.to_string(),
         })
     }
+
+    fn find_retry_policy(&self, frontend: FrontendKind, model: &str) -> Option<RetryConfig> {
+        StaticRouter::find_retry_policy(self, frontend, model)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_shim_config::{GatewayConfig, RouteEntry};
+    use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
 
     fn cfg_with_route(
         frontend: &str,
@@ -128,10 +188,13 @@ mod tests {
             routes: vec![RouteEntry {
                 frontend: frontend.to_string(),
                 model: model.to_string(),
-                upstream: upstream.to_string(),
-                upstream_model: upstream_model.to_string(),
+                upstream: Some(upstream.to_string()),
+                upstream_model: Some(upstream_model.to_string()),
+                upstreams: vec![],
                 reasoning_effort: None,
                 anthropic_beta: None,
+                retry: RetryConfig::default(),
+                breaker: BreakerConfig::default(),
             }],
             copilot: None,
         }
@@ -177,10 +240,13 @@ mod tests {
         cfg.routes.push(RouteEntry {
             frontend: "anthropic_messages".to_string(),
             model: "override".to_string(),
-            upstream: "other".to_string(),
-            upstream_model: "other-model".to_string(),
+            upstream: Some("other".to_string()),
+            upstream_model: Some("other-model".to_string()),
+            upstreams: vec![],
             reasoning_effort: None,
             anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
         });
         let router = StaticRouter::from_config(&cfg);
         // Specific route wins
@@ -194,5 +260,75 @@ mod tests {
             .unwrap();
         assert_eq!(t.provider, "copilot");
         assert_eq!(t.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn array_form_uses_first_upstream_as_primary() {
+        // P01 T5 only consumes the chain head; Plan 02 walks the rest. Pin
+        // the contract so a future refactor that picks element [1] doesn't
+        // silently break P01 wiring.
+        use agent_shim_config::UpstreamRef;
+        let cfg = GatewayConfig {
+            server: Default::default(),
+            logging: Default::default(),
+            upstreams: Default::default(),
+            routes: vec![RouteEntry {
+                frontend: "openai_chat".into(),
+                model: "gpt-4o".into(),
+                upstream: None,
+                upstream_model: None,
+                upstreams: vec![
+                    UpstreamRef {
+                        name: "primary".into(),
+                        model: "gpt-4o-primary".into(),
+                    },
+                    UpstreamRef {
+                        name: "secondary".into(),
+                        model: "gpt-4o-secondary".into(),
+                    },
+                ],
+                reasoning_effort: None,
+                anthropic_beta: None,
+                retry: RetryConfig::default(),
+                breaker: BreakerConfig::default(),
+            }],
+            copilot: None,
+        };
+        let router = StaticRouter::from_config(&cfg);
+        let target = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
+        assert_eq!(target.provider, "primary");
+        assert_eq!(target.model, "gpt-4o-primary");
+    }
+
+    #[test]
+    fn find_retry_policy_returns_route_specific_config() {
+        let mut cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
+        cfg.routes[0].retry.max_attempts = 7;
+        let router = StaticRouter::from_config(&cfg);
+        let retry = router
+            .find_retry_policy(FrontendKind::OpenAiChat, "gpt-4o")
+            .expect("specific route must yield its retry config");
+        assert_eq!(retry.max_attempts, 7);
+    }
+
+    #[test]
+    fn find_retry_policy_falls_back_to_wildcard() {
+        let mut cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
+        cfg.routes[0].retry.max_attempts = 5;
+        let router = StaticRouter::from_config(&cfg);
+        let retry = router
+            .find_retry_policy(FrontendKind::AnthropicMessages, "any-model")
+            .expect("wildcard route must yield its retry config for any model");
+        assert_eq!(retry.max_attempts, 5);
+    }
+
+    #[test]
+    fn find_retry_policy_returns_none_when_no_match() {
+        let cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
+        let router = StaticRouter::from_config(&cfg);
+        // Different frontend, no wildcard for it → no policy.
+        assert!(router
+            .find_retry_policy(FrontendKind::AnthropicMessages, "claude-foo")
+            .is_none());
     }
 }

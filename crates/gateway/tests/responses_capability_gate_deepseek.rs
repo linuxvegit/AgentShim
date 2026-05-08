@@ -125,10 +125,13 @@ fn make_app_state() -> AppState {
         routes: vec![RouteEntry {
             frontend: "openai_responses".to_string(),
             model: "text-only-model".to_string(),
-            upstream: "text-only-stub".to_string(),
-            upstream_model: "text-only-model".to_string(),
+            upstream: Some("text-only-stub".to_string()),
+            upstream_model: Some("text-only-model".to_string()),
+            upstreams: vec![],
             reasoning_effort: None,
             anthropic_beta: None,
+            retry: Default::default(),
+            breaker: Default::default(),
         }],
         copilot: None,
     };

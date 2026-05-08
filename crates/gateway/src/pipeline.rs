@@ -28,6 +28,7 @@ use agent_shim_core::{
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_providers::{BackendProvider, ProviderCapabilities, ProviderError};
+use agent_shim_router::{retry_with_policy, RetryPolicy};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -101,6 +102,18 @@ pub async fn dispatch(
             tracing::warn!(model = %model_alias, error = %e, "no route");
             HandlerError::Route(e)
         })?;
+
+    // Look up the per-route retry policy (from `retry:` block in YAML or
+    // §4.5/D12 defaults). Phase 4 P01 T5: every provider call below the
+    // pipeline goes through retry_with_policy. Routes without a configured
+    // retry block fall back to RetryConfig::default() — equivalent to the
+    // documented defaults (max_attempts=2, exp backoff with jitter).
+    let retry_policy = RetryPolicy::from(
+        &state
+            .resolver
+            .find_retry_policy(spec.frontend.kind(), &model_alias)
+            .unwrap_or_default(),
+    );
 
     let upstream_model = target.model.clone();
 
@@ -233,6 +246,7 @@ pub async fn dispatch(
                 model_alias,
                 upstream_model,
                 started,
+                retry_policy,
             },
         )
     } else {
@@ -245,6 +259,7 @@ pub async fn dispatch(
                 model_alias,
                 upstream_model,
                 started,
+                retry_policy,
             },
         )
         .await
@@ -256,6 +271,11 @@ struct RunContext {
     model_alias: String,
     upstream_model: String,
     started: std::time::Instant,
+    /// Effective retry policy resolved from the route's `retry:` block (or
+    /// the §4.5/D12 default when the block is absent). Threaded into both
+    /// branches so the provider call site can wrap `provider.complete()` in
+    /// `retry_with_policy`. Phase 4 P01 T5.
+    retry_policy: RetryPolicy,
 }
 
 fn run_stream(
@@ -270,6 +290,7 @@ fn run_stream(
         model_alias,
         upstream_model,
         started,
+        retry_policy,
     } = ctx;
 
     if spec.log_streaming_usage_on_drop {
@@ -283,7 +304,7 @@ fn run_stream(
             started,
         };
 
-        let upstream_stream = spawn_provider_stream(provider, canonical, target);
+        let upstream_stream = spawn_provider_stream(provider, canonical, target, retry_policy);
         let logging_stream = upstream_stream.map(move |event| {
             if let Ok(ref ev) = event {
                 match ev {
@@ -324,7 +345,7 @@ fn run_stream(
         }
     } else {
         // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        let upstream_stream = spawn_provider_stream(provider, canonical, target);
+        let upstream_stream = spawn_provider_stream(provider, canonical, target, retry_policy);
         let frontend_response = spec.frontend.encode_stream(upstream_stream);
         tracing::info!(
             "← {} (stream) | model: {} → {} | {:.1}s",
@@ -348,11 +369,14 @@ async fn run_unary(
         model_alias,
         upstream_model,
         started,
+        retry_policy,
     } = ctx;
-    let stream = provider.complete(canonical, target).await.map_err(|e| {
-        tracing::error!(error = %e, "provider.complete failed");
-        HandlerError::Provider(e)
-    })?;
+    let stream = retry_with_policy(provider, target, canonical, &retry_policy)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "provider call failed after retries");
+            HandlerError::Provider(e)
+        })?;
     let response = collect_stream(stream).await?;
     let (input, output) = match &response.usage {
         Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
@@ -398,16 +422,24 @@ fn capture_anthropic_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 
 /// Spawn the upstream provider call on a background task and return a
 /// CanonicalStream the frontend can encode lazily.
+///
+/// The provider call is wrapped in `retry_with_policy` so transient errors
+/// (network/5xx/429 by default) trigger a silent retry within the configured
+/// budget. The retry happens BEFORE the first byte is forwarded — once the
+/// upstream stream is open, we forward events as-is. Mid-stream failures
+/// surface to the client as `StreamError::Upstream`; restarting after partial
+/// SSE output isn't safe and is explicitly out of scope for P01.
 pub(crate) fn spawn_provider_stream(
     provider: Arc<dyn BackendProvider>,
     canonical: agent_shim_core::CanonicalRequest,
     target: BackendTarget,
+    retry_policy: RetryPolicy,
 ) -> CanonicalStream {
     let (tx, rx) =
         tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
 
     tokio::spawn(async move {
-        match provider.complete(canonical, target).await {
+        match retry_with_policy(provider, target, canonical, &retry_policy).await {
             Ok(mut upstream) => {
                 while let Some(event) = upstream.next().await {
                     if tx.send(event).await.is_err() {
@@ -416,7 +448,7 @@ pub(crate) fn spawn_provider_stream(
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "provider.complete failed");
+                tracing::error!(error = %e, "provider call failed after retries");
                 let _ = tx
                     .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
                     .await;

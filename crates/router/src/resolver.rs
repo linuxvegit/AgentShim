@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use agent_shim_config::RetryConfig;
 use agent_shim_core::{BackendTarget, FrontendKind};
 
 use crate::model_index::ModelIndex;
@@ -59,6 +60,17 @@ impl ModelResolver {
 
         Ok(target)
     }
+
+    /// Look up the per-route retry policy. Delegates to the static router.
+    /// Returns `None` if no route entry matched — callers fall back to
+    /// `RetryConfig::default()` (the §4.5/D12 defaults).
+    pub fn find_retry_policy(
+        &self,
+        frontend: FrontendKind,
+        model_alias: &str,
+    ) -> Option<RetryConfig> {
+        self.static_router.find_retry_policy(frontend, model_alias)
+    }
 }
 
 #[cfg(test)]
@@ -66,7 +78,7 @@ mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
 
-    use agent_shim_config::{GatewayConfig, RouteEntry};
+    use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
 
     use crate::StaticRouter;
 
@@ -83,10 +95,13 @@ mod tests {
             routes: vec![RouteEntry {
                 frontend: frontend.to_string(),
                 model: model.to_string(),
-                upstream: upstream.to_string(),
-                upstream_model: upstream_model.to_string(),
+                upstream: Some(upstream.to_string()),
+                upstream_model: Some(upstream_model.to_string()),
+                upstreams: vec![],
                 reasoning_effort: None,
                 anthropic_beta: None,
+                retry: RetryConfig::default(),
+                breaker: BreakerConfig::default(),
             }],
             copilot: None,
         }
