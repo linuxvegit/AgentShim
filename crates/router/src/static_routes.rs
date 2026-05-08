@@ -24,7 +24,12 @@ struct WildcardTarget {
 
 /// A static router built from `GatewayConfig.routes`.
 pub struct StaticRouter {
-    routes: HashMap<RouteKey, BackendTarget>,
+    /// Route table keyed by `(frontend, model)`. Each entry holds the FULL
+    /// fallback chain — singular config produces a 1-element vec, array-form
+    /// config produces N elements in configured order. `Router::resolve`
+    /// returns `Vec<BackendTarget>` so `ResilientCaller` (Plan 02 T4) can
+    /// walk the chain head-to-tail.
+    routes: HashMap<RouteKey, Vec<BackendTarget>>,
     wildcards: HashMap<FrontendKind, WildcardTarget>,
     /// Source `RouteEntry` indexed by `(frontend, model)` so the gateway
     /// pipeline can recover per-route resilience policy (`retry`, `breaker`)
@@ -68,14 +73,21 @@ impl StaticRouter {
                 default_anthropic_beta: entry.anthropic_beta.clone(),
             };
 
-            // Determine the (provider, model) pair from either the singular
-            // (v0.3) or array (v0.4) form. `validate_routes` already enforced
-            // exactly one shape per route, so we can trust the first hit.
-            // P01 T5 only consumes the primary upstream; Plan 02's
-            // `ResilientCaller` walks the rest of the chain.
-            let (provider, upstream_model) = if !entry.upstreams.is_empty() {
-                let first = &entry.upstreams[0];
-                (first.name.clone(), first.model.clone())
+            // Build the full fallback chain from either the singular (v0.3)
+            // or array (v0.4) form. `validate_routes` enforces exactly one
+            // shape per route, so an empty `upstreams` vec is the unambiguous
+            // marker for the singular shape. Plan 02 T1: singular produces a
+            // 1-element chain; array produces N elements in configured order.
+            let targets: Vec<BackendTarget> = if !entry.upstreams.is_empty() {
+                entry
+                    .upstreams
+                    .iter()
+                    .map(|u| BackendTarget {
+                        provider: u.name.clone(),
+                        model: u.model.clone(),
+                        policy: policy.clone(),
+                    })
+                    .collect()
             } else {
                 // Singular form: `validate_routes` enforces these are
                 // populated when `upstreams` is empty. `.expect()` (not
@@ -91,16 +103,24 @@ impl StaticRouter {
                     .upstream_model
                     .clone()
                     .expect("validate_routes guarantees singular routes have `upstream_model` set");
-                (provider, upstream_model)
+                vec![BackendTarget {
+                    provider,
+                    model: upstream_model,
+                    policy: policy.clone(),
+                }]
             };
 
             if entry.model == "*" {
+                // Wildcards stay single-target — exactly one wildcard per
+                // frontend, and chain walking under wildcards isn't part of
+                // Plan 02. Pick the chain head as the wildcard primary.
+                let head = &targets[0];
                 wildcards.insert(
                     frontend,
                     WildcardTarget {
-                        provider,
-                        upstream_model,
-                        policy,
+                        provider: head.provider.clone(),
+                        upstream_model: head.model.clone(),
+                        policy: policy.clone(),
                     },
                 );
                 wildcard_entries.insert(frontend, entry.clone());
@@ -110,12 +130,7 @@ impl StaticRouter {
                 frontend,
                 model: entry.model.clone(),
             };
-            let target = BackendTarget {
-                provider,
-                model: upstream_model,
-                policy,
-            };
-            routes.insert(key.clone(), target);
+            routes.insert(key.clone(), targets);
             route_entries.insert(key, entry.clone());
         }
         Self {
@@ -150,13 +165,17 @@ impl StaticRouter {
 }
 
 impl Router for StaticRouter {
-    fn resolve(&self, frontend: FrontendKind, model: &str) -> Result<BackendTarget, RouteError> {
+    fn resolve(
+        &self,
+        frontend: FrontendKind,
+        model: &str,
+    ) -> Result<Vec<BackendTarget>, RouteError> {
         let key = RouteKey {
             frontend,
             model: model.to_string(),
         };
-        if let Some(target) = self.routes.get(&key) {
-            return Ok(target.clone());
+        if let Some(targets) = self.routes.get(&key) {
+            return Ok(targets.clone());
         }
         if let Some(wc) = self.wildcards.get(&frontend) {
             let upstream_model = if wc.upstream_model == "*" {
@@ -164,11 +183,11 @@ impl Router for StaticRouter {
             } else {
                 wc.upstream_model.clone()
             };
-            return Ok(BackendTarget {
+            return Ok(vec![BackendTarget {
                 provider: wc.provider.clone(),
                 model: upstream_model,
                 policy: wc.policy.clone(),
-            });
+            }]);
         }
         Err(RouteError::NoRoute {
             frontend,
@@ -210,9 +229,10 @@ mod tests {
     fn resolves_known_route() {
         let cfg = cfg_with_route("openai_chat", "gpt-4o", "my-upstream", "gpt-4o-2024-11-20");
         let router = StaticRouter::from_config(&cfg);
-        let target = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
-        assert_eq!(target.provider, "my-upstream");
-        assert_eq!(target.model, "gpt-4o-2024-11-20");
+        let chain = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "my-upstream");
+        assert_eq!(chain[0].model, "gpt-4o-2024-11-20");
     }
 
     #[test]
@@ -234,10 +254,11 @@ mod tests {
             "claude-3-5-sonnet-20241022",
         );
         let router = StaticRouter::from_config(&cfg);
-        let target = router
+        let chain = router
             .resolve(FrontendKind::AnthropicMessages, "claude-3-5-sonnet")
             .unwrap();
-        assert_eq!(target.provider, "upstream-a");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "upstream-a");
     }
 
     #[test]
@@ -251,23 +272,27 @@ mod tests {
         ));
         let router = StaticRouter::from_config(&cfg);
         // Specific route wins
-        let t = router
+        let chain = router
             .resolve(FrontendKind::AnthropicMessages, "override")
             .unwrap();
-        assert_eq!(t.provider, "other");
-        // Wildcard catches anything else, passes model name through
-        let t = router
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "other");
+        // Wildcard catches anything else, passes model name through (still
+        // a 1-element chain — wildcards don't fan out under Plan 02).
+        let chain = router
             .resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7")
             .unwrap();
-        assert_eq!(t.provider, "copilot");
-        assert_eq!(t.model, "claude-opus-4-7");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "claude-opus-4-7");
     }
 
     #[test]
-    fn array_form_uses_first_upstream_as_primary() {
-        // P01 T5 only consumes the chain head; Plan 02 walks the rest. Pin
-        // the contract so a future refactor that picks element [1] doesn't
-        // silently break P01 wiring.
+    fn array_route_produces_multi_element_chain() {
+        // Plan 02 T1: array-form route preserves all upstreams, in
+        // configured order, as a fallback chain. Replaces the P01 T5 contract
+        // (which kept only the head) now that `Router::resolve` returns
+        // `Vec<BackendTarget>` for `ResilientCaller` to walk.
         use agent_shim_config::UpstreamRef;
         let cfg = GatewayConfig {
             server: Default::default(),
@@ -280,12 +305,12 @@ mod tests {
                 upstream_model: None,
                 upstreams: vec![
                     UpstreamRef {
-                        name: "primary".into(),
-                        model: "gpt-4o-primary".into(),
+                        name: "openai".into(),
+                        model: "gpt-4o-2024-11-20".into(),
                     },
                     UpstreamRef {
-                        name: "secondary".into(),
-                        model: "gpt-4o-secondary".into(),
+                        name: "copilot".into(),
+                        model: "gpt-4o".into(),
                     },
                 ],
                 reasoning_effort: None,
@@ -296,9 +321,12 @@ mod tests {
             copilot: None,
         };
         let router = StaticRouter::from_config(&cfg);
-        let target = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
-        assert_eq!(target.provider, "primary");
-        assert_eq!(target.model, "gpt-4o-primary");
+        let chain = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider, "openai");
+        assert_eq!(chain[0].model, "gpt-4o-2024-11-20");
+        assert_eq!(chain[1].provider, "copilot");
+        assert_eq!(chain[1].model, "gpt-4o");
     }
 
     #[test]

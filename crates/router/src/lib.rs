@@ -23,7 +23,18 @@ pub enum RouteError {
 }
 
 pub trait Router: Send + Sync {
-    fn resolve(&self, frontend: FrontendKind, model: &str) -> Result<BackendTarget, RouteError>;
+    /// Resolve `(frontend, model)` to the full fallback chain.
+    ///
+    /// Returns a vec of `BackendTarget`s in the order they should be
+    /// attempted. A v0.3 singular `RouteEntry` produces a 1-element vec;
+    /// a v0.4 array-form route produces N elements in configured order.
+    /// Callers (e.g. `ResilientCaller`) walk the chain head-to-tail,
+    /// failing over from element[i] to element[i+1] on eligible errors.
+    fn resolve(
+        &self,
+        frontend: FrontendKind,
+        model: &str,
+    ) -> Result<Vec<BackendTarget>, RouteError>;
 
     /// Look up the per-route retry policy. Returns `None` if no route entry
     /// matched (callers should fall back to `RetryConfig::default()`).

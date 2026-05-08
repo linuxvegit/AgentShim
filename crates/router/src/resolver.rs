@@ -39,12 +39,25 @@ impl ModelResolver {
     /// [`BackendTarget`]. Looks up the static route, then upgrades
     /// `target.model` to the canonical form discovered from the upstream if
     /// fuzzy matching finds a hit. Logs the upgrade at info level.
+    ///
+    /// Plan 02 T1 transitional shim: `Router::resolve` now returns
+    /// `Vec<BackendTarget>` (the full fallback chain). Until Plan 02 T2
+    /// refactors this method to return the chain, we collapse to the head
+    /// element so the gateway pipeline keeps building. This is safe because
+    /// the chain is non-empty by construction (singular routes produce
+    /// 1-element vecs; array routes are validated to be non-empty by
+    /// `validate_routes`).
     pub fn resolve(
         &self,
         frontend: FrontendKind,
         model_alias: &str,
     ) -> Result<BackendTarget, RouteError> {
-        let mut target = self.static_router.resolve(frontend, model_alias)?;
+        let chain = self.static_router.resolve(frontend, model_alias)?;
+        // Chain is non-empty by router invariant; pick the head until T2.
+        let mut target = chain
+            .into_iter()
+            .next()
+            .expect("StaticRouter::resolve never returns an empty chain on Ok");
 
         if let Some(canonical) = self.model_index.resolve(&target.provider, &target.model) {
             if canonical != target.model {
