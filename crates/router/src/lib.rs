@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod circuit_breaker;
+pub mod errors;
 pub mod fallback;
 pub mod model_index;
 pub mod rate_limit;
@@ -47,6 +48,7 @@ pub trait Router: Send + Sync {
     }
 }
 
+pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
     fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility,
 };
