@@ -69,6 +69,10 @@ pub fn compute_backoff<R: Rng>(attempt: u32, policy: &RetryPolicy, rng: &mut R) 
 /// On terminal error (per `retry_on` override of the default classifier):
 /// returns the error immediately without further attempts.
 ///
+/// `total_budget_ms` is a budget over **accumulated backoff sleeps**, not
+/// wallclock since entry. Time spent inside `provider.complete()` itself
+/// is not counted; per-attempt timeouts are enforced elsewhere.
+///
 /// This helper is **single-upstream**. Plan 02's `ResilientCaller` walks
 /// the chain across multiple upstreams.
 pub async fn retry_with_policy(
@@ -80,33 +84,32 @@ pub async fn retry_with_policy(
     let mut rng = SmallRng::from_entropy();
     let mut attempt: u32 = 1;
     let mut total_elapsed_ms: u64 = 0;
-    // The initial `None` is overwritten before being read on every code path
-    // that breaks the loop; the `expect` after the loop captures the invariant.
-    #[allow(unused_assignments)]
-    let mut last_err: Option<ProviderError> = None;
 
-    loop {
-        let result = provider.complete(req.clone(), target.clone()).await;
-        match result {
+    let last_err: ProviderError = loop {
+        // Clone-per-attempt: BackendProvider::complete consumes the request.
+        // Acceptable while retries are rare; revisit with Arc<CanonicalRequest>
+        // if profiling shows clone cost in the hot path.
+        match provider.complete(req.clone(), target.clone()).await {
             Ok(stream) => return Ok(stream),
             Err(e) => {
-                let eligibility = fallback_eligibility_with_overrides(&e, &policy.retry_on);
-                if eligibility == FallbackEligibility::Terminal {
+                if fallback_eligibility_with_overrides(&e, &policy.retry_on)
+                    == FallbackEligibility::Terminal
+                {
                     return Err(e);
                 }
-                last_err = Some(e);
                 if attempt >= policy.max_attempts {
-                    break;
+                    break e;
                 }
                 let backoff = compute_backoff(attempt, policy, &mut rng);
                 let backoff_ms = backoff.as_millis() as u64;
                 if total_elapsed_ms + backoff_ms > policy.total_budget_ms {
-                    break;
+                    break e;
                 }
-                tracing::info!(
+                tracing::warn!(
                     attempt,
                     backoff_ms,
                     total_elapsed_ms,
+                    error = %e,
                     "retrying provider call after eligible error"
                 );
                 tokio::time::sleep(backoff).await;
@@ -114,9 +117,8 @@ pub async fn retry_with_policy(
                 attempt += 1;
             }
         }
-    }
-
-    Err(last_err.expect("loop only breaks after recording an error"))
+    };
+    Err(last_err)
 }
 
 #[cfg(test)]
