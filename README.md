@@ -23,23 +23,24 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 **Frontends** (what your agent speaks):
 - Anthropic `/v1/messages` — full SSE streaming, tool use, thinking blocks
 - OpenAI `/v1/chat/completions` — full SSE streaming, tool calls, `[DONE]` terminator
+- OpenAI `/v1/responses` — item-based event model, `response.reasoning.{delta,done}`, `function_call_arguments.{delta,done}`, `input_image` vision parts
 
 **Backends** (where requests go):
 - **OpenAI-compatible** — any provider with a `/v1/chat/completions` endpoint (DeepSeek, Kimi, Qwen, Ollama, vLLM, llama.cpp, Azure OpenAI, etc.)
 - **GitHub Copilot** — OAuth device-flow login, automatic token refresh, Copilot-specific headers
 - **Anthropic** — direct talk to api.anthropic.com via Messages API. Hybrid path: byte-passthrough when inbound is Anthropic, canonical translation otherwise.
 - **DeepSeek native** — direct talk to api.deepseek.com with reasoning passthrough (deepseek-reasoner emits visible thinking blocks via the ReasoningInterleaver state machine) and cache hit/miss usage mapping.
-- **Gemini (AI Studio)** — direct talk to generativelanguage.googleapis.com via the Generate Content API. Native JSON-array streaming, `inlineData`/`fileData` images, `thinkingConfig` (budget tokens) for reasoning-capable models, `safetyRatings` round-trip via the canonical extensions map.
+- **Gemini (AI Studio)** — direct talk to generativelanguage.googleapis.com via the Generate Content API. Native JSON-array streaming, `inlineData`/`fileData` images, `thinkingConfig` (budget tokens) for reasoning-capable models, `safetyRatings` round-trip via the typed `Usage.safety_ratings` field (and the legacy `gemini.safety_ratings` extension key for v0.3.0; removed in v0.3.1 per [ADR-0003](docs/adr/0003-promote-safety-ratings.md)).
 
 **Cross-protocol translation works.** An Anthropic-speaking agent can talk to an OpenAI-compatible backend and vice versa, including streaming tool-call argument deltas.
 
-## Capability matrix (v0.2)
+## Capability matrix (v0.3)
 
 | Frontend → Provider | OAI-compat | Copilot | Anthropic | DeepSeek | Gemini |
 |---|---|---|---|---|---|
 | Anthropic Messages | text · tools · vision | text · tools · vision | text · tools · vision (passthrough = lossless) | text · tools · reasoning | text · tools · vision · thinking |
-| OpenAI Chat | text · tools · vision | text · tools · vision | text · tools (canonical path) | text · tools · reasoning | text · tools · vision · thinking |
-| OpenAI Responses | text · tools | text · tools | n/a in v0.2 | text · tools | n/a in v0.2 |
+| OpenAI Chat | text · tools · vision | text · tools · vision | text · tools · vision (canonical path) | text · tools · reasoning | text · tools · vision · thinking |
+| OpenAI Responses | text · tools · vision | text · tools · vision | text · tools · vision · reasoning (canonical path) | ❌ gate (text-only provider) | text · tools · vision · thinking · safety |
 
 Vision support gates at the gateway boundary: when an inbound request contains an image block but the routed provider's `capabilities.vision == false` (today: DeepSeek), the request is rejected with HTTP 400 and a frontend-shaped error envelope before any upstream call. See [docs/architecture.md](docs/architecture.md#capability-gate).
 
@@ -112,7 +113,8 @@ agent-shim serve --config gateway.yaml
 
 Now point your agent at `http://127.0.0.1:8787`:
 - Claude Code / Anthropic clients → `http://127.0.0.1:8787/v1/messages`
-- Cursor / Codex / OpenAI clients → `http://127.0.0.1:8787/v1/chat/completions`
+- Cursor / Codex / OpenAI Chat clients → `http://127.0.0.1:8787/v1/chat/completions`
+- Codex / OpenAI Responses clients → `http://127.0.0.1:8787/v1/responses`
 
 ## GitHub Copilot
 
@@ -264,7 +266,7 @@ AGENT_SHIM__LOGGING__FORMAT=json
 | `upstreams.<name>.anthropic_version` | string | `2023-06-01` | `anthropic-version` header value (Anthropic only) |
 | `upstreams.<name>.default_headers` | map<string, string> | `{}` | Operator-level header overrides applied to every upstream request |
 | `upstreams.<name>.request_timeout_secs` | u64 | `120` | Request timeout |
-| `routes[].frontend` | `anthropic_messages` \| `openai_chat` | — | Which frontend endpoint handles this |
+| `routes[].frontend` | `anthropic_messages` \| `openai_chat` \| `openai_responses` | — | Which frontend endpoint handles this |
 | `routes[].model` | string | — | Model alias the agent requests |
 | `routes[].upstream` | string | — | Which upstream to route to |
 | `routes[].upstream_model` | string | — | Model name sent to the upstream |
@@ -304,22 +306,23 @@ crates/
   protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.2
+## What's NOT in v0.3
 
-- OpenAI `/v1/responses` frontend wired to Anthropic/Gemini (Phase 3 — works for OAI-compat/Copilot/DeepSeek today)
-- Fallback chains, circuit breakers, retries (Phase 4)
-- Rate limiting, per-agent API keys (Phase 4)
+- Fallback chains, circuit breakers, per-route retries with backoff (Phase 4)
+- Per-key rate limiting, per-agent API keys, request budget caps (Phase 4)
 - Prometheus metrics, hot-reload config, OpenTelemetry (Phase 5)
-- Audio / file content end-to-end (vision Tier-1 is in)
-- Multi-account Copilot
+- Audio / file content end-to-end (vision Tier-1 is in; audio is Phase 6+)
+- Multi-account Copilot (Phase 6+)
+- OAuth Anthropic / "Workbench" tokens (Phase 6+)
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
 
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.2.0** — Phase 2 provider breadth (Anthropic, DeepSeek, Gemini natives) +
-vision Tier-1 + `/v1/messages/count_tokens` endpoint.
+**v0.3.0** — Phase 3: OpenAI Responses frontend → all backends; vision Tier-1
+across the matrix; `safety_ratings` promoted to typed canonical field
+([ADR-0003](docs/adr/0003-promote-safety-ratings.md)).
 
 ## Contributing
 
