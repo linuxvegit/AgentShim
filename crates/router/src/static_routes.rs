@@ -77,10 +77,21 @@ impl StaticRouter {
                 let first = &entry.upstreams[0];
                 (first.name.clone(), first.model.clone())
             } else {
-                (
-                    entry.upstream.clone().unwrap_or_default(),
-                    entry.upstream_model.clone().unwrap_or_default(),
-                )
+                // Singular form: `validate_routes` enforces these are
+                // populated when `upstreams` is empty. `.expect()` (not
+                // `unwrap_or_default()`) so a config that bypassed
+                // validation panics with a pointer to the invariant
+                // instead of silently routing to `provider = ""` and
+                // failing later with a confusing `UnknownProvider("")`.
+                let provider = entry
+                    .upstream
+                    .clone()
+                    .expect("validate_routes guarantees singular routes have `upstream` set");
+                let upstream_model = entry
+                    .upstream_model
+                    .clone()
+                    .expect("validate_routes guarantees singular routes have `upstream_model` set");
+                (provider, upstream_model)
             };
 
             if entry.model == "*" {
@@ -185,17 +196,12 @@ mod tests {
             server: Default::default(),
             logging: Default::default(),
             upstreams: Default::default(),
-            routes: vec![RouteEntry {
-                frontend: frontend.to_string(),
-                model: model.to_string(),
-                upstream: Some(upstream.to_string()),
-                upstream_model: Some(upstream_model.to_string()),
-                upstreams: vec![],
-                reasoning_effort: None,
-                anthropic_beta: None,
-                retry: RetryConfig::default(),
-                breaker: BreakerConfig::default(),
-            }],
+            routes: vec![RouteEntry::singular(
+                frontend,
+                model,
+                upstream,
+                upstream_model,
+            )],
             copilot: None,
         }
     }
@@ -237,17 +243,12 @@ mod tests {
     #[test]
     fn wildcard_route_passes_model_through() {
         let mut cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
-        cfg.routes.push(RouteEntry {
-            frontend: "anthropic_messages".to_string(),
-            model: "override".to_string(),
-            upstream: Some("other".to_string()),
-            upstream_model: Some("other-model".to_string()),
-            upstreams: vec![],
-            reasoning_effort: None,
-            anthropic_beta: None,
-            retry: RetryConfig::default(),
-            breaker: BreakerConfig::default(),
-        });
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "override",
+            "other",
+            "other-model",
+        ));
         let router = StaticRouter::from_config(&cfg);
         // Specific route wins
         let t = router

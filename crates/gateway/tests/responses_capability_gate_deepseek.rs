@@ -122,17 +122,12 @@ fn make_app_state() -> AppState {
         server: Default::default(),
         logging: Default::default(),
         upstreams: Default::default(),
-        routes: vec![RouteEntry {
-            frontend: "openai_responses".to_string(),
-            model: "text-only-model".to_string(),
-            upstream: Some("text-only-stub".to_string()),
-            upstream_model: Some("text-only-model".to_string()),
-            upstreams: vec![],
-            reasoning_effort: None,
-            anthropic_beta: None,
-            retry: Default::default(),
-            breaker: Default::default(),
-        }],
+        routes: vec![RouteEntry::singular(
+            "openai_responses",
+            "text-only-model",
+            "text-only-stub",
+            "text-only-model",
+        )],
         copilot: None,
     };
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));

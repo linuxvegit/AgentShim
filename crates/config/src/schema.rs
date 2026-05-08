@@ -208,6 +208,32 @@ pub struct RouteEntry {
     pub breaker: BreakerConfig,
 }
 
+impl RouteEntry {
+    /// Convenience constructor for a v0.3-shape singular-upstream route.
+    /// Builds a `RouteEntry` with the singular `upstream`/`upstream_model`
+    /// fields set, an empty `upstreams` array, default `retry`/`breaker`
+    /// configs, and no `reasoning_effort`/`anthropic_beta`. Primarily for
+    /// hand-built test fixtures; production configs are deserialized.
+    pub fn singular(
+        frontend: impl Into<String>,
+        model: impl Into<String>,
+        upstream: impl Into<String>,
+        upstream_model: impl Into<String>,
+    ) -> Self {
+        Self {
+            frontend: frontend.into(),
+            model: model.into(),
+            upstream: Some(upstream.into()),
+            upstream_model: Some(upstream_model.into()),
+            upstreams: Vec::new(),
+            reasoning_effort: None,
+            anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
+        }
+    }
+}
+
 /// Reference to one upstream in a fallback chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -532,6 +558,17 @@ default_headers:
         assert_eq!(entry.upstream.as_deref(), Some("openai"));
         assert_eq!(entry.upstreams.len(), 0); // empty when singular
         assert_eq!(entry.retry.max_attempts, 2); // default per D12
+    }
+
+    #[test]
+    fn route_entry_singular_constructor() {
+        let entry = RouteEntry::singular("openai_chat", "gpt-4o", "openai", "gpt-4o-2024-11-20");
+        assert_eq!(entry.frontend, "openai_chat");
+        assert_eq!(entry.model, "gpt-4o");
+        assert_eq!(entry.upstream.as_deref(), Some("openai"));
+        assert_eq!(entry.upstream_model.as_deref(), Some("gpt-4o-2024-11-20"));
+        assert!(entry.upstreams.is_empty());
+        assert_eq!(entry.retry.max_attempts, 2); // §4.5 default
     }
 
     #[test]
