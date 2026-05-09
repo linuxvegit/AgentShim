@@ -11,14 +11,9 @@ use std::net::SocketAddr;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-async fn healthz() -> &'static str {
-    "ok"
-}
-
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(healthz))
-        .route("/healthz", get(healthz))
+        .route("/", get(|| async { "ok" }))
         .route("/v1/messages", post(handlers::anthropic_messages::handle))
         .route(
             "/v1/messages/count_tokens",

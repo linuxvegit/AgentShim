@@ -1,3 +1,4 @@
+mod admin;
 mod cli;
 mod commands;
 mod handlers;
