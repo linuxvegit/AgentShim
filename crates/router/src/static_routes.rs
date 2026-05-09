@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_shim_config::{GatewayConfig, RetryConfig, RouteEntry};
+use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
 use agent_shim_core::{request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy};
 
 use crate::{RouteError, Router};
@@ -162,6 +162,28 @@ impl StaticRouter {
             .get(&frontend)
             .map(|entry| entry.retry.clone())
     }
+
+    /// Look up the per-route breaker policy for this `(frontend, model)`.
+    ///
+    /// Mirrors `find_retry_policy`: specific routes win over wildcards.
+    /// Returns `None` if no route matches; callers fall back to
+    /// `BreakerConfig::default()` (the §4.5/D6 defaults).
+    pub fn find_breaker_policy(
+        &self,
+        frontend: FrontendKind,
+        model: &str,
+    ) -> Option<BreakerConfig> {
+        let key = RouteKey {
+            frontend,
+            model: model.to_string(),
+        };
+        if let Some(entry) = self.route_entries.get(&key) {
+            return Some(entry.breaker.clone());
+        }
+        self.wildcard_entries
+            .get(&frontend)
+            .map(|entry| entry.breaker.clone())
+    }
 }
 
 impl Router for StaticRouter {
@@ -197,6 +219,10 @@ impl Router for StaticRouter {
 
     fn find_retry_policy(&self, frontend: FrontendKind, model: &str) -> Option<RetryConfig> {
         StaticRouter::find_retry_policy(self, frontend, model)
+    }
+
+    fn find_breaker_policy(&self, frontend: FrontendKind, model: &str) -> Option<BreakerConfig> {
+        StaticRouter::find_breaker_policy(self, frontend, model)
     }
 }
 
@@ -358,6 +384,38 @@ mod tests {
         // Different frontend, no wildcard for it → no policy.
         assert!(router
             .find_retry_policy(FrontendKind::AnthropicMessages, "claude-foo")
+            .is_none());
+    }
+
+    #[test]
+    fn find_breaker_policy_returns_route_specific_config() {
+        let mut cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
+        cfg.routes[0].breaker.failure_threshold_pct = 99;
+        let router = StaticRouter::from_config(&cfg);
+        let breaker = router
+            .find_breaker_policy(FrontendKind::OpenAiChat, "gpt-4o")
+            .expect("specific route must yield its breaker config");
+        assert_eq!(breaker.failure_threshold_pct, 99);
+    }
+
+    #[test]
+    fn find_breaker_policy_falls_back_to_wildcard() {
+        let mut cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
+        cfg.routes[0].breaker.failure_threshold_pct = 77;
+        let router = StaticRouter::from_config(&cfg);
+        let breaker = router
+            .find_breaker_policy(FrontendKind::AnthropicMessages, "any-model")
+            .expect("wildcard route must yield its breaker config for any model");
+        assert_eq!(breaker.failure_threshold_pct, 77);
+    }
+
+    #[test]
+    fn find_breaker_policy_returns_none_when_no_match() {
+        let cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
+        let router = StaticRouter::from_config(&cfg);
+        // Different frontend, no wildcard for it → no policy.
+        assert!(router
+            .find_breaker_policy(FrontendKind::AnthropicMessages, "claude-foo")
             .is_none());
     }
 }

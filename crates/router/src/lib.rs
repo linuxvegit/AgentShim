@@ -47,6 +47,20 @@ pub trait Router: Send + Sync {
     fn find_retry_policy(&self, _frontend: FrontendKind, _model: &str) -> Option<RetryConfig> {
         None
     }
+
+    /// Look up the per-route breaker policy. Returns `None` if no route entry
+    /// matched (callers should fall back to `BreakerConfig::default()`).
+    ///
+    /// Default impl returns `None` for parity with `find_retry_policy` —
+    /// keeps test routers compiling while `StaticRouter` overrides with a
+    /// real lookup.
+    fn find_breaker_policy(
+        &self,
+        _frontend: FrontendKind,
+        _model: &str,
+    ) -> Option<agent_shim_config::BreakerConfig> {
+        None
+    }
 }
 
 pub use circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry, Clock, SystemClock};

@@ -79,6 +79,18 @@ impl ModelResolver {
     ) -> Option<RetryConfig> {
         self.static_router.find_retry_policy(frontend, model_alias)
     }
+
+    /// Look up the per-route breaker policy. Delegates to the static
+    /// router. Returns `None` if no route entry matched — callers fall
+    /// back to `BreakerConfig::default()` (the §4.5/D6 defaults).
+    pub fn find_breaker_policy(
+        &self,
+        frontend: FrontendKind,
+        model_alias: &str,
+    ) -> Option<agent_shim_config::BreakerConfig> {
+        self.static_router
+            .find_breaker_policy(frontend, model_alias)
+    }
 }
 
 #[cfg(test)]

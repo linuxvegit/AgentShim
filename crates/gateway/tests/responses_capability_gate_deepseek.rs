@@ -39,7 +39,8 @@ use agent_shim_providers::{
 };
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
-    ModelResolver, ProviderLookup, ResilientCaller, Router as RouterTrait, StaticRouter,
+    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, Router as RouterTrait,
+    StaticRouter,
 };
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
@@ -155,7 +156,11 @@ fn make_app_state() -> AppState {
         }
     }
     let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(Lookup(Arc::clone(&providers)));
-    let resilient_caller = Arc::new(ResilientCaller::new(provider_lookup));
+    let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
+    let resilient_caller = Arc::new(ResilientCaller::new(
+        provider_lookup,
+        Arc::clone(&breaker_registry),
+    ));
 
     AppState {
         config: Arc::new(cfg),
@@ -165,6 +170,7 @@ fn make_app_state() -> AppState {
         providers,
         resolver,
         resilient_caller,
+        breaker_registry,
     }
 }
 

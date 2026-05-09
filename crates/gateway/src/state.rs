@@ -14,7 +14,9 @@ use agent_shim_providers::{
     BackendProvider, ProviderRegistry,
 };
 use agent_shim_router::model_index::ModelIndex;
-use agent_shim_router::{ModelResolver, ProviderLookup, ResilientCaller, Router, StaticRouter};
+use agent_shim_router::{
+    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, Router, StaticRouter,
+};
 
 /// Adapter that lets `ResilientCaller` (in the router crate) look up
 /// providers via the gateway's `ProviderRegistry` (in the providers crate).
@@ -49,6 +51,16 @@ pub struct AppState {
     /// resolver per request, applying retry+fallback per chain element.
     /// Plan 04 P02 T6 wires this into `pipeline::dispatch`.
     pub resilient_caller: Arc<ResilientCaller>,
+    /// Per-`(provider, model)` circuit breakers. Built once at startup and
+    /// shared with `ResilientCaller`. Plan 04 P03 T4: the gateway holds
+    /// the canonical handle so future surfaces (admin endpoints, metrics)
+    /// can introspect the same registry the chain walker is using.
+    ///
+    /// `#[allow(dead_code)]` because the request hot path reads through
+    /// `resilient_caller`'s clone of this Arc; this field is the
+    /// future-facing introspection seam.
+    #[allow(dead_code)]
+    pub breaker_registry: Arc<BreakerRegistry>,
 }
 
 impl AppState {
@@ -129,7 +141,11 @@ impl AppState {
         let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(GatewayProviderLookup {
             registry: Arc::clone(&providers),
         });
-        let resilient_caller = Arc::new(ResilientCaller::new(provider_lookup));
+        let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
+        let resilient_caller = Arc::new(ResilientCaller::new(
+            provider_lookup,
+            Arc::clone(&breaker_registry),
+        ));
 
         Self {
             config: Arc::new(config),
@@ -139,6 +155,7 @@ impl AppState {
             providers,
             resolver,
             resilient_caller,
+            breaker_registry,
         }
     }
 }

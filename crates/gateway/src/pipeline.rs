@@ -28,7 +28,7 @@ use agent_shim_core::{
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_providers::{ProviderCapabilities, ProviderError};
-use agent_shim_router::RetryPolicy;
+use agent_shim_router::{BreakerPolicy, RetryPolicy};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -113,6 +113,18 @@ pub async fn dispatch(
         .unwrap_or_default();
     let retry_policy = RetryPolicy::from(&route_retry_config);
     let policies: Vec<RetryPolicy> = (0..chain.len()).map(|_| retry_policy.clone()).collect();
+
+    // Plan 04 P03 T4: parallel breaker policies — same uniform-per-route
+    // shape as retry, fed into `ResilientCaller::complete` alongside the
+    // retry policies. Falls back to `BreakerConfig::default()` (the §4.5/D6
+    // defaults) when the route doesn't override.
+    let route_breaker_config = state
+        .resolver
+        .find_breaker_policy(spec.frontend.kind(), &model_alias)
+        .unwrap_or_default();
+    let breaker_policy = BreakerPolicy::from(&route_breaker_config);
+    let breaker_policies: Vec<BreakerPolicy> =
+        (0..chain.len()).map(|_| breaker_policy.clone()).collect();
 
     // The chain is non-empty by router invariant (singular routes produce
     // 1-element vecs; array routes are validated to be non-empty by
@@ -287,6 +299,7 @@ pub async fn dispatch(
             canonical,
             chain,
             policies,
+            breaker_policies,
             RunContext {
                 model_alias,
                 upstream_model,
@@ -302,6 +315,7 @@ pub async fn dispatch(
             canonical,
             chain,
             policies,
+            breaker_policies,
             RunContext {
                 model_alias,
                 upstream_model,
@@ -330,6 +344,7 @@ async fn run_stream(
     canonical: CanonicalRequest,
     chain: Vec<BackendTarget>,
     policies: Vec<RetryPolicy>,
+    breaker_policies: Vec<BreakerPolicy>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let label = spec.endpoint_label;
@@ -345,7 +360,7 @@ async fn run_stream(
     // encoding is unchanged from the pre-T6 single-upstream world.
     let upstream_stream = state
         .resilient_caller
-        .complete(chain, canonical, policies)
+        .complete(chain, canonical, policies, breaker_policies)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "resilient call failed");
@@ -421,6 +436,7 @@ async fn run_unary(
     canonical: CanonicalRequest,
     chain: Vec<BackendTarget>,
     policies: Vec<RetryPolicy>,
+    breaker_policies: Vec<BreakerPolicy>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let RunContext {
@@ -432,7 +448,7 @@ async fn run_unary(
 
     let stream = state
         .resilient_caller
-        .complete(chain, canonical, policies)
+        .complete(chain, canonical, policies, breaker_policies)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "resilient call failed");
