@@ -21,6 +21,7 @@ agent-shim-frontends = { path = "../frontends" }
 agent-shim-providers = { path = "../providers" }
 agent-shim-router = { path = "../router" }
 tokio.workspace = true
+tokio-util.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

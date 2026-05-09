@@ -59,33 +59,42 @@ pub async fn run_with_admin(state: AppState) -> Result<()> {
     let admin_bind: SocketAddr = format!("{}:{}", admin_cfg.bind, admin_cfg.port).parse()?;
 
     let public_listener = tokio::net::TcpListener::bind(public_bind).await?;
-    let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
     info!("Listening on {} (public)", public_bind);
+    let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
     info!("Listening on {} (admin)", admin_bind);
 
     let public_app = build_router(state.clone());
     let admin_app = crate::admin::build_router(state);
 
-    // Share one shutdown signal: when one listener is told to shut down,
-    // the other follows. The original signal future is consumed by a
-    // spawned task that fans out via Notify so both listeners can await
-    // their own clones.
-    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    // Plan 01 P01 T4 followup: CancellationToken caches cancellation,
+    // so a SIGTERM arriving during boot (before either listener's
+    // graceful_shutdown future has registered with the notify) still
+    // shuts down both listeners. The previous Notify::notify_waiters
+    // shape had a race window where this could hang.
+    let token = tokio_util::sync::CancellationToken::new();
     {
-        let s = shutdown.clone();
-        tokio::spawn(async move {
+        let token = token.clone();
+        let signal_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
             shutdown_signal().await;
-            s.notify_waiters();
+            token.cancel();
         });
+        // The signal task is detached deliberately — it terminates when
+        // shutdown_signal() resolves, which must happen for the process
+        // to exit. A future enhancement could abort it on early return
+        // from select! below; for now the runtime drop on main exit
+        // collects it. We `drop` the JoinHandle (rather than `let _ =`)
+        // because clippy's let_underscore_future would otherwise flag
+        // it as accidentally discarding a future.
+        drop(signal_task);
     }
 
     let public_shutdown = {
-        let s = shutdown.clone();
-        async move { s.notified().await }
+        let token = token.clone();
+        async move { token.cancelled().await }
     };
     let admin_shutdown = {
-        let s = shutdown.clone();
-        async move { s.notified().await }
+        let token = token.clone();
+        async move { token.cancelled().await }
     };
 
     tokio::select! {
