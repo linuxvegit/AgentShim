@@ -36,8 +36,8 @@ use tokio::net::TcpListener;
 /// `OpenAiCompatibleProvider::complete()` returns `Ok(stream)` —
 /// fallback is not eligible at that point. The `finish_reason=stop`
 /// chunk lets the SSE parser emit `MessageStop`, which lets the OAI
-/// Chat encoder emit `[DONE]`, which lets the response body terminate
-/// cleanly so the test doesn't hang on the streaming keepalive ping.
+/// Chat encoder emit `[DONE]` and terminate the response body cleanly
+/// (via the `terminate_on_sentinel` scan in `encode_stream::encode`).
 /// (The contract is that fallback doesn't fire mid-stream — the body
 /// shape doesn't matter as long as the gateway returns 200 and bytes
 /// flow.)
@@ -170,14 +170,12 @@ async fn mid_stream_failure_does_not_trigger_fallback() {
         "stream": true
     });
 
-    // Send the request and wait for the headers to arrive. Don't drain
-    // the body — the OAI Chat encoder's keepalive ping stream is
-    // infinite (no `terminate_on_sentinel` analogue, unlike the
-    // Responses encoder), so reading to EOF would hang. The status
-    // tells us chain[0] returned 200 and the gateway forwarded that;
-    // mockito's per-mock hit count tells us whether B was reached.
-    // Dropping the response below closes the TCP socket, which lets
-    // the gateway-side stream terminate via backpressure.
+    // Send the request and wait for the headers to arrive. Reading just one
+    // chunk is enough to prove bytes flowed; the gateway's stream now
+    // terminates correctly after `data: [DONE]\n\n` (see the
+    // `terminate_on_sentinel` block in
+    // `crates/frontends/src/openai_chat/encode_stream.rs`), so draining
+    // would also work, but isn't necessary for what we're asserting here.
     let resp = reqwest::Client::new()
         .post(format!("http://{}/v1/chat/completions", addr))
         .header("content-type", "application/json")
@@ -197,8 +195,8 @@ async fn mid_stream_failure_does_not_trigger_fallback() {
     );
 
     // Read just one chunk to prove bytes flowed (the gateway crossed
-    // the "stream is open" threshold) but don't drain — see comment
-    // above on the keepalive issue.
+    // the "stream is open" threshold). Draining is also safe now that
+    // the OAI Chat encoder terminates on the [DONE] sentinel.
     let mut byte_stream = resp.bytes_stream();
     use futures::StreamExt;
     let first = tokio::time::timeout(std::time::Duration::from_secs(2), byte_stream.next())

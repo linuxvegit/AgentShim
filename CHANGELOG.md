@@ -5,6 +5,32 @@ All notable changes to AgentShim are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-05-09
+
+Patch release: fixes a streaming termination bug on the OpenAI Chat
+frontend that caused clients to hang indefinitely after the model had
+finished responding.
+
+### Fixed
+
+- **OpenAI Chat `/v1/chat/completions` streaming response never
+  terminated.** When `server.keepalive_secs > 0` (the default, 15s),
+  the SSE encoder merged the canonical event stream with an infinite
+  `IntervalStream` of keepalive pings via `futures::stream::select`,
+  which only ends when *both* sides end. The ping side never ended,
+  so even after `data: [DONE]\n\n` was emitted the HTTP body stayed
+  open and clients (Codex, Cursor, Claude Code, etc.) sat on
+  "waiting for reply" indefinitely. The fix mirrors the pattern
+  already in use by the Anthropic Messages and OpenAI Responses
+  encoders: an `AtomicBool` `done` flag flipped on `ResponseStop`
+  (and on stream-level errors) gates the ping stream via
+  `take_while` and trips a `terminate_on_sentinel` `scan` over the
+  merged output, closing the body cleanly after `[DONE]`. Two
+  regression tests with a 2-second `tokio::time::timeout` guard the
+  termination contract for both `keepalive=Some(_)` and
+  `keepalive=None` paths
+  (`crates/frontends/src/openai_chat/encode_stream.rs`).
+
 ## [0.4.0] — 2026-05-08
 
 Phase 4 release: the gateway becomes **resilient** as well as
