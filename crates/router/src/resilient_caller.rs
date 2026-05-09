@@ -27,28 +27,84 @@ pub trait ProviderLookup: Send + Sync {
 /// The resilience-layer entry point.
 pub struct ResilientCaller {
     providers: Arc<dyn ProviderLookup>,
+    breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
 }
 
 impl ResilientCaller {
-    pub fn new(providers: Arc<dyn ProviderLookup>) -> Self {
-        Self { providers }
+    pub fn new(
+        providers: Arc<dyn ProviderLookup>,
+        breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
+    ) -> Self {
+        Self {
+            providers,
+            breakers,
+        }
     }
 
     /// Walk the chain. Each element gets its own retry budget. Fallback
     /// to chain[i+1] only on retry exhaustion with a fallback-eligible
     /// error; terminal errors short-circuit.
+    ///
+    /// The breaker gate runs before each chain element:
+    /// - `Skip` → continue to chain[i+1] without consuming retries.
+    /// - `Probe` → fall through; `record()` resets `probe_in_flight`.
+    /// - `Allow` → normal path.
     pub async fn complete(
         &self,
         chain: Vec<BackendTarget>,
         req: CanonicalRequest,
-        policies: Vec<RetryPolicy>,
+        retry_policies: Vec<RetryPolicy>,
+        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
     ) -> Result<CanonicalStream, ResilienceError> {
-        debug_assert_eq!(chain.len(), policies.len(), "one policy per chain element");
+        debug_assert_eq!(
+            chain.len(),
+            retry_policies.len(),
+            "one retry policy per chain element"
+        );
+        debug_assert_eq!(
+            chain.len(),
+            breaker_policies.len(),
+            "one breaker policy per chain element"
+        );
+
         let mut tried: Vec<TriedUpstream> = Vec::new();
         let mut last_error: Option<ProviderError> = None;
+        let mut breakers_skipped: Vec<String> = Vec::new();
 
         for (i, target) in chain.iter().enumerate() {
-            let policy = &policies[i];
+            let bpolicy = &breaker_policies[i];
+            let rpolicy = &retry_policies[i];
+
+            // ── BREAKER GATE ────────────────────────────────────────────────
+            let decision = self
+                .breakers
+                .decision(&target.provider, &target.model, bpolicy);
+            match decision {
+                crate::circuit_breaker::BreakerDecision::Skip => {
+                    tracing::warn!(
+                        provider = %target.provider,
+                        model = %target.model,
+                        chain_position = i,
+                        "breaker open; skipping chain element"
+                    );
+                    breakers_skipped.push(target.provider.clone());
+                    continue; // next chain element
+                }
+                crate::circuit_breaker::BreakerDecision::Probe => {
+                    tracing::info!(
+                        provider = %target.provider,
+                        model = %target.model,
+                        chain_position = i,
+                        "breaker half-open; attempting probe"
+                    );
+                    // Fall through to call. probe_in_flight is set by
+                    // decision(); record() clears it.
+                }
+                crate::circuit_breaker::BreakerDecision::Allow => {
+                    // Normal path.
+                }
+            }
+
             let provider = match self.providers.get(&target.provider) {
                 Some(p) => p,
                 None => {
@@ -59,11 +115,13 @@ impl ResilientCaller {
 
             let started = Instant::now();
             // retry_with_policy returns Err on retry exhaustion OR terminal.
-            let result = retry_with_policy(provider, target.clone(), req.clone(), policy).await;
+            let result = retry_with_policy(provider, target.clone(), req.clone(), rpolicy).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
             match result {
                 Ok(stream) => {
+                    self.breakers
+                        .record(&target.provider, &target.model, true, bpolicy);
                     tracing::info!(
                         provider = %target.provider,
                         model = %target.model,
@@ -74,12 +132,14 @@ impl ResilientCaller {
                     return Ok(stream);
                 }
                 Err(e) => {
-                    let eligibility = fallback_eligibility_with_overrides(&e, &policy.retry_on);
+                    self.breakers
+                        .record(&target.provider, &target.model, false, bpolicy);
+                    let eligibility = fallback_eligibility_with_overrides(&e, &rpolicy.retry_on);
                     let tag = crate::fallback::error_tag(&e);
                     tried.push(TriedUpstream {
                         provider: target.provider.clone(),
                         model: target.model.clone(),
-                        attempts: policy.max_attempts, // upper bound; real count
+                        attempts: rpolicy.max_attempts, // upper bound; real count
                         // is logged by retry loop
                         last_error_tag: tag.to_string(),
                         last_error_msg: e.to_string(),
@@ -109,16 +169,31 @@ impl ResilientCaller {
             }
         }
 
-        Err(ResilienceError::NoUpstreamSucceeded {
-            tried,
-            last_error: last_error.expect("loop only exits with last_error set on Err path"),
-        })
+        // Chain exhausted. Distinguish "every element skipped by breaker"
+        // from "every element actually attempted and failed".
+        if !tried.is_empty() {
+            Err(ResilienceError::NoUpstreamSucceeded {
+                tried,
+                last_error: last_error.expect("last_error set on every Err path"),
+            })
+        } else if !breakers_skipped.is_empty() {
+            Err(ResilienceError::AllBreakersOpen {
+                tried: breakers_skipped,
+            })
+        } else {
+            // chain.is_empty() — shouldn't reach here in practice.
+            Err(ResilienceError::TerminalError {
+                error: ProviderError::Network("empty chain".into()),
+                tried: vec![],
+            })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry};
     use agent_shim_core::{
         request::RequestMetadata, ContentBlock, ExtensionMap, FrontendInfo, FrontendKind,
         FrontendModel, GenerationOptions, Message, RequestId, ResolvedPolicy,
@@ -128,6 +203,21 @@ mod tests {
     use futures::stream;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Build N policies with `enabled: false` so the breaker never trips
+    /// and existing P02 retry/fallback semantics are unchanged.
+    fn disabled_breaker(n: usize) -> Vec<BreakerPolicy> {
+        (0..n)
+            .map(|_| BreakerPolicy {
+                enabled: false,
+                failure_threshold_pct: 50,
+                min_requests: 5,
+                window: Duration::from_secs(60),
+                open_cooldown: Duration::from_secs(30),
+            })
+            .collect()
+    }
 
     /// In-memory ProviderLookup with a name → MockProvider mapping.
     struct InMemoryProviders {
@@ -234,10 +324,13 @@ mod tests {
                 MockProvider::new("a", vec![Ok(())]) as Arc<_>,
             )]),
         });
-        let caller = ResilientCaller::new(providers);
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let caller = ResilientCaller::new(providers, registry);
         let chain = vec![target("a")];
         let policies = vec![fast_policy(2)];
-        let result = caller.complete(chain, dummy_request(), policies).await;
+        let result = caller
+            .complete(chain, dummy_request(), policies, disabled_breaker(1))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -267,10 +360,13 @@ mod tests {
                 ),
             ]),
         });
-        let caller = ResilientCaller::new(providers);
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let caller = ResilientCaller::new(providers, registry);
         let chain = vec![target("a"), target("b")];
         let policies = vec![fast_policy(2), fast_policy(2)];
-        let result = caller.complete(chain, dummy_request(), policies).await;
+        let result = caller
+            .complete(chain, dummy_request(), policies, disabled_breaker(2))
+            .await;
         assert!(result.is_ok());
     }
 
@@ -294,10 +390,13 @@ mod tests {
                 ),
             ]),
         });
-        let caller = ResilientCaller::new(providers);
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let caller = ResilientCaller::new(providers, registry);
         let chain = vec![target("a"), target("b")];
         let policies = vec![fast_policy(2), fast_policy(2)];
-        let result = caller.complete(chain, dummy_request(), policies).await;
+        let result = caller
+            .complete(chain, dummy_request(), policies, disabled_breaker(2))
+            .await;
         assert!(matches!(result, Err(ResilienceError::TerminalError { .. })));
     }
 
@@ -327,10 +426,13 @@ mod tests {
                 ),
             ]),
         });
-        let caller = ResilientCaller::new(providers);
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let caller = ResilientCaller::new(providers, registry);
         let chain = vec![target("a"), target("b")];
         let policies = vec![fast_policy(2), fast_policy(2)];
-        let result = caller.complete(chain, dummy_request(), policies).await;
+        let result = caller
+            .complete(chain, dummy_request(), policies, disabled_breaker(2))
+            .await;
         match result {
             Err(ResilienceError::NoUpstreamSucceeded { tried, .. }) => {
                 assert_eq!(tried.len(), 2);
@@ -339,6 +441,94 @@ mod tests {
             }
             Err(other) => panic!("expected NoUpstreamSucceeded, got {other:?}"),
             Ok(_) => panic!("expected NoUpstreamSucceeded, got Ok(stream)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn breaker_open_skips_chain_element_without_retry() {
+        let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
+            map: HashMap::from([
+                ("a".to_string(), MockProvider::new("a", vec![]) as Arc<_>),
+                (
+                    "b".to_string(),
+                    MockProvider::new("b", vec![Ok(())]) as Arc<_>,
+                ),
+            ]),
+        });
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+
+        // Pre-trip A's breaker.
+        let policy = BreakerPolicy {
+            enabled: true,
+            failure_threshold_pct: 50,
+            min_requests: 5,
+            window: Duration::from_secs(60),
+            open_cooldown: Duration::from_secs(30),
+        };
+        for _ in 0..5 {
+            registry.record("a", "gpt-4o", false, &policy);
+        }
+        assert_eq!(
+            registry.decision("a", "gpt-4o", &policy),
+            BreakerDecision::Skip
+        );
+
+        let caller = ResilientCaller::new(providers, registry);
+        let chain = vec![target("a"), target("b")];
+        let result = caller
+            .complete(
+                chain,
+                dummy_request(),
+                vec![fast_policy(2), fast_policy(2)],
+                vec![policy.clone(), policy.clone()],
+            )
+            .await;
+        assert!(result.is_ok());
+        // A's MockProvider was set up with empty scripted vec; if `a` was
+        // called even once it would have errored with "script exhausted".
+        // The Ok() result on B confirms A was correctly skipped.
+    }
+
+    #[tokio::test]
+    async fn all_breakers_open_returns_dedicated_variant() {
+        let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
+            map: HashMap::from([
+                ("a".to_string(), MockProvider::new("a", vec![]) as Arc<_>),
+                ("b".to_string(), MockProvider::new("b", vec![]) as Arc<_>),
+            ]),
+        });
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let policy = BreakerPolicy {
+            enabled: true,
+            failure_threshold_pct: 50,
+            min_requests: 5,
+            window: Duration::from_secs(60),
+            open_cooldown: Duration::from_secs(30),
+        };
+        for _ in 0..5 {
+            registry.record("a", "gpt-4o", false, &policy);
+        }
+        for _ in 0..5 {
+            registry.record("b", "gpt-4o", false, &policy);
+        }
+        let caller = ResilientCaller::new(providers, registry);
+        let chain = vec![target("a"), target("b")];
+        let result = caller
+            .complete(
+                chain,
+                dummy_request(),
+                vec![fast_policy(2), fast_policy(2)],
+                vec![policy.clone(), policy.clone()],
+            )
+            .await;
+        match result {
+            Err(ResilienceError::AllBreakersOpen { tried }) => {
+                assert_eq!(tried.len(), 2);
+                assert_eq!(tried[0], "a");
+                assert_eq!(tried[1], "b");
+            }
+            Err(other) => panic!("expected AllBreakersOpen, got {other:?}"),
+            Ok(_) => panic!("expected AllBreakersOpen, got Ok(stream)"),
         }
     }
 }
