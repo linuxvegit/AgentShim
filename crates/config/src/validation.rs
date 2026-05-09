@@ -290,7 +290,18 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
 ///
 /// Returns a human-readable `String` so the canonical `validate()` entry point
 /// can surface the message verbatim through `ValidationError::InvalidRoute`.
+///
+/// Short-circuits on `rate_limit.enabled = false`: if rate limiting is off
+/// at the master switch, stale or partially-edited bucket entries should
+/// not surface as hard config errors at startup. The fields are still
+/// parsed and stored — they're just not validated against the route table
+/// or bucket bounds. Operators who want stricter pre-validation should
+/// flip `enabled: true`.
 pub fn validate_rate_limit(cfg: &GatewayConfig) -> Result<(), String> {
+    if !cfg.rate_limit.enabled {
+        return Ok(());
+    }
+
     // Rule 7: per_route keys reference existing routes.
     for key in cfg.rate_limit.per_route.keys() {
         let parts: Vec<&str> = key.splitn(2, '/').collect();
@@ -319,14 +330,9 @@ pub fn validate_rate_limit(cfg: &GatewayConfig) -> Result<(), String> {
         }
     }
 
-    // Rule 9: per_key overrides start with sha256:.
+    // Rule 9: per_key overrides are SHA-256 hashes (sha256:<64 lowercase hex>).
     for key in cfg.rate_limit.per_key.overrides.keys() {
-        if !key.starts_with("sha256:") {
-            return Err(format!(
-                "rate_limit.per_key.overrides key '{key}' must start with 'sha256:'; \
-                 do not paste plaintext API keys here"
-            ));
-        }
+        check_sha256_key(key, "rate_limit.per_key.overrides")?;
     }
 
     // Rule 10: every bucket has rate_per_sec > 0 AND burst >= 1.
@@ -368,19 +374,41 @@ pub fn validate_rate_limit(cfg: &GatewayConfig) -> Result<(), String> {
 
 /// Phase 4 (Plan 04 P04 T3) `auth` block validation. Enforces:
 ///   - `auth.required=true` requires `auth.enabled=true`.
-///   - Every `auth.keys` key must start with `sha256:` (catches plaintext-key
-///     paste mistakes).
+///   - Every `auth.keys` key must be a `sha256:<64 lowercase hex>` value
+///     (catches plaintext-key paste mistakes AND typo-shaped hashes).
 pub fn validate_auth(cfg: &GatewayConfig) -> Result<(), String> {
     if cfg.auth.required && !cfg.auth.enabled {
         return Err("auth.required=true requires auth.enabled=true".into());
     }
     for key in cfg.auth.keys.keys() {
-        if !key.starts_with("sha256:") {
+        check_sha256_key(key, "auth.keys")?;
+    }
+    Ok(())
+}
+
+/// Validate that `key` is shaped `sha256:<64 lowercase hex>`.
+///
+/// Operators paste these from the recipe in `docs/resilience.md`
+/// (`echo -n key | sha256sum | awk '{print "sha256:" $1}'`). We catch
+/// three classes of paste mistake here:
+///   - Missing `sha256:` prefix (looks like a plaintext API key).
+///   - Wrong hex length (truncated or extra chars).
+///   - Non-hex characters in the hash (e.g. `sha256:nothex...`).
+fn check_sha256_key(key: &str, ctx: &str) -> Result<(), String> {
+    let hex = match key.strip_prefix("sha256:") {
+        Some(h) => h,
+        None => {
             return Err(format!(
-                "auth.keys key '{key}' must start with 'sha256:'; \
+                "{ctx} key '{key}' must start with 'sha256:'; \
                  do not paste plaintext API keys here"
             ));
         }
+    };
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{ctx} key '{key}' has malformed hash; expected 'sha256:' \
+             followed by 64 lowercase hex characters"
+        ));
     }
     Ok(())
 }
@@ -986,5 +1014,153 @@ auth:
     "#;
         let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
         assert!(validate_auth(&cfg).is_err());
+    }
+
+    // ── Followup tests (rule-8 coverage + sha256 format + disabled bypass +
+    //     v0.3 back-compat) — added in the P04 T3 followup ──
+
+    #[test]
+    fn rejects_per_upstream_unknown_upstream() {
+        // Rule 8: per_upstream key must reference an upstream that exists.
+        // The plan has rule-7 coverage (per_route → unknown route) but no
+        // companion test for per_upstream, leaving the rule provable only
+        // by inspection.
+        let cfg_yaml = r#"
+upstreams:
+  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x"}
+routes:
+  - frontend: openai_chat
+    model: gpt-4o
+    upstream: oai
+    upstream_model: gpt-4o
+rate_limit:
+  enabled: true
+  per_upstream:
+    "ghost-upstream": {rate_per_sec: 10, burst: 30}
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        let err = validate_rate_limit(&cfg).unwrap_err();
+        assert!(err.contains("ghost-upstream"));
+        assert!(err.contains("non-existent upstream"));
+    }
+
+    #[test]
+    fn rejects_auth_key_without_sha256_prefix() {
+        // Auth.keys parallel to rule 9: a plaintext API key pasted into
+        // auth.keys (instead of its hash) is the easy paste mistake to
+        // catch. The plan tested validate_auth's required→enabled rule
+        // but not the sha256: prefix path.
+        let cfg_yaml = r#"
+auth:
+  enabled: true
+  keys:
+    "plaintext-api-key":
+      label: "alice"
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        let err = validate_auth(&cfg).unwrap_err();
+        assert!(err.contains("sha256:"));
+    }
+
+    #[test]
+    fn rejects_sha256_with_wrong_hex_length() {
+        // The original `starts_with("sha256:")` check accepted any prefix.
+        // This pins the new format check: 64 lowercase hex chars after
+        // the prefix.
+        let cfg_yaml = r#"
+auth:
+  enabled: true
+  keys:
+    "sha256:abc":
+      label: "truncated"
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        let err = validate_auth(&cfg).unwrap_err();
+        assert!(err.contains("malformed hash"));
+    }
+
+    #[test]
+    fn rejects_sha256_with_non_hex_chars() {
+        // `sha256:nothex...` was previously accepted by the prefix-only
+        // check. Now rejected.
+        let cfg_yaml = r#"
+auth:
+  enabled: true
+  keys:
+    "sha256:nothex01234567890123456789012345678901234567890123456789012345":
+      label: "non-hex"
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        let err = validate_auth(&cfg).unwrap_err();
+        assert!(err.contains("malformed hash"));
+    }
+
+    #[test]
+    fn well_formed_sha256_hash_passes() {
+        // Positive case: a valid sha256:<64 lowercase hex> validates.
+        // Without this, a regression that broke the happy path would
+        // only be caught by the more end-to-end smoke tests.
+        let cfg_yaml = r#"
+auth:
+  enabled: true
+  keys:
+    "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824":
+      label: "alice"
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        validate_auth(&cfg).expect("well-formed sha256 hash must validate");
+    }
+
+    #[test]
+    fn rate_limit_disabled_skips_all_validation() {
+        // Master switch off → stale or partially-edited rate-limit fields
+        // should NOT surface as hard config errors. Operators flipping
+        // `enabled: false` to silence rate limiting in an emergency
+        // shouldn't be forced to clean up the rest of the block at the
+        // same time.
+        let cfg_yaml = r#"
+upstreams:
+  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x"}
+routes:
+  - frontend: openai_chat
+    model: gpt-4o
+    upstream: oai
+    upstream_model: gpt-4o
+rate_limit:
+  enabled: false
+  per_route:
+    "anthropic_messages/claude-opus-4-7": {rate_per_sec: 0, burst: 0}
+  per_upstream:
+    "ghost": {rate_per_sec: 10, burst: 30}
+  per_key:
+    overrides:
+      "plaintext-key": {rate_per_sec: 100, burst: 300}
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        validate_rate_limit(&cfg).expect("disabled rate_limit must skip validation entirely");
+    }
+
+    #[test]
+    fn v03_config_without_auth_or_rate_limit_blocks_parses() {
+        // Direct v0.3 back-compat assertion: a config with neither block
+        // must parse cleanly via #[serde(default)] AND pass validation.
+        // Existing v0.3 fixtures cover this transitively, but the
+        // assertion is fragile under future schema changes.
+        let cfg_yaml = r#"
+upstreams:
+  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x"}
+routes:
+  - frontend: openai_chat
+    model: gpt-4o
+    upstream: oai
+    upstream_model: gpt-4o
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        validate_rate_limit(&cfg).expect("default rate_limit must validate");
+        validate_auth(&cfg).expect("default auth must validate");
+        // Both Default impls produce the disabled state.
+        assert!(!cfg.auth.enabled);
+        assert!(!cfg.auth.required);
+        assert!(!cfg.rate_limit.enabled);
     }
 }
