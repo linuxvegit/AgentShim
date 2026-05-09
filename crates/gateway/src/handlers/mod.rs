@@ -245,6 +245,12 @@ impl IntoResponse for HandlerError {
         // body. We deliberately use a generic message ("Authentication
         // required.") instead of distinguishing missing-vs-unknown so
         // probing clients can't enumerate valid key shapes.
+        //
+        // The `WWW-Authenticate: Bearer realm="agent-shim"` header is
+        // RFC 7235-required for 401: HTTP libraries (curl --anyauth,
+        // SDKs that key auth-retry off the header) need it to know the
+        // server is challenging for credentials rather than failing
+        // for some other reason.
         if let HandlerError::Unauthorized { kind } = &self {
             let body = match kind {
                 FrontendKind::AnthropicMessages => serde_json::json!({
@@ -262,7 +268,12 @@ impl IntoResponse for HandlerError {
                     },
                 }),
             };
-            return (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+            let mut resp = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"agent-shim\""),
+            );
+            return resp;
         }
 
         // Resilience variants (P02 T5): they all carry `kind` so the body

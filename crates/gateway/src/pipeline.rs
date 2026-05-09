@@ -95,6 +95,54 @@ pub async fn dispatch(
         alias
     };
 
+    // Plan 04 P04 T4: extract identity + run the auth.required gate
+    // BEFORE route resolution. Both are in-memory hash lookups so order
+    // is a security choice rather than a perf one: returning 401 ahead
+    // of 404 prevents an unauthenticated probe from enumerating which
+    // routes exist. When `auth.enabled = false` we skip extraction —
+    // identity is always Anonymous and the rate-limit registry is
+    // separately gated by its own `enabled=false` short-circuit.
+    let identity = if state.auth_enabled {
+        let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
+        let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
+
+        if state.auth_required {
+            match &extracted {
+                AgentIdentity::Anonymous => {
+                    tracing::warn!(
+                        endpoint = spec.endpoint_label,
+                        "auth.required=true but request had no Authorization or x-api-key header"
+                    );
+                    return Err(HandlerError::Unauthorized {
+                        kind: spec.frontend.kind(),
+                    });
+                }
+                AgentIdentity::KeyHash(h) => {
+                    // Non-constant-time compare on already-hashed values
+                    // is fine: the hash itself is not a secret, so timing
+                    // leaks reveal nothing about the original key bytes.
+                    if !state.configured_key_hashes.contains(h) {
+                        // Operator log carries the hash (NEVER plaintext) so
+                        // a misconfigured client can be tracked down without
+                        // leaking the secret.
+                        tracing::warn!(
+                            endpoint = spec.endpoint_label,
+                            presented_hash = %h,
+                            "auth.required=true but presented key not in auth.keys allowlist"
+                        );
+                        return Err(HandlerError::Unauthorized {
+                            kind: spec.frontend.kind(),
+                        });
+                    }
+                }
+            }
+        }
+        extracted
+    } else {
+        AgentIdentity::Anonymous
+    };
+
     let chain = state
         .resolver
         .resolve(spec.frontend.kind(), &model_alias)
@@ -143,60 +191,15 @@ pub async fn dispatch(
     let breaker_policy = BreakerPolicy::from(&route_breaker_config);
     let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; chain.len()];
 
-    // Plan 04 P04 T4: extract identity + client IP for the rate-limit
-    // gates and the auth.required check. When `auth.enabled = false` we
-    // skip extraction entirely — the rate-limit registry is also
-    // disabled in that mode (the gates short-circuit on `enabled=false`)
-    // and identity is only ever Anonymous. When `auth.enabled = true`
-    // and `auth.required = true`, missing or unknown keys produce HTTP
-    // 401 here, BEFORE the chain walk.
-    let identity = if state.auth_enabled {
-        let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
-        let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-        let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
-
-        if state.auth_required {
-            match &extracted {
-                AgentIdentity::Anonymous => {
-                    tracing::warn!(
-                        endpoint = spec.endpoint_label,
-                        "auth.required=true but request had no Authorization or x-api-key header"
-                    );
-                    return Err(HandlerError::Unauthorized {
-                        kind: spec.frontend.kind(),
-                    });
-                }
-                AgentIdentity::KeyHash(h) => {
-                    if !state.configured_key_hashes.contains(h) {
-                        // Operator log carries the hash (NEVER plaintext) so
-                        // a misconfigured client can be tracked down without
-                        // leaking the secret.
-                        tracing::warn!(
-                            endpoint = spec.endpoint_label,
-                            presented_hash = %h,
-                            "auth.required=true but presented key not in auth.keys allowlist"
-                        );
-                        return Err(HandlerError::Unauthorized {
-                            kind: spec.frontend.kind(),
-                        });
-                    }
-                }
-            }
-        }
-        extracted
-    } else {
-        AgentIdentity::Anonymous
-    };
-
-    // Best-effort client IP. `x-forwarded-for` first (when behind a
-    // reverse proxy) — take the leftmost token, which is the original
-    // client per RFC 7239. `unknown` fallback when no header is set; the
-    // per-IP bucket will key all such requests together, which is what
-    // we want before the proxy is configured.
+    // Plan 04 P04 T4: build `client_ip` and `frontend_model` for the
+    // rate-limit gates. These depend on `model_alias`, so they're built
+    // AFTER the auth.required check but BEFORE the chain walk.
     //
-    // axum's `dispatch` does not currently receive the socket peer
-    // addr; threading it through the handler signature is a v0.5 P5
-    // concern.
+    // `x-forwarded-for` is client-controlled when no reverse proxy
+    // strips/rewrites it, so the per-IP bucket is trivially bypassable
+    // by direct-internet-exposed deployments. Operators should front the
+    // gateway with a known proxy that asserts the header. Threading the
+    // socket peer addr through the handler signature is a v0.5 P5 concern.
     let client_ip = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
