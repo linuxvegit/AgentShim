@@ -12,8 +12,9 @@
 //!   back to Closed (and clear the window). On failure, transition back to
 //!   Open with fresh cooldown.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Injectable clock so transitions are deterministic in tests.
@@ -314,9 +315,6 @@ mod tests {
     }
 }
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-
 /// `(provider, model)` key for the breaker registry.
 type BreakerKey = (String, String);
 
@@ -327,6 +325,17 @@ type BreakerMap = HashMap<BreakerKey, Arc<RwLock<BreakerState>>>;
 
 /// Registry keyed by `(provider, model)`. Each key has its own
 /// `BreakerState` behind the registry's `RwLock`.
+///
+/// **Memory growth:** the inner map only inserts and never evicts, so its
+/// cardinality is bounded by the set of `(provider, model)` pairs that have
+/// ever been observed. Under Phase 4 P03 this is bounded by the static route
+/// table; future wildcard / dynamic-model routing should revisit this and
+/// add an eviction strategy if the bound becomes loose.
+///
+/// **Lock-poisoning policy:** internal `read()`/`write()` calls
+/// `.unwrap()` poisoned guards. A panic inside any guard taints that
+/// breaker; callers should treat a poisoned breaker as a fatal process
+/// invariant violation and propagate the panic.
 pub struct BreakerRegistry {
     breakers: RwLock<BreakerMap>,
     clock: Arc<dyn Clock>,
@@ -426,5 +435,20 @@ mod registry_tests {
         // No assertion on final state — concurrency makes that
         // non-deterministic. The win is that the test completes without
         // deadlocking or panicking.
+    }
+
+    #[test]
+    fn get_or_create_returns_same_arc_for_same_key() {
+        // Locks in the dedup invariant of `get_or_create`'s slow path:
+        // two calls for the same `(provider, model)` must yield clones of
+        // the *same* Arc, not two distinct breakers. The concurrent test
+        // above only proves liveness; this asserts identity.
+        let registry = BreakerRegistry::with_system_clock();
+        let a = registry.get_or_create("openai", "gpt-4o");
+        let b = registry.get_or_create("openai", "gpt-4o");
+        assert!(Arc::ptr_eq(&a, &b));
+        // Distinct key → distinct Arc.
+        let c = registry.get_or_create("anthropic", "claude-opus-4-7");
+        assert!(!Arc::ptr_eq(&a, &c));
     }
 }
