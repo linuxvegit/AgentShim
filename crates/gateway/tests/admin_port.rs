@@ -73,7 +73,7 @@ async fn admin_disabled_when_block_absent() {
     let public_port = pick_port().await;
     let yaml = config_yaml(public_port, None);
     let public_addr = spawn_gateway(&yaml).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Public listener responds at /
     let resp = reqwest::get(format!("http://{}/", public_addr)).await.unwrap();
@@ -81,6 +81,11 @@ async fn admin_disabled_when_block_absent() {
 
     // /healthz no longer on the public port (was moved to admin in P01 T3)
     let resp = reqwest::get(format!("http://{}/healthz", public_addr)).await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // /readyz also moved off the public port (was never there in P01,
+    // belt-and-braces for future drift).
+    let resp = reqwest::get(format!("http://{}/readyz", public_addr)).await.unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -90,7 +95,7 @@ async fn admin_listener_serves_healthz_when_configured() {
     let admin_port = pick_port().await;
     let yaml = config_yaml(public_port, Some(admin_port));
     let (_public, admin_addr) = spawn_gateway_with_admin(&yaml).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = reqwest::get(format!("http://{}/healthz", admin_addr)).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -103,7 +108,7 @@ async fn admin_listener_serves_readyz_when_configured() {
     let admin_port = pick_port().await;
     let yaml = config_yaml(public_port, Some(admin_port));
     let (_public, admin_addr) = spawn_gateway_with_admin(&yaml).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = reqwest::get(format!("http://{}/readyz", admin_addr)).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -116,7 +121,7 @@ async fn admin_listener_does_not_expose_v1_endpoints() {
     let admin_port = pick_port().await;
     let yaml = config_yaml(public_port, Some(admin_port));
     let (_public, admin_addr) = spawn_gateway_with_admin(&yaml).await;
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // /v1/* must not be reachable on admin port (security boundary).
     let resp = reqwest::Client::new()
