@@ -12,6 +12,8 @@ path = "src/lib.rs"
 agent-shim-core = { path = "../core" }
 agent-shim-config = { path = "../config" }
 agent-shim-providers = { path = "../providers" }
+governor = "0.6"
+nonzero_ext = "0.3"
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true

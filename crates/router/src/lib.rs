@@ -70,6 +70,7 @@ pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
     fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility,
 };
+pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry};
 pub use resilient_caller::{ProviderLookup, ResilientCaller};
 pub use resolver::ModelResolver;
 pub use retry::{compute_backoff, retry_with_policy, RetryPolicy};
