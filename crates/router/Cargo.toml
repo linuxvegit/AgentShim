@@ -17,6 +17,7 @@ serde.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = { workspace = true }

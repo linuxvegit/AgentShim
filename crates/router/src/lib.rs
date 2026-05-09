@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod circuit_breaker;
 pub mod errors;
 pub mod fallback;
@@ -63,6 +64,7 @@ pub trait Router: Send + Sync {
     }
 }
 
+pub use auth::{extract_identity_from_headers, hash_key, AgentIdentity};
 pub use circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry, Clock, SystemClock};
 pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
