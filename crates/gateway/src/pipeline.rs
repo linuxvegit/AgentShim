@@ -107,24 +107,41 @@ pub async fn dispatch(
     // uniformly. Build one `RetryPolicy` and clone it per chain position so
     // `ResilientCaller::complete` can apply it independently to each
     // upstream's retry budget.
-    let route_retry_config = state
+    let route_retry_config = match state
         .resolver
         .find_retry_policy(spec.frontend.kind(), &model_alias)
-        .unwrap_or_default();
+    {
+        Some(c) => c,
+        None => {
+            tracing::debug!(
+                model = %model_alias,
+                "no route-specific retry policy; using RetryConfig defaults"
+            );
+            Default::default()
+        }
+    };
     let retry_policy = RetryPolicy::from(&route_retry_config);
-    let policies: Vec<RetryPolicy> = (0..chain.len()).map(|_| retry_policy.clone()).collect();
+    let policies: Vec<RetryPolicy> = vec![retry_policy; chain.len()];
 
     // Plan 04 P03 T4: parallel breaker policies — same uniform-per-route
     // shape as retry, fed into `ResilientCaller::complete` alongside the
     // retry policies. Falls back to `BreakerConfig::default()` (the §4.5/D6
     // defaults) when the route doesn't override.
-    let route_breaker_config = state
+    let route_breaker_config = match state
         .resolver
         .find_breaker_policy(spec.frontend.kind(), &model_alias)
-        .unwrap_or_default();
+    {
+        Some(c) => c,
+        None => {
+            tracing::debug!(
+                model = %model_alias,
+                "no route-specific breaker policy; using BreakerConfig defaults"
+            );
+            Default::default()
+        }
+    };
     let breaker_policy = BreakerPolicy::from(&route_breaker_config);
-    let breaker_policies: Vec<BreakerPolicy> =
-        (0..chain.len()).map(|_| breaker_policy.clone()).collect();
+    let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; chain.len()];
 
     // The chain is non-empty by router invariant (singular routes produce
     // 1-element vecs; array routes are validated to be non-empty by
