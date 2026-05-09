@@ -57,13 +57,22 @@ pub struct AppCore {
     /// rebinding mid-process is out of scope, so these never change after
     /// `AppCore` is constructed.
     pub server_config: agent_shim_config::ServerConfig,
-    /// Admin listener config. `None` when the YAML had no `admin:` block,
-    /// which keeps the admin port opt-in.
+    /// Optional admin listener config (Plan 01 P01 T1 schema; consumed
+    /// by `commands::serve` in T4 to bind the admin port). `None` →
+    /// admin listener disabled entirely (spec D10). The
+    /// `#[allow(dead_code)]` falls off in T4.
     #[allow(dead_code)]
     pub admin_config: Option<agent_shim_config::AdminConfig>,
+    /// Anthropic Messages frontend adapter (decode + encode). Built
+    /// once at startup; the per-request keepalive is captured here.
     pub anthropic: Arc<AnthropicMessages>,
+    /// OpenAI Chat Completions frontend adapter.
     pub openai: Arc<OpenAiChat>,
+    /// OpenAI Responses frontend adapter.
     pub openai_responses: Arc<OpenAiResponses>,
+    /// Backend provider registry. The chain walker (`ResilientCaller`)
+    /// looks up providers through `GatewayProviderLookup`, which
+    /// borrows this Arc.
     pub providers: Arc<ProviderRegistry>,
     /// Resolves `(frontend, model_alias)` → `BackendTarget`. Owns both the
     /// static route table and the fuzzy model index as internal seams.
@@ -319,28 +328,53 @@ routes:
         let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
         let state = AppState::new(cfg).await;
 
-        // Core holds the immutable handles.
-        assert!(state.core.providers.get("noop").is_some());
-        let _registry: &Arc<agent_shim_router::BreakerRegistry> = &state.core.breaker_registry;
-        assert!(
-            state.core.admin_config.is_none(),
-            "absent admin block → None"
-        );
+        // Compile-time assertions: each half holds the right type. Pinning
+        // the types here ensures a future refactor can't quietly move a
+        // field from one half to the other without breaking this test.
+        let _: &Arc<agent_shim_providers::ProviderRegistry> = &state.core.providers;
+        let _: &Arc<agent_shim_router::BreakerRegistry> = &state.core.breaker_registry;
+        let _: &Arc<agent_shim_router::ModelResolver> = &state.core.resolver;
+        let _: &Arc<agent_shim_router::LimiterRegistry> = &state.core.limiter_registry;
+        let _: &Arc<agent_shim_router::ResilientCaller> = &state.core.resilient_caller;
+        let _: &Option<agent_shim_config::AdminConfig> = &state.core.admin_config;
 
-        // Snapshot holds the policy-bearing config.
         let snap = state.snapshot.load_full();
+        let _: &Arc<agent_shim_config::GatewayConfig> = &snap.config;
+        let _: &Arc<HashSet<String>> = &snap.configured_key_hashes;
+
+        // Behavioural assertion: the YAML's absent auth block produces the
+        // expected defaults on the snapshot side.
         assert!(!snap.auth_required);
         assert!(snap.configured_key_hashes.is_empty());
+        assert!(state.core.admin_config.is_none(), "absent admin block → None");
+        assert!(state.core.providers.get("noop").is_some());
     }
 
     #[tokio::test]
-    async fn appstate_snapshot_arc_clone_is_cheap() {
-        // Arc<ArcSwap<AppSnapshot>> readers must be lock-free.
+    async fn captured_snapshot_survives_swap() {
+        // The §2.2 invariant: in-flight requests use the snapshot at the
+        // time of their start. Mid-request swap doesn't reach them.
         let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
         let state = AppState::new(cfg).await;
-        let snap1 = state.snapshot.load_full();
-        let snap2 = state.snapshot.load_full();
-        // Same underlying allocation — no swap occurred.
-        assert!(Arc::ptr_eq(&snap1, &snap2));
+
+        // Simulate request capture (what pipeline::dispatch does at the top).
+        let captured = state.snapshot.load_full();
+        assert!(!captured.auth_required);
+
+        // Build a replacement snapshot with auth_required = true and store.
+        let new_snap = AppSnapshot {
+            config: Arc::clone(&captured.config),
+            auth_enabled: true,
+            auth_required: true,
+            configured_key_hashes: Arc::clone(&captured.configured_key_hashes),
+        };
+        state.snapshot.store(Arc::new(new_snap));
+
+        // The captured Arc still sees the OLD value — in-flight requests
+        // are unaffected by the swap.
+        assert!(!captured.auth_required, "captured snapshot stays valid post-swap");
+
+        // A fresh load sees the NEW value — new requests pick up the swap.
+        assert!(state.snapshot.load_full().auth_required, "fresh load sees new snapshot");
     }
 }
