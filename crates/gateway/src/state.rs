@@ -15,7 +15,8 @@ use agent_shim_providers::{
 };
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
-    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, Router, StaticRouter,
+    BreakerRegistry, Clock, ModelResolver, ProviderLookup, ResilientCaller, Router, StaticRouter,
+    SystemClock,
 };
 
 /// Adapter that lets `ResilientCaller` (in the router crate) look up
@@ -65,6 +66,33 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: GatewayConfig) -> Self {
+        Self::build(config, Arc::new(SystemClock)).await
+    }
+
+    /// Test-only constructor that lets tests inject a custom `Clock` into
+    /// the `BreakerRegistry`. Production callers MUST use `AppState::new`.
+    ///
+    /// Plan 04 P03 T6: the half-open recovery smoke test needs deterministic
+    /// time control to advance past `open_cooldown_secs` without sleeping. A
+    /// `FakeClock` injected here flows through `BreakerRegistry::new(clock)`
+    /// into every breaker decision/record call.
+    ///
+    /// `#[allow(dead_code)]` because integration tests in
+    /// `crates/gateway/tests/` are a separate compilation unit; the
+    /// library build proper does not call this constructor and would
+    /// otherwise warn under `-D warnings`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub async fn new_with_clock(config: GatewayConfig, clock: Arc<dyn Clock>) -> Self {
+        Self::build(config, clock).await
+    }
+
+    /// Shared construction path for `new` and `new_with_clock`. The only
+    /// thing the two callers parameterize is the `Clock` handed to
+    /// `BreakerRegistry::new` — everything else (provider registry,
+    /// resolver, frontend handlers) is identical, so extracting this
+    /// helper keeps the two public constructors as one-liners.
+    async fn build(config: GatewayConfig, clock: Arc<dyn Clock>) -> Self {
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
         let anthropic = Arc::new(AnthropicMessages {
             keepalive: Some(keepalive),
@@ -141,7 +169,7 @@ impl AppState {
         let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(GatewayProviderLookup {
             registry: Arc::clone(&providers),
         });
-        let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
+        let breaker_registry = Arc::new(BreakerRegistry::new(clock));
         let resilient_caller = Arc::new(ResilientCaller::new(
             provider_lookup,
             Arc::clone(&breaker_registry),
