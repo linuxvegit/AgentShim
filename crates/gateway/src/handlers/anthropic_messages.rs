@@ -14,7 +14,7 @@ pub async fn handle(
     body: Bytes,
 ) -> Result<Response, HandlerError> {
     let spec = PipelineSpec {
-        frontend: state.anthropic.as_ref(),
+        frontend: state.core.anthropic.as_ref(),
         endpoint_label: "/v1/messages",
         capture_anthropic_headers: true,
         try_proxy_raw: true,

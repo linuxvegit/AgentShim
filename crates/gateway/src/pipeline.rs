@@ -69,6 +69,11 @@ pub async fn dispatch(
     let body_bytes = body.len();
     let started = std::time::Instant::now();
 
+    // Plan 01 P01 T2: capture the policy snapshot once. In-flight requests
+    // use this snapshot for their entire lifetime; mid-request reload (Plan
+    // 04) does not affect them.
+    let snapshot = state.snapshot.load_full();
+
     // Resolve the route up front. The Responses passthrough path needs the
     // target before it has decoded the body, so route resolution has to come
     // first regardless of which path we take.
@@ -102,12 +107,12 @@ pub async fn dispatch(
     // routes exist. When `auth.enabled = false` we skip extraction —
     // identity is always Anonymous and the rate-limit registry is
     // separately gated by its own `enabled=false` short-circuit.
-    let identity = if state.auth_enabled {
+    let identity = if snapshot.auth_enabled {
         let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
         let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
         let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
 
-        if state.auth_required {
+        if snapshot.auth_required {
             match &extracted {
                 AgentIdentity::Anonymous => {
                     tracing::warn!(
@@ -122,7 +127,7 @@ pub async fn dispatch(
                     // Non-constant-time compare on already-hashed values
                     // is fine: the hash itself is not a secret, so timing
                     // leaks reveal nothing about the original key bytes.
-                    if !state.configured_key_hashes.contains(h) {
+                    if !snapshot.configured_key_hashes.contains(h) {
                         // Operator log carries the hash (NEVER plaintext) so
                         // a misconfigured client can be tracked down without
                         // leaking the secret.
@@ -144,6 +149,7 @@ pub async fn dispatch(
     };
 
     let chain = state
+        .core
         .resolver
         .resolve(spec.frontend.kind(), &model_alias)
         .map_err(|e| {
@@ -156,6 +162,7 @@ pub async fn dispatch(
     // `ResilientCaller::complete` can apply it independently to each
     // upstream's retry budget.
     let route_retry_config = match state
+        .core
         .resolver
         .find_retry_policy(spec.frontend.kind(), &model_alias)
     {
@@ -176,6 +183,7 @@ pub async fn dispatch(
     // retry policies. Falls back to `BreakerConfig::default()` (the §4.5/D6
     // defaults) when the route doesn't override.
     let route_breaker_config = match state
+        .core
         .resolver
         .find_breaker_policy(spec.frontend.kind(), &model_alias)
     {
@@ -229,12 +237,16 @@ pub async fn dispatch(
         .clone();
     let upstream_model = first_target.model.clone();
 
-    let first_provider = state.providers.get(&first_target.provider).ok_or_else(|| {
-        tracing::error!(provider = %first_target.provider, "provider not registered");
-        HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-            first_target.provider.clone(),
-        ))
-    })?;
+    let first_provider = state
+        .core
+        .providers
+        .get(&first_target.provider)
+        .ok_or_else(|| {
+            tracing::error!(provider = %first_target.provider, "provider not registered");
+            HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
+                first_target.provider.clone(),
+            ))
+        })?;
 
     // Raw-passthrough short-circuit: only the Responses frontend uses this.
     // We don't know reasoning_effort etc. without decoding the body, so log
@@ -479,6 +491,7 @@ async fn run_stream(
     // `CanonicalStream` from whichever upstream succeeded; downstream
     // encoding is unchanged from the pre-T6 single-upstream world.
     let upstream_stream = state
+        .core
         .resilient_caller
         .complete(
             chain,
@@ -582,6 +595,7 @@ async fn run_unary(
     } = ctx;
 
     let stream = state
+        .core
         .resilient_caller
         .complete(
             chain,

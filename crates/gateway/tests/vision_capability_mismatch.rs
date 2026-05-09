@@ -28,7 +28,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_gateway::server::build_router;
-use agent_shim_gateway::state::AppState;
+use agent_shim_gateway::state::{AppCore, AppSnapshot, AppState};
 use agent_shim_providers::{
     BackendProvider, ProviderCapabilities, ProviderError, ProviderRegistry,
 };
@@ -177,18 +177,25 @@ fn make_app_state() -> AppState {
     ));
 
     AppState {
-        config: Arc::new(cfg),
-        anthropic,
-        openai,
-        openai_responses,
-        providers,
-        resolver,
-        resilient_caller,
-        breaker_registry,
-        limiter_registry,
-        auth_enabled: false,
-        auth_required: false,
-        configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+        core: Arc::new(AppCore {
+            config_path: None,
+            server_config: cfg.server.clone(),
+            admin_config: cfg.admin.clone(),
+            anthropic,
+            openai,
+            openai_responses,
+            providers,
+            resolver,
+            resilient_caller,
+            breaker_registry,
+            limiter_registry,
+        }),
+        snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
+            config: Arc::new(cfg),
+            auth_enabled: false,
+            auth_required: false,
+            configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+        }))),
     }
 }
 

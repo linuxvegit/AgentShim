@@ -16,7 +16,11 @@ pub enum ValidationError {
     #[error("invalid route: {0}")]
     InvalidRoute(String),
     #[error("admin.port {admin} collides with server.port {server} on bind {bind}")]
-    PortCollision { admin: u16, server: u16, bind: String },
+    PortCollision {
+        admin: u16,
+        server: u16,
+        bind: String,
+    },
 }
 
 const VALID_FRONTENDS: &[&str] = &[
@@ -1189,7 +1193,10 @@ routes:
     #[test]
     fn admin_port_zero_rejected() {
         let mut cfg = minimal_cfg();
-        cfg.admin = Some(crate::AdminConfig { bind: "127.0.0.1".into(), port: 0 });
+        cfg.admin = Some(crate::AdminConfig {
+            bind: "127.0.0.1".into(),
+            port: 0,
+        });
         assert!(matches!(validate(&cfg), Err(ValidationError::ZeroPort)));
     }
 
@@ -1201,7 +1208,11 @@ routes:
             port: cfg.server.port,
         });
         match validate(&cfg) {
-            Err(ValidationError::PortCollision { admin, server, bind }) => {
+            Err(ValidationError::PortCollision {
+                admin,
+                server,
+                bind,
+            }) => {
                 assert_eq!(admin, cfg.server.port);
                 assert_eq!(server, cfg.server.port);
                 assert_eq!(bind, cfg.server.bind);

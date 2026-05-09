@@ -749,7 +749,10 @@ admin:
 "#;
         let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
         let admin = cfg.admin.expect("admin block present");
-        assert_eq!(admin.bind, "127.0.0.1", "bind should fall back to default when omitted");
+        assert_eq!(
+            admin.bind, "127.0.0.1",
+            "bind should fall back to default when omitted"
+        );
         assert_eq!(admin.port, 9200);
     }
 }

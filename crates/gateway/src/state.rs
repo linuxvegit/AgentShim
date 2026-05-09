@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_shim_config::{GatewayConfig, UpstreamConfig};
+use arc_swap::ArcSwap;
+
+use agent_shim_config::UpstreamConfig;
 use agent_shim_frontends::{
     anthropic_messages::AnthropicMessages, openai_chat::OpenAiChat,
     openai_responses::OpenAiResponses,
@@ -38,9 +40,27 @@ impl ProviderLookup for GatewayProviderLookup {
     }
 }
 
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<GatewayConfig>,
+/// Immutable handles built once at startup. None of these fields can change
+/// without restarting the process. See Phase 5 design spec §2.2 for the
+/// AppCore vs AppSnapshot split.
+///
+/// Plan 01 P01 T2: extracted from the old monolithic `AppState` so Plan 04's
+/// hot-reload path can swap the policy-bearing `AppSnapshot` while leaving
+/// the immutable handles (provider registry, breaker registry, etc.) alone.
+pub struct AppCore {
+    /// Path the configuration was originally loaded from. `None` when the
+    /// state was constructed from an in-memory `GatewayConfig` (tests, ad-hoc
+    /// callers). Plan 04 will read this for SIGHUP-triggered reloads.
+    #[allow(dead_code)]
+    pub config_path: Option<std::path::PathBuf>,
+    /// Bind address / keepalive / timeout knobs cached at startup. Server
+    /// rebinding mid-process is out of scope, so these never change after
+    /// `AppCore` is constructed.
+    pub server_config: agent_shim_config::ServerConfig,
+    /// Admin listener config. `None` when the YAML had no `admin:` block,
+    /// which keeps the admin port opt-in.
+    #[allow(dead_code)]
+    pub admin_config: Option<agent_shim_config::AdminConfig>,
     pub anthropic: Arc<AnthropicMessages>,
     pub openai: Arc<OpenAiChat>,
     pub openai_responses: Arc<OpenAiResponses>,
@@ -51,28 +71,28 @@ pub struct AppState {
     /// Resilience-layer entry point. Wraps the same provider registry
     /// behind a `ProviderLookup` adapter, then walks the chain from the
     /// resolver per request, applying retry+fallback per chain element.
-    /// Plan 04 P02 T6 wires this into `pipeline::dispatch`.
     pub resilient_caller: Arc<ResilientCaller>,
-    /// Per-`(provider, model)` circuit breakers. Built once at startup and
-    /// shared with `ResilientCaller`. Plan 04 P03 T4: the gateway holds
-    /// the canonical handle so future surfaces (admin endpoints, metrics)
-    /// can introspect the same registry the chain walker is using.
-    ///
-    /// `#[allow(dead_code)]` because the request hot path reads through
-    /// `resilient_caller`'s clone of this Arc; this field is the
-    /// future-facing introspection seam.
+    /// Per-`(provider, model)` circuit breakers. State, not policy — the
+    /// breaker map survives reload (spec §2.2). Future admin/introspection
+    /// endpoints will read through this Arc.
     #[allow(dead_code)]
     pub breaker_registry: Arc<BreakerRegistry>,
-    /// Token-bucket rate limiters owned at the gateway boundary. Plan 04
-    /// P04 T4 wires this into `ResilientCaller` (which actually consults
-    /// the buckets) and keeps the canonical handle here for the same
-    /// reason as `breaker_registry` — future admin/introspection
-    /// endpoints will read through this Arc.
-    ///
-    /// `#[allow(dead_code)]` because the request hot path reads through
-    /// `resilient_caller`'s clone of this Arc.
+    /// Token-bucket rate limiters. The registry holds buckets across reload;
+    /// individual buckets are replaced when policy changes (spec §5.4).
     #[allow(dead_code)]
     pub limiter_registry: Arc<LimiterRegistry>,
+}
+
+/// Hot-swappable policy-bearing snapshot. Plan 04 will swap this on
+/// SIGHUP / `POST /admin/reload`; in P01 it is built once and never replaced.
+/// See Phase 5 design spec §2.2.
+pub struct AppSnapshot {
+    /// The policy-bearing config. Hot-reloadable fields (auth, rate_limit,
+    /// routes, upstream-policy knobs) live here; immutable startup-time
+    /// fields (server bind, admin listener, provider construction) live on
+    /// `AppCore`.
+    #[allow(dead_code)]
+    pub config: Arc<agent_shim_config::GatewayConfig>,
     /// Pre-computed `auth.enabled` so `pipeline::dispatch` doesn't re-walk
     /// the config on every request. Plan 04 P04 T4.
     pub auth_enabled: bool,
@@ -86,8 +106,21 @@ pub struct AppState {
     pub configured_key_hashes: Arc<HashSet<String>>,
 }
 
+/// The application-wide handler state cloned into every axum handler.
+///
+/// Phase 5 P01 T2: split into a fixed `AppCore` (provider registry, frontend
+/// adapters, resilience layer) and a hot-swappable `AppSnapshot` (config,
+/// auth, etc.). In-flight requests capture the snapshot once at the top of
+/// `pipeline::dispatch` so a mid-request reload does not perturb their
+/// policy view (spec §2.2).
+#[derive(Clone)]
+pub struct AppState {
+    pub core: Arc<AppCore>,
+    pub snapshot: Arc<ArcSwap<AppSnapshot>>,
+}
+
 impl AppState {
-    pub async fn new(config: GatewayConfig) -> Self {
+    pub async fn new(config: agent_shim_config::GatewayConfig) -> Self {
         Self::build(config, Arc::new(SystemClock)).await
     }
 
@@ -105,7 +138,10 @@ impl AppState {
     /// otherwise warn under `-D warnings`.
     #[doc(hidden)]
     #[allow(dead_code)]
-    pub async fn new_with_clock(config: GatewayConfig, clock: Arc<dyn Clock>) -> Self {
+    pub async fn new_with_clock(
+        config: agent_shim_config::GatewayConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self::build(config, clock).await
     }
 
@@ -114,7 +150,7 @@ impl AppState {
     /// `BreakerRegistry::new` — everything else (provider registry,
     /// resolver, frontend handlers) is identical, so extracting this
     /// helper keeps the two public constructors as one-liners.
-    async fn build(config: GatewayConfig, clock: Arc<dyn Clock>) -> Self {
+    async fn build(config: agent_shim_config::GatewayConfig, clock: Arc<dyn Clock>) -> Self {
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
         let anthropic = Arc::new(AnthropicMessages {
             keepalive: Some(keepalive),
@@ -218,8 +254,20 @@ impl AppState {
         let configured_key_hashes: Arc<HashSet<String>> =
             Arc::new(config.auth.keys.keys().cloned().collect());
 
-        Self {
+        let server_config = config.server.clone();
+        let admin_config = config.admin.clone();
+
+        let snapshot = AppSnapshot {
             config: Arc::new(config),
+            auth_enabled,
+            auth_required,
+            configured_key_hashes,
+        };
+
+        let core = AppCore {
+            config_path: None,
+            server_config,
+            admin_config,
             anthropic,
             openai,
             openai_responses,
@@ -228,9 +276,11 @@ impl AppState {
             resilient_caller,
             breaker_registry,
             limiter_registry,
-            auth_enabled,
-            auth_required,
-            configured_key_hashes,
+        };
+
+        Self {
+            core: Arc::new(core),
+            snapshot: Arc::new(ArcSwap::new(Arc::new(snapshot))),
         }
     }
 }
@@ -242,4 +292,55 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_yaml() -> &'static str {
+        r#"
+server: {bind: 127.0.0.1, port: 8787}
+upstreams:
+  noop:
+    type: open_ai_compatible
+    base_url: http://localhost:9999/v1
+    api_key: dummy
+routes:
+  - frontend: openai_chat
+    model: x
+    upstream: noop
+    upstream_model: x
+"#
+    }
+
+    #[tokio::test]
+    async fn appstate_split_into_core_and_snapshot() {
+        let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
+        let state = AppState::new(cfg).await;
+
+        // Core holds the immutable handles.
+        assert!(state.core.providers.get("noop").is_some());
+        let _registry: &Arc<agent_shim_router::BreakerRegistry> = &state.core.breaker_registry;
+        assert!(
+            state.core.admin_config.is_none(),
+            "absent admin block → None"
+        );
+
+        // Snapshot holds the policy-bearing config.
+        let snap = state.snapshot.load_full();
+        assert!(!snap.auth_required);
+        assert!(snap.configured_key_hashes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn appstate_snapshot_arc_clone_is_cheap() {
+        // Arc<ArcSwap<AppSnapshot>> readers must be lock-free.
+        let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
+        let state = AppState::new(cfg).await;
+        let snap1 = state.snapshot.load_full();
+        let snap2 = state.snapshot.load_full();
+        // Same underlying allocation — no swap occurred.
+        assert!(Arc::ptr_eq(&snap1, &snap2));
+    }
 }

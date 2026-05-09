@@ -33,8 +33,11 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Start the server, binding to the address in the config.
 pub async fn run(state: AppState) -> Result<()> {
-    let bind: SocketAddr =
-        format!("{}:{}", state.config.server.bind, state.config.server.port).parse()?;
+    let bind: SocketAddr = format!(
+        "{}:{}",
+        state.core.server_config.bind, state.core.server_config.port
+    )
+    .parse()?;
 
     let app = build_router(state);
     info!("Listening on {}", bind);
