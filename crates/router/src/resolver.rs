@@ -123,6 +123,8 @@ mod tests {
                 retry: RetryConfig::default(),
                 breaker: BreakerConfig::default(),
             }],
+            auth: Default::default(),
+            rate_limit: Default::default(),
             copilot: None,
         }
     }
@@ -218,6 +220,8 @@ mod tests {
                 retry: RetryConfig::default(),
                 breaker: BreakerConfig::default(),
             }],
+            auth: Default::default(),
+            rate_limit: Default::default(),
             copilot: None,
         };
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));

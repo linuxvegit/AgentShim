@@ -70,6 +70,8 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             "test-anthropic",
             "claude-opus-4-7",
         )],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     }
 }

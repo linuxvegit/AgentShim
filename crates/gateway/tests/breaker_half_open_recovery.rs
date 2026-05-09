@@ -140,6 +140,8 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
                 open_cooldown_secs: 30,
             },
         }],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     }
 }

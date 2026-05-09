@@ -107,6 +107,8 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
             },
             breaker: BreakerConfig::default(),
         }],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     }
 }

@@ -14,6 +14,10 @@ pub struct GatewayConfig {
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
     pub copilot: Option<CopilotConfig>,
 }
 
@@ -354,6 +358,76 @@ fn default_window_secs() -> u64 {
 }
 fn default_open_cooldown_secs() -> u64 {
     30
+}
+
+/// Top-level auth config. Default: disabled (preserves v0.3 behavior).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    pub enabled: bool,
+    pub required: bool,
+    pub keys: BTreeMap<String, AuthKeyEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthKeyEntry {
+    pub label: String,
+}
+
+/// Top-level rate-limit config. Default: disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RateLimitConfig {
+    pub enabled: bool,
+    pub per_key: PerKeyConfig,
+    pub per_route: BTreeMap<String, BucketConfigYaml>,
+    pub per_upstream: BTreeMap<String, BucketConfigYaml>,
+    pub per_ip: PerIpConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PerKeyConfig {
+    pub default: Option<BucketConfigYaml>,
+    pub anonymous: Option<BucketConfigYaml>,
+    pub overrides: BTreeMap<String, BucketConfigYaml>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfigYaml {
+    pub rate_per_sec: u32,
+    pub burst: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerIpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_per_ip_rate")]
+    pub rate_per_sec: u32,
+    #[serde(default = "default_per_ip_burst")]
+    pub burst: u32,
+}
+
+impl Default for PerIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rate_per_sec: default_per_ip_rate(),
+            burst: default_per_ip_burst(),
+        }
+    }
+}
+
+fn default_per_ip_rate() -> u32 {
+    5
+}
+
+fn default_per_ip_burst() -> u32 {
+    20
 }
 
 #[cfg(test)]

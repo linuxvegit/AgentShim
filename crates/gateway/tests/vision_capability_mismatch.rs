@@ -139,6 +139,8 @@ fn make_app_state() -> AppState {
                 "text-only-model",
             ),
         ],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     };
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));

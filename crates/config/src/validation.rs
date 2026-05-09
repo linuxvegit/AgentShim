@@ -1,4 +1,4 @@
-use crate::schema::{GatewayConfig, UpstreamConfig};
+use crate::schema::{BucketConfigYaml, GatewayConfig, UpstreamConfig};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -120,6 +120,12 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
     // entry point so `gateway::commands::serve`/`validate_config` (and any
     // other caller of `validate()`) get the new rules for free.
     validate_routes(cfg).map_err(ValidationError::InvalidRoute)?;
+
+    // Phase 4 (Plan 04 P04 T3) auth + rate_limit validation. Reuses
+    // `InvalidRoute` as the catch-all "config-shape error" tunnel so the
+    // existing CLI surfaces these errors without churning the public enum.
+    validate_rate_limit(cfg).map_err(ValidationError::InvalidRoute)?;
+    validate_auth(cfg).map_err(ValidationError::InvalidRoute)?;
 
     Ok(())
 }
@@ -275,6 +281,110 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Phase 4 (Plan 04 P04 T3) `rate_limit` block validation. Implements
+/// rules 7, 8, 9, and 10 from the §4.4 design:
+///   7. `per_route` keys reference existing routes (`<frontend>/<model>`).
+///   8. `per_upstream` keys reference configured upstreams.
+///   9. `per_key.overrides` keys must start with `sha256:` (no plaintext keys).
+///  10. Every bucket has `rate_per_sec > 0` AND `burst >= 1`.
+///
+/// Returns a human-readable `String` so the canonical `validate()` entry point
+/// can surface the message verbatim through `ValidationError::InvalidRoute`.
+pub fn validate_rate_limit(cfg: &GatewayConfig) -> Result<(), String> {
+    // Rule 7: per_route keys reference existing routes.
+    for key in cfg.rate_limit.per_route.keys() {
+        let parts: Vec<&str> = key.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "rate_limit.per_route key '{key}' must be '<frontend>/<model>'"
+            ));
+        }
+        let exists = cfg
+            .routes
+            .iter()
+            .any(|r| r.frontend == parts[0] && r.model == parts[1]);
+        if !exists {
+            return Err(format!(
+                "rate_limit.per_route key '{key}' references non-existent route"
+            ));
+        }
+    }
+
+    // Rule 8: per_upstream keys reference configured upstreams.
+    for key in cfg.rate_limit.per_upstream.keys() {
+        if !cfg.upstreams.contains_key(key) {
+            return Err(format!(
+                "rate_limit.per_upstream key '{key}' references non-existent upstream"
+            ));
+        }
+    }
+
+    // Rule 9: per_key overrides start with sha256:.
+    for key in cfg.rate_limit.per_key.overrides.keys() {
+        if !key.starts_with("sha256:") {
+            return Err(format!(
+                "rate_limit.per_key.overrides key '{key}' must start with 'sha256:'; \
+                 do not paste plaintext API keys here"
+            ));
+        }
+    }
+
+    // Rule 10: every bucket has rate_per_sec > 0 AND burst >= 1.
+    let validate_bucket = |b: &BucketConfigYaml, ctx: &str| -> Result<(), String> {
+        if b.rate_per_sec == 0 {
+            return Err(format!("{ctx} rate_per_sec must be > 0"));
+        }
+        if b.burst == 0 {
+            return Err(format!("{ctx} burst must be >= 1"));
+        }
+        Ok(())
+    };
+    if let Some(b) = &cfg.rate_limit.per_key.default {
+        validate_bucket(b, "rate_limit.per_key.default")?;
+    }
+    if let Some(b) = &cfg.rate_limit.per_key.anonymous {
+        validate_bucket(b, "rate_limit.per_key.anonymous")?;
+    }
+    for (k, v) in &cfg.rate_limit.per_key.overrides {
+        validate_bucket(v, &format!("rate_limit.per_key.overrides[{k}]"))?;
+    }
+    for (k, v) in &cfg.rate_limit.per_route {
+        validate_bucket(v, &format!("rate_limit.per_route[{k}]"))?;
+    }
+    for (k, v) in &cfg.rate_limit.per_upstream {
+        validate_bucket(v, &format!("rate_limit.per_upstream[{k}]"))?;
+    }
+    if cfg.rate_limit.per_ip.enabled {
+        if cfg.rate_limit.per_ip.rate_per_sec == 0 {
+            return Err("rate_limit.per_ip.rate_per_sec must be > 0".into());
+        }
+        if cfg.rate_limit.per_ip.burst == 0 {
+            return Err("rate_limit.per_ip.burst must be >= 1".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Phase 4 (Plan 04 P04 T3) `auth` block validation. Enforces:
+///   - `auth.required=true` requires `auth.enabled=true`.
+///   - Every `auth.keys` key must start with `sha256:` (catches plaintext-key
+///     paste mistakes).
+pub fn validate_auth(cfg: &GatewayConfig) -> Result<(), String> {
+    if cfg.auth.required && !cfg.auth.enabled {
+        return Err("auth.required=true requires auth.enabled=true".into());
+    }
+    for key in cfg.auth.keys.keys() {
+        if !key.starts_with("sha256:") {
+            return Err(format!(
+                "auth.keys key '{key}' must start with 'sha256:'; \
+                 do not paste plaintext API keys here"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +398,8 @@ mod tests {
             logging: LoggingConfig::default(),
             upstreams: BTreeMap::new(),
             routes: vec![],
+            auth: AuthConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             copilot: None,
         }
     }
@@ -812,5 +924,67 @@ mod tests {
         );
         let err = validate_routes(&cfg).unwrap_err();
         assert!(err.contains("multiplier"));
+    }
+
+    // ── Plan 04 P04 T3: rate_limit + auth validation ────────────────────────
+
+    #[test]
+    fn rejects_per_route_unknown_route() {
+        // NOTE: schema rename quirk — the OpenAiCompatible variant deserializes
+        // as `open_ai_compatible` (snake_case'd from `OpenAiCompatible`), not
+        // `openai_compatible`. The plan's YAML had the wrong tag; corrected
+        // here so the YAML parses far enough to exercise the rate_limit rule.
+        let cfg_yaml = r#"
+upstreams:
+  oai: {type: open_ai_compatible, base_url: "https://x", api_key: "x"}
+routes:
+  - frontend: openai_chat
+    model: gpt-4o
+    upstream: oai
+    upstream_model: gpt-4o
+rate_limit:
+  enabled: true
+  per_route:
+    "anthropic_messages/claude-opus-4-7": {rate_per_sec: 10, burst: 30}
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        assert!(validate_rate_limit(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_per_key_override_without_sha256_prefix() {
+        let cfg_yaml = r#"
+rate_limit:
+  enabled: true
+  per_key:
+    overrides:
+      "plaintext-key": {rate_per_sec: 100, burst: 300}
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        let err = validate_rate_limit(&cfg).unwrap_err();
+        assert!(err.contains("sha256:"));
+    }
+
+    #[test]
+    fn rejects_zero_burst() {
+        let cfg_yaml = r#"
+rate_limit:
+  enabled: true
+  per_key:
+    default: {rate_per_sec: 10, burst: 0}
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        assert!(validate_rate_limit(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_required_without_enabled() {
+        let cfg_yaml = r#"
+auth:
+  enabled: false
+  required: true
+    "#;
+        let cfg: GatewayConfig = serde_yaml::from_str(cfg_yaml).unwrap();
+        assert!(validate_auth(&cfg).is_err());
     }
 }

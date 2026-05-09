@@ -67,6 +67,8 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             },
             breaker: BreakerConfig::default(),
         }],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     }
 }
