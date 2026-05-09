@@ -255,6 +255,21 @@ pub async fn dispatch(
     // both fall through. Successful proxy_raw returns the stream as-is —
     // resilience-layer handling for that case is intentionally out of
     // scope for v0.4.
+    //
+    // Plan 04 P04 T5 — KNOWN GAP (v0.5): when proxy_raw returns
+    // `Ok(Some(...))` and serves the response without a canonical
+    // round-trip, the rate-limit and breaker gates are bypassed
+    // entirely. Both gates live inside `ResilientCaller::complete`,
+    // which the proxy_raw fast path skips. Gating at the top of the
+    // `try_proxy_raw` block double-consumes when proxy_raw falls
+    // through to the canonical path; gating only inside `Ok(Some(...))`
+    // means proxy_raw has already committed upstream resources by the
+    // time we'd reject. Either fix needs a small refactor (e.g. an
+    // explicit RateLimitTicket value that's only consumed when the
+    // request actually completes) — out of scope for v0.4. The
+    // `crates/gateway/tests/rate_limit_per_key_envelope.rs` Anthropic
+    // test routes through an OAI-compat upstream specifically to
+    // exercise the canonical-path gate.
     if spec.try_proxy_raw {
         tracing::info!(
             "→ {} | model: {} → {} | bodyBytes: {} | reasoning_default: {}",
