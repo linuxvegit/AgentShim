@@ -137,8 +137,15 @@ impl LimiterRegistry {
             Ok(_) => LimitOutcome::Allowed,
             Err(neg) => {
                 let wait = neg.wait_time_from(DefaultClock::default().now());
+                // Round up to the next whole second so the client never
+                // retries earlier than the bucket allows. `as_secs()`
+                // floors; e.g. 1.7s would become 1, telling the client
+                // to retry 0.7s too early. The `.max(1)` floor handles
+                // the sub-second case where the bucket is technically
+                // limited but as_secs() already returns 0.
+                let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
                 LimitOutcome::Limited {
-                    retry_after_secs: wait.as_secs().max(1) as u32,
+                    retry_after_secs: secs.max(1) as u32,
                 }
             }
         }
@@ -276,7 +283,12 @@ mod tests {
 
     #[test]
     fn allows_burst_then_rejects_third() {
-        let registry = LimiterRegistry::from_config(&small_config());
+        // Use per_key_only_config so the assertion can pin the dimension
+        // strictly to PerKey. The original config also configured a
+        // per_route bucket of identical shape, which would reject at the
+        // same moment — the original test had to allow either dimension,
+        // making it tolerant to a regression that swapped the order.
+        let registry = LimiterRegistry::from_config(&per_key_only_config());
         let id = AgentIdentity::Anonymous;
         assert!(registry
             .check_pre_chain(&id, "openai_chat/gpt-4o", "127.0.0.1")
@@ -286,14 +298,34 @@ mod tests {
             .is_ok());
         match registry.check_pre_chain(&id, "openai_chat/gpt-4o", "127.0.0.1") {
             Err((dim, secs)) => {
-                // First to reject is per_key (the inner gate; per_route also
-                // would reject — implementation runs per_key first).
-                assert!(matches!(
-                    dim,
-                    RateLimitDimension::PerKey | RateLimitDimension::PerRoute
-                ));
+                assert_eq!(dim, RateLimitDimension::PerKey);
                 assert!(secs >= 1);
             }
+            Ok(()) => panic!("expected limit on 3rd request"),
+        }
+    }
+
+    #[test]
+    fn first_rejection_wins_per_key_before_per_route() {
+        // Both per-key and per-route buckets reject on the same request;
+        // the documented contract says per-key is checked first and
+        // names the rejection. Locks in the dimension-priority contract
+        // against future reorderings.
+        let registry = LimiterRegistry::from_config(&small_config());
+        let id = AgentIdentity::Anonymous;
+        // Burn both buckets via two successful requests (each consumes
+        // one token from per_key AND one from per_route since burst=2).
+        for _ in 0..2 {
+            assert!(registry
+                .check_pre_chain(&id, "openai_chat/gpt-4o", "127.0.0.1")
+                .is_ok());
+        }
+        match registry.check_pre_chain(&id, "openai_chat/gpt-4o", "127.0.0.1") {
+            Err((dim, _)) => assert_eq!(
+                dim,
+                RateLimitDimension::PerKey,
+                "per-key must win over per-route on the first rejection"
+            ),
             Ok(()) => panic!("expected limit on 3rd request"),
         }
     }
