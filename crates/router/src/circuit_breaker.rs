@@ -72,7 +72,6 @@ pub enum BreakerDecision {
 
 /// Internal state for one breaker. Concurrent access is guarded by the
 /// registry's `RwLock`.
-#[allow(dead_code)] // Used by `BreakerRegistry` in Plan 03 T2.
 struct BreakerState {
     samples: VecDeque<(Instant, bool)>, // true = success, false = failure
     open_since: Option<Instant>,
@@ -81,7 +80,6 @@ struct BreakerState {
     probe_in_flight: AtomicBool,
 }
 
-#[allow(dead_code)] // Used by `BreakerRegistry` in Plan 03 T2.
 impl BreakerState {
     fn new() -> Self {
         Self {
@@ -313,5 +311,120 @@ mod tests {
             state.record(false, clock.now(), &policy);
         }
         assert_eq!(state.decision(clock.now(), &policy), BreakerDecision::Allow);
+    }
+}
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+/// `(provider, model)` key for the breaker registry.
+type BreakerKey = (String, String);
+
+/// Map from breaker key to its shared state. Each entry is wrapped in
+/// `Arc<RwLock<_>>` so the outer registry lock can be released while a
+/// per-key call holds the inner write guard.
+type BreakerMap = HashMap<BreakerKey, Arc<RwLock<BreakerState>>>;
+
+/// Registry keyed by `(provider, model)`. Each key has its own
+/// `BreakerState` behind the registry's `RwLock`.
+pub struct BreakerRegistry {
+    breakers: RwLock<BreakerMap>,
+    clock: Arc<dyn Clock>,
+}
+
+impl BreakerRegistry {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            breakers: RwLock::new(HashMap::new()),
+            clock,
+        }
+    }
+
+    pub fn with_system_clock() -> Self {
+        Self::new(Arc::new(SystemClock))
+    }
+
+    fn get_or_create(&self, provider: &str, model: &str) -> Arc<RwLock<BreakerState>> {
+        let key = (provider.to_string(), model.to_string());
+        // Fast path: read-only lookup.
+        if let Some(state) = self.breakers.read().unwrap().get(&key) {
+            return Arc::clone(state);
+        }
+        // Slow path: create.
+        let mut w = self.breakers.write().unwrap();
+        Arc::clone(
+            w.entry(key)
+                .or_insert_with(|| Arc::new(RwLock::new(BreakerState::new()))),
+        )
+    }
+
+    /// Query whether the chain walker should call this upstream.
+    pub fn decision(&self, provider: &str, model: &str, policy: &BreakerPolicy) -> BreakerDecision {
+        let state = self.get_or_create(provider, model);
+        let s = state.read().unwrap();
+        s.decision(self.clock.now(), policy)
+    }
+
+    /// Record the outcome of a call (regardless of how the breaker decided).
+    pub fn record(&self, provider: &str, model: &str, succeeded: bool, policy: &BreakerPolicy) {
+        let state = self.get_or_create(provider, model);
+        let mut s = state.write().unwrap();
+        s.record(succeeded, self.clock.now(), policy);
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn fast_policy() -> BreakerPolicy {
+        BreakerPolicy {
+            enabled: true,
+            failure_threshold_pct: 50,
+            min_requests: 5,
+            window: Duration::from_secs(60),
+            open_cooldown: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn distinct_keys_have_independent_breakers() {
+        let registry = BreakerRegistry::with_system_clock();
+        let policy = fast_policy();
+        // Trip A's breaker.
+        for _ in 0..5 {
+            registry.record("openai", "gpt-4o", false, &policy);
+        }
+        assert_eq!(
+            registry.decision("openai", "gpt-4o", &policy),
+            BreakerDecision::Skip
+        );
+        // B is independent.
+        assert_eq!(
+            registry.decision("anthropic", "claude-opus-4-7", &policy),
+            BreakerDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_record_and_query_does_not_deadlock() {
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let policy = fast_policy();
+        let mut handles = vec![];
+        for i in 0..50 {
+            let r = Arc::clone(&registry);
+            let p = policy.clone();
+            handles.push(tokio::spawn(async move {
+                let succeeded = i % 3 != 0;
+                r.record("openai", "gpt-4o", succeeded, &p);
+                let _d = r.decision("openai", "gpt-4o", &p);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // No assertion on final state — concurrency makes that
+        // non-deterministic. The win is that the test completes without
+        // deadlocking or panicking.
     }
 }

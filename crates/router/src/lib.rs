@@ -49,6 +49,7 @@ pub trait Router: Send + Sync {
     }
 }
 
+pub use circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry, Clock, SystemClock};
 pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
     fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility,
