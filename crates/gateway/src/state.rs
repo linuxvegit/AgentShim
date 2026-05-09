@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +16,8 @@ use agent_shim_providers::{
 };
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
-    BreakerRegistry, Clock, ModelResolver, ProviderLookup, ResilientCaller, Router, StaticRouter,
-    SystemClock,
+    BreakerRegistry, Clock, LimiterRegistry, ModelResolver, ProviderLookup, ResilientCaller,
+    Router, StaticRouter, SystemClock,
 };
 
 /// Adapter that lets `ResilientCaller` (in the router crate) look up
@@ -62,6 +63,27 @@ pub struct AppState {
     /// future-facing introspection seam.
     #[allow(dead_code)]
     pub breaker_registry: Arc<BreakerRegistry>,
+    /// Token-bucket rate limiters owned at the gateway boundary. Plan 04
+    /// P04 T4 wires this into `ResilientCaller` (which actually consults
+    /// the buckets) and keeps the canonical handle here for the same
+    /// reason as `breaker_registry` — future admin/introspection
+    /// endpoints will read through this Arc.
+    ///
+    /// `#[allow(dead_code)]` because the request hot path reads through
+    /// `resilient_caller`'s clone of this Arc.
+    #[allow(dead_code)]
+    pub limiter_registry: Arc<LimiterRegistry>,
+    /// Pre-computed `auth.enabled` so `pipeline::dispatch` doesn't re-walk
+    /// the config on every request. Plan 04 P04 T4.
+    pub auth_enabled: bool,
+    /// Pre-computed `auth.required`. When true the pipeline rejects
+    /// missing/unknown keys with HTTP 401 before the chain walk.
+    pub auth_required: bool,
+    /// Set of `sha256:<hex>` strings derived from `auth.keys`. The
+    /// `auth.required` check rejects requests whose presented key hash
+    /// is not in this set. Pre-computed once so the per-request lookup
+    /// is a single HashSet contains() call.
+    pub configured_key_hashes: Arc<HashSet<String>>,
 }
 
 impl AppState {
@@ -170,10 +192,31 @@ impl AppState {
             registry: Arc::clone(&providers),
         });
         let breaker_registry = Arc::new(BreakerRegistry::new(clock));
+
+        // Plan 04 P04 T4: rate-limit registry. When `rate_limit.enabled
+        // = false` (the default for v0.3 configs that don't carry the
+        // block at all, plus explicit opt-out) we use the disabled
+        // shortcut so the per-request gate calls become no-ops without
+        // even touching the bucket map.
+        let limiter_registry = Arc::new(if config.rate_limit.enabled {
+            LimiterRegistry::from_config(&config.rate_limit)
+        } else {
+            LimiterRegistry::disabled()
+        });
+
         let resilient_caller = Arc::new(ResilientCaller::new(
             provider_lookup,
             Arc::clone(&breaker_registry),
+            Arc::clone(&limiter_registry),
         ));
+
+        // Plan 04 P04 T4: pre-compute the auth fields so per-request
+        // header parsing and key lookup are single Bool/HashSet checks
+        // instead of walking the config map.
+        let auth_enabled = config.auth.enabled;
+        let auth_required = config.auth.required;
+        let configured_key_hashes: Arc<HashSet<String>> =
+            Arc::new(config.auth.keys.keys().cloned().collect());
 
         Self {
             config: Arc::new(config),
@@ -184,6 +227,10 @@ impl AppState {
             resolver,
             resilient_caller,
             breaker_registry,
+            limiter_registry,
+            auth_enabled,
+            auth_required,
+            configured_key_hashes,
         }
     }
 }

@@ -71,6 +71,14 @@ pub enum HandlerError {
         dimension: RateLimitDimension,
         retry_after_secs: u32,
     },
+    /// `auth.required = true` and the inbound request had either no key
+    /// at all or a key whose hash is not in `auth.keys`. HTTP 401. Plan
+    /// 04 P04 T4 produces this; the `IntoResponse` impl shapes a
+    /// dialect-correct envelope. We do NOT carry the (hashed or
+    /// plaintext) presented key here — operator logs see only the
+    /// failure mode, not the presented value.
+    #[error("authentication required")]
+    Unauthorized { kind: FrontendKind },
 }
 
 impl HandlerError {
@@ -231,6 +239,32 @@ impl IntoResponse for HandlerError {
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
 
+        // Unauthorized (Plan 04 P04 T4): `auth.required = true` and the
+        // inbound request was either unauthenticated or presented a key
+        // not in the configured allowlist. HTTP 401 with a dialect-shaped
+        // body. We deliberately use a generic message ("Authentication
+        // required.") instead of distinguishing missing-vs-unknown so
+        // probing clients can't enumerate valid key shapes.
+        if let HandlerError::Unauthorized { kind } = &self {
+            let body = match kind {
+                FrontendKind::AnthropicMessages => serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": "authentication_error",
+                        "message": "Authentication required.",
+                    },
+                }),
+                FrontendKind::OpenAiChat | FrontendKind::OpenAiResponses => serde_json::json!({
+                    "error": {
+                        "message": "Authentication required.",
+                        "type": "authentication_error",
+                        "code": "unauthorized",
+                    },
+                }),
+            };
+            return (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+        }
+
         // Resilience variants (P02 T5): they all carry `kind` so the body
         // can be shaped per-dialect. They share the structure of pulling
         // out the kind, picking a status, building the dialect body, and
@@ -298,6 +332,7 @@ impl IntoResponse for HandlerError {
             } => StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
             HandlerError::TerminalUpstream { .. } => StatusCode::BAD_GATEWAY,
             HandlerError::CapabilityMismatch { .. } => unreachable!("handled above"),
+            HandlerError::Unauthorized { .. } => unreachable!("handled above"),
             HandlerError::NoUpstreamSucceeded { .. }
             | HandlerError::AllBreakersOpen { .. }
             | HandlerError::RateLimited { .. } => unreachable!("handled above"),

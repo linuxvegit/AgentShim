@@ -28,7 +28,7 @@ use agent_shim_core::{
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_providers::{ProviderCapabilities, ProviderError};
-use agent_shim_router::{BreakerPolicy, RetryPolicy};
+use agent_shim_router::{AgentIdentity, BreakerPolicy, RetryPolicy};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -142,6 +142,77 @@ pub async fn dispatch(
     };
     let breaker_policy = BreakerPolicy::from(&route_breaker_config);
     let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; chain.len()];
+
+    // Plan 04 P04 T4: extract identity + client IP for the rate-limit
+    // gates and the auth.required check. When `auth.enabled = false` we
+    // skip extraction entirely — the rate-limit registry is also
+    // disabled in that mode (the gates short-circuit on `enabled=false`)
+    // and identity is only ever Anonymous. When `auth.enabled = true`
+    // and `auth.required = true`, missing or unknown keys produce HTTP
+    // 401 here, BEFORE the chain walk.
+    let identity = if state.auth_enabled {
+        let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
+        let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
+
+        if state.auth_required {
+            match &extracted {
+                AgentIdentity::Anonymous => {
+                    tracing::warn!(
+                        endpoint = spec.endpoint_label,
+                        "auth.required=true but request had no Authorization or x-api-key header"
+                    );
+                    return Err(HandlerError::Unauthorized {
+                        kind: spec.frontend.kind(),
+                    });
+                }
+                AgentIdentity::KeyHash(h) => {
+                    if !state.configured_key_hashes.contains(h) {
+                        // Operator log carries the hash (NEVER plaintext) so
+                        // a misconfigured client can be tracked down without
+                        // leaking the secret.
+                        tracing::warn!(
+                            endpoint = spec.endpoint_label,
+                            presented_hash = %h,
+                            "auth.required=true but presented key not in auth.keys allowlist"
+                        );
+                        return Err(HandlerError::Unauthorized {
+                            kind: spec.frontend.kind(),
+                        });
+                    }
+                }
+            }
+        }
+        extracted
+    } else {
+        AgentIdentity::Anonymous
+    };
+
+    // Best-effort client IP. `x-forwarded-for` first (when behind a
+    // reverse proxy) — take the leftmost token, which is the original
+    // client per RFC 7239. `unknown` fallback when no header is set; the
+    // per-IP bucket will key all such requests together, which is what
+    // we want before the proxy is configured.
+    //
+    // axum's `dispatch` does not currently receive the socket peer
+    // addr; threading it through the handler signature is a v0.5 P5
+    // concern.
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Per-route bucket key: `<frontend_kind>/<model_alias>`. Matches
+    // the format the YAML config uses for `rate_limit.per_route` keys
+    // (see Plan 04 P04 T3).
+    let frontend_kind_str = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+    let frontend_model = format!("{frontend_kind_str}/{model_alias}");
 
     // The chain is non-empty by router invariant (singular routes produce
     // 1-element vecs; array routes are validated to be non-empty by
@@ -317,6 +388,9 @@ pub async fn dispatch(
             chain,
             policies,
             breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
             RunContext {
                 model_alias,
                 upstream_model,
@@ -333,6 +407,9 @@ pub async fn dispatch(
             chain,
             policies,
             breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
             RunContext {
                 model_alias,
                 upstream_model,
@@ -355,6 +432,11 @@ struct RunContext {
     frontend_kind: agent_shim_core::FrontendKind,
 }
 
+// `#[allow(clippy::too_many_arguments)]`: matches the signature of
+// `ResilientCaller::complete` plus the per-frontend pipeline spec and
+// the run-context bundle. Bundling identity/client_ip/frontend_model
+// into a struct would just move the verbosity to the caller.
+#[allow(clippy::too_many_arguments)]
 async fn run_stream(
     spec: PipelineSpec<'_>,
     state: &AppState,
@@ -362,6 +444,9 @@ async fn run_stream(
     chain: Vec<BackendTarget>,
     policies: Vec<RetryPolicy>,
     breaker_policies: Vec<BreakerPolicy>,
+    identity: AgentIdentity,
+    client_ip: String,
+    frontend_model: String,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let label = spec.endpoint_label;
@@ -377,7 +462,15 @@ async fn run_stream(
     // encoding is unchanged from the pre-T6 single-upstream world.
     let upstream_stream = state
         .resilient_caller
-        .complete(chain, canonical, policies, breaker_policies)
+        .complete(
+            chain,
+            canonical,
+            policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+        )
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "resilient call failed");
@@ -447,6 +540,10 @@ async fn run_stream(
     }
 }
 
+// `#[allow(clippy::too_many_arguments)]`: see `run_stream` above —
+// same justification, the parameters describe the full chain-walk
+// context.
+#[allow(clippy::too_many_arguments)]
 async fn run_unary(
     spec: PipelineSpec<'_>,
     state: &AppState,
@@ -454,6 +551,9 @@ async fn run_unary(
     chain: Vec<BackendTarget>,
     policies: Vec<RetryPolicy>,
     breaker_policies: Vec<BreakerPolicy>,
+    identity: AgentIdentity,
+    client_ip: String,
+    frontend_model: String,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let RunContext {
@@ -465,7 +565,15 @@ async fn run_unary(
 
     let stream = state
         .resilient_caller
-        .complete(chain, canonical, policies, breaker_policies)
+        .complete(
+            chain,
+            canonical,
+            policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+        )
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "resilient call failed");

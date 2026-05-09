@@ -168,9 +168,11 @@ fn make_app_state() -> AppState {
     }
     let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(Lookup(Arc::clone(&providers)));
     let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
+    let limiter_registry = Arc::new(agent_shim_router::LimiterRegistry::disabled());
     let resilient_caller = Arc::new(ResilientCaller::new(
         provider_lookup,
         Arc::clone(&breaker_registry),
+        Arc::clone(&limiter_registry),
     ));
 
     AppState {
@@ -182,6 +184,10 @@ fn make_app_state() -> AppState {
         resolver,
         resilient_caller,
         breaker_registry,
+        limiter_registry,
+        auth_enabled: false,
+        auth_required: false,
+        configured_key_hashes: Arc::new(std::collections::HashSet::new()),
     }
 }
 
