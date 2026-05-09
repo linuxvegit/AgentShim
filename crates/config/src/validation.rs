@@ -15,6 +15,8 @@ pub enum ValidationError {
     InvalidUpstream(String, String),
     #[error("invalid route: {0}")]
     InvalidRoute(String),
+    #[error("admin.port {admin} collides with server.port {server} on bind {bind}")]
+    PortCollision { admin: u16, server: u16, bind: String },
 }
 
 const VALID_FRONTENDS: &[&str] = &[
@@ -62,10 +64,11 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
             return Err(ValidationError::ZeroPort);
         }
         if admin.port == cfg.server.port && admin.bind == cfg.server.bind {
-            return Err(ValidationError::InvalidRoute(format!(
-                "admin.port {} collides with server.port {} on the same bind {}",
-                admin.port, cfg.server.port, admin.bind
-            )));
+            return Err(ValidationError::PortCollision {
+                admin: admin.port,
+                server: cfg.server.port,
+                bind: admin.bind.clone(),
+            });
         }
     }
 
@@ -1187,7 +1190,7 @@ routes:
     fn admin_port_zero_rejected() {
         let mut cfg = minimal_cfg();
         cfg.admin = Some(crate::AdminConfig { bind: "127.0.0.1".into(), port: 0 });
-        assert!(validate(&cfg).is_err());
+        assert!(matches!(validate(&cfg), Err(ValidationError::ZeroPort)));
     }
 
     #[test]
@@ -1197,7 +1200,14 @@ routes:
             bind: cfg.server.bind.clone(),
             port: cfg.server.port,
         });
-        assert!(validate(&cfg).is_err());
+        match validate(&cfg) {
+            Err(ValidationError::PortCollision { admin, server, bind }) => {
+                assert_eq!(admin, cfg.server.port);
+                assert_eq!(server, cfg.server.port);
+                assert_eq!(bind, cfg.server.bind);
+            }
+            other => panic!("expected PortCollision, got {other:?}"),
+        }
     }
 
     #[test]

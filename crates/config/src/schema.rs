@@ -729,4 +729,27 @@ admin:
         let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
         assert!(cfg.admin.is_none(), "admin must be None when block absent");
     }
+
+    #[test]
+    fn admin_config_empty_block_uses_defaults() {
+        let yaml = r#"
+admin: {}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let admin = cfg.admin.expect("admin block present");
+        assert_eq!(admin.bind, "127.0.0.1");
+        assert_eq!(admin.port, 9100);
+    }
+
+    #[test]
+    fn admin_config_partial_block_uses_field_defaults() {
+        let yaml = r#"
+admin:
+  port: 9200
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let admin = cfg.admin.expect("admin block present");
+        assert_eq!(admin.bind, "127.0.0.1", "bind should fall back to default when omitted");
+        assert_eq!(admin.port, 9200);
+    }
 }
