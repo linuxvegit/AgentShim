@@ -74,6 +74,11 @@ pub enum BreakerDecision {
 /// Internal state for one breaker. Concurrent access is guarded by the
 /// registry's `RwLock`.
 struct BreakerState {
+    /// `(provider, model)` pair this breaker tracks. Used solely for the
+    /// `breaker.state_change` tracing event (Plan 05 P05 T1) so operators
+    /// can pinpoint which breaker tripped.
+    upstream: String,
+    model: String,
     samples: VecDeque<(Instant, bool)>, // true = success, false = failure
     open_since: Option<Instant>,
     /// Set to true while the half-open probe is in flight; prevents a second
@@ -82,12 +87,29 @@ struct BreakerState {
 }
 
 impl BreakerState {
-    fn new() -> Self {
+    fn new(upstream: String, model: String) -> Self {
         Self {
+            upstream,
+            model,
             samples: VecDeque::new(),
             open_since: None,
             probe_in_flight: AtomicBool::new(false),
         }
+    }
+
+    /// Emit a `breaker.state_change` tracing event. Centralized so the four
+    /// transition points stay consistent (Plan 05 P05 T1).
+    fn emit_state_change(&self, from: &'static str, to: &'static str, reason: &'static str) {
+        tracing::info!(
+            target: "agent_shim::resilience",
+            event_name = "breaker.state_change",
+            upstream = %self.upstream,
+            model = %self.model,
+            from_state = from,
+            to_state = to,
+            reason = reason,
+            "circuit breaker state changed"
+        );
     }
 
     fn record(&mut self, succeeded: bool, now: Instant, policy: &BreakerPolicy) {
@@ -113,11 +135,13 @@ impl BreakerState {
             // here we only transition based on the probe result.
             if succeeded {
                 // Half-open probe succeeded → Closed.
+                self.emit_state_change("half_open", "closed", "probe_succeeded");
                 self.open_since = None;
                 self.samples.clear();
                 self.samples.push_back((now, true));
             } else if now.duration_since(opened) >= policy.open_cooldown {
                 // Half-open probe failed → re-open with fresh cooldown.
+                self.emit_state_change("half_open", "open", "probe_failed");
                 self.open_since = Some(now);
             }
             // else: still in cooldown; recording while Open shouldn't happen
@@ -134,6 +158,7 @@ impl BreakerState {
         let failures = self.samples.iter().filter(|(_, ok)| !*ok).count() as u32;
         let pct = (failures * 100) / total;
         if pct >= policy.failure_threshold_pct {
+            self.emit_state_change("closed", "open", "failure_threshold_exceeded");
             self.open_since = Some(now);
         }
     }
@@ -143,6 +168,12 @@ impl BreakerState {
     /// When this returns [`BreakerDecision::Probe`], the caller MUST
     /// pair it with a subsequent [`BreakerState::record`] call (success
     /// or failure) — see the variant docs for the full contract.
+    ///
+    /// Note: takes `&self` (read-only). The `Open → HalfOpen` state
+    /// transition is implicit — `open_since` doesn't get cleared until
+    /// `record()` runs after the probe — but a `breaker.state_change`
+    /// event is still emitted at the moment the probe is authorized
+    /// (Plan 05 P05 T1) so operators see the cooldown elapsed.
     fn decision(&self, now: Instant, policy: &BreakerPolicy) -> BreakerDecision {
         if !policy.enabled {
             return BreakerDecision::Allow;
@@ -157,6 +188,7 @@ impl BreakerState {
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
+                        self.emit_state_change("open", "half_open", "cooldown_elapsed");
                         BreakerDecision::Probe
                     } else {
                         BreakerDecision::Skip
@@ -199,11 +231,15 @@ mod tests {
         }
     }
 
+    fn new_state() -> BreakerState {
+        BreakerState::new("openai".to_string(), "gpt-4o".to_string())
+    }
+
     #[test]
     fn closed_under_min_requests_never_trips() {
         let clock = FakeClock::new();
         let policy = fast_policy();
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         // 4 failures < min_requests (5), so still Closed even at 100% failure.
         for _ in 0..4 {
             state.record(false, clock.now(), &policy);
@@ -215,7 +251,7 @@ mod tests {
     fn closed_trips_when_failure_rate_crosses_threshold() {
         let clock = FakeClock::new();
         let policy = fast_policy();
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         // 5 failures = 100% > 50% threshold → trip.
         for _ in 0..5 {
             state.record(false, clock.now(), &policy);
@@ -227,7 +263,7 @@ mod tests {
     fn open_skips_during_cooldown() {
         let clock = FakeClock::new();
         let policy = fast_policy();
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         for _ in 0..5 {
             state.record(false, clock.now(), &policy);
         }
@@ -239,7 +275,7 @@ mod tests {
     fn open_transitions_to_probe_after_cooldown() {
         let clock = FakeClock::new();
         let policy = fast_policy();
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         for _ in 0..5 {
             state.record(false, clock.now(), &policy);
         }
@@ -253,7 +289,7 @@ mod tests {
     fn half_open_success_closes_breaker() {
         let clock = FakeClock::new();
         let policy = fast_policy();
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         for _ in 0..5 {
             state.record(false, clock.now(), &policy);
         }
@@ -268,7 +304,7 @@ mod tests {
     fn half_open_failure_reopens_with_fresh_cooldown() {
         let clock = FakeClock::new();
         let policy = fast_policy();
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         for _ in 0..5 {
             state.record(false, clock.now(), &policy);
         }
@@ -287,7 +323,7 @@ mod tests {
     fn samples_outside_window_are_evicted() {
         let clock = FakeClock::new();
         let policy = fast_policy(); // window = 60s
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         // 5 old failures, all outside the window after advance.
         for _ in 0..5 {
             state.record(false, clock.now(), &policy);
@@ -307,7 +343,7 @@ mod tests {
             enabled: false,
             ..fast_policy()
         };
-        let mut state = BreakerState::new();
+        let mut state = new_state();
         for _ in 0..100 {
             state.record(false, clock.now(), &policy);
         }
@@ -361,10 +397,12 @@ impl BreakerRegistry {
         }
         // Slow path: create.
         let mut w = self.breakers.write().unwrap();
-        Arc::clone(
-            w.entry(key)
-                .or_insert_with(|| Arc::new(RwLock::new(BreakerState::new()))),
-        )
+        Arc::clone(w.entry(key).or_insert_with(|| {
+            Arc::new(RwLock::new(BreakerState::new(
+                provider.to_string(),
+                model.to_string(),
+            )))
+        }))
     }
 
     /// Query whether the chain walker should call this upstream.

@@ -73,6 +73,9 @@ pub fn compute_backoff<R: Rng>(attempt: u32, policy: &RetryPolicy, rng: &mut R) 
 /// wallclock since entry. Time spent inside `provider.complete()` itself
 /// is not counted; per-attempt timeouts are enforced elsewhere.
 ///
+/// `request_id` flows in from the caller for `tracing` correlation; see the
+/// event taxonomy doc on [`crate::resilient_caller`].
+///
 /// This helper is **single-upstream**. Plan 02's `ResilientCaller` walks
 /// the chain across multiple upstreams.
 pub async fn retry_with_policy(
@@ -80,6 +83,7 @@ pub async fn retry_with_policy(
     target: BackendTarget,
     req: CanonicalRequest,
     policy: &RetryPolicy,
+    request_id: &str,
 ) -> Result<CanonicalStream, ProviderError> {
     let mut rng = SmallRng::from_entropy();
     let mut attempt: u32 = 1;
@@ -106,10 +110,15 @@ pub async fn retry_with_policy(
                     break e;
                 }
                 tracing::warn!(
-                    attempt,
-                    backoff_ms,
-                    total_elapsed_ms,
-                    error = %e,
+                    target: "agent_shim::resilience",
+                    event_name = "retry.attempt",
+                    request_id = %request_id,
+                    upstream = %target.provider,
+                    model = %target.model,
+                    attempt = attempt,
+                    error_class = crate::fallback::error_class_label(&e),
+                    backoff_ms = backoff_ms,
+                    total_elapsed_ms = total_elapsed_ms,
                     "retrying provider call after eligible error"
                 );
                 tokio::time::sleep(backoff).await;
@@ -118,6 +127,17 @@ pub async fn retry_with_policy(
             }
         }
     };
+    // Retry budget exhausted (max_attempts reached or budget overrun).
+    tracing::warn!(
+        target: "agent_shim::resilience",
+        event_name = "retry.exhausted",
+        request_id = %request_id,
+        upstream = %target.provider,
+        model = %target.model,
+        attempts = attempt,
+        last_error = %last_err,
+        "retry budget exhausted"
+    );
     Err(last_err)
 }
 
@@ -351,6 +371,7 @@ mod tests {
             dummy_target(),
             dummy_request(),
             &fast_policy(3),
+            "test-req",
         )
         .await;
         assert!(result.is_ok());
@@ -368,6 +389,7 @@ mod tests {
             dummy_target(),
             dummy_request(),
             &fast_policy(3),
+            "test-req",
         )
         .await;
         assert!(result.is_ok());
@@ -385,6 +407,7 @@ mod tests {
             dummy_target(),
             dummy_request(),
             &fast_policy(3),
+            "test-req",
         )
         .await;
         assert!(matches!(
@@ -406,6 +429,7 @@ mod tests {
             dummy_target(),
             dummy_request(),
             &fast_policy(3),
+            "test-req",
         )
         .await;
         assert!(matches!(
@@ -431,8 +455,14 @@ mod tests {
             MockOutcome::upstream(502, "bad"),
             MockOutcome::upstream(502, "bad"),
         ]));
-        let result =
-            retry_with_policy(provider.clone(), dummy_target(), dummy_request(), &policy).await;
+        let result = retry_with_policy(
+            provider.clone(),
+            dummy_target(),
+            dummy_request(),
+            &policy,
+            "test-req",
+        )
+        .await;
         assert!(matches!(
             result,
             Err(ProviderError::Upstream { status: 502, .. })

@@ -7,6 +7,33 @@
 //!
 //! Plan 03 inserts the breaker gate inside the chain walk.
 //! Plan 04 inserts the rate-limit gate before the chain walk.
+//!
+//! # Tracing event taxonomy (Plan 05 P05 T1)
+//!
+//! Every resilience event uses one of these `target = "agent_shim::resilience"`
+//! event names, with the field set documented per kind:
+//!
+//! | event_name              | level | fields                                                                          |
+//! |-------------------------|-------|---------------------------------------------------------------------------------|
+//! | retry.attempt           | warn  | request_id, upstream, model, attempt, error_class, backoff_ms, total_elapsed_ms |
+//! | retry.exhausted         | warn  | request_id, upstream, model, attempts, last_error                               |
+//! | fallback.transition     | warn  | request_id, from_upstream, to_upstream, reason                                  |
+//! | breaker.state_change    | info  | upstream, model, from_state, to_state, reason                                   |
+//! | rate_limit.rejected     | warn  | request_id, identity, dimension, retry_after_secs                               |
+//! | request.completed       | info on success / warn on failure | request_id, identity, frontend_model, outcome, total_elapsed_ms, tried |
+//!
+//! All numeric fields use Rust integer types (no strings). `identity` uses
+//! `AgentIdentity::log_id()` which returns `"anonymous"` or the full
+//! `"sha256:<hex>"` form. Plaintext keys never appear in log output.
+//!
+//! ## `request_id` provenance (known limitation)
+//!
+//! Until middleware-level plumbing lands, `request_id` is generated as a
+//! fresh UUID at the top of [`ResilientCaller::complete`]. It satisfies the
+//! field-set contract (operators see *a* stable id correlating events from
+//! one request) but does NOT match the request-id header set by
+//! `crates/observability/src/request_id.rs`. A future task should plumb a
+//! real `Context { request_id }` from the pipeline.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -87,6 +114,101 @@ impl ResilientCaller {
             "one breaker policy per chain element"
         );
 
+        // KNOWN LIMITATION (Plan 05 P05 T1): generate a fresh UUID per call
+        // until middleware-level request-id plumbing lands. See module doc.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let start = Instant::now();
+
+        // Run the chain walk in an inner async block so we can emit the
+        // `request.completed` summary on every exit path.
+        let result = self
+            .complete_inner(
+                chain,
+                req,
+                retry_policies,
+                breaker_policies,
+                &identity,
+                &client_ip,
+                &frontend_model,
+                &request_id,
+            )
+            .await;
+
+        let total_elapsed_ms = start.elapsed().as_millis() as u64;
+        let outcome: &'static str = match &result {
+            Ok(_) => "success",
+            Err(ResilienceError::RateLimited { .. }) => "rate_limited",
+            Err(ResilienceError::NoUpstreamSucceeded { .. }) => "no_upstream_succeeded",
+            Err(ResilienceError::AllBreakersOpen { .. }) => "all_breakers_open",
+            Err(ResilienceError::TerminalError { .. }) => "terminal_error",
+        };
+        let tried_summary: Vec<String> = match &result {
+            Ok(_) => Vec::new(),
+            Err(ResilienceError::NoUpstreamSucceeded { tried, .. }) => tried
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}/{} attempts={} last={}",
+                        t.provider, t.model, t.attempts, t.last_error_tag
+                    )
+                })
+                .collect(),
+            Err(ResilienceError::TerminalError { tried, .. }) => tried
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}/{} attempts={} last={}",
+                        t.provider, t.model, t.attempts, t.last_error_tag
+                    )
+                })
+                .collect(),
+            Err(ResilienceError::AllBreakersOpen { tried }) => tried.clone(),
+            Err(ResilienceError::RateLimited { .. }) => Vec::new(),
+        };
+
+        if result.is_ok() {
+            tracing::info!(
+                target: "agent_shim::resilience",
+                event_name = "request.completed",
+                request_id = %request_id,
+                identity = %identity.log_id(),
+                frontend_model = %frontend_model,
+                outcome = outcome,
+                total_elapsed_ms = total_elapsed_ms,
+                tried = ?tried_summary,
+                "request completed"
+            );
+        } else {
+            tracing::warn!(
+                target: "agent_shim::resilience",
+                event_name = "request.completed",
+                request_id = %request_id,
+                identity = %identity.log_id(),
+                frontend_model = %frontend_model,
+                outcome = outcome,
+                total_elapsed_ms = total_elapsed_ms,
+                tried = ?tried_summary,
+                "request completed with error"
+            );
+        }
+        result
+    }
+
+    /// Inner chain-walk body. Pulled out of `complete()` so the wrapper can
+    /// emit the `request.completed` summary on every exit path without
+    /// repeating it at every `return`.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_inner(
+        &self,
+        chain: Vec<BackendTarget>,
+        req: CanonicalRequest,
+        retry_policies: Vec<RetryPolicy>,
+        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        identity: &crate::auth::AgentIdentity,
+        client_ip: &str,
+        frontend_model: &str,
+        request_id: &str,
+    ) -> Result<CanonicalStream, ResilienceError> {
         // ── PRE-CHAIN RATE LIMIT GATE ────────────────────────────────────
         // Outermost gate per §5.2 layering: per-key + per-route + per-IP
         // buckets are consulted before any breaker decision or provider
@@ -94,15 +216,16 @@ impl ResilientCaller {
         // scoped) so we never enter the chain walk.
         if let Err((dim, retry_after_secs)) =
             self.limiters
-                .check_pre_chain(&identity, &frontend_model, &client_ip)
+                .check_pre_chain(identity, frontend_model, client_ip)
         {
             tracing::warn!(
+                target: "agent_shim::resilience",
+                event_name = "rate_limit.rejected",
+                request_id = %request_id,
                 identity = %identity.log_id(),
-                frontend_model = %frontend_model,
-                client_ip = %client_ip,
-                dimension = ?dim,
-                retry_after_secs,
-                "rate limited (pre-chain)"
+                dimension = dimension_label(dim),
+                retry_after_secs = retry_after_secs,
+                "rate limit exceeded (pre-chain)"
             );
             return Err(ResilienceError::RateLimited {
                 dimension: dim,
@@ -140,7 +263,10 @@ impl ResilientCaller {
                 .decision(&target.provider, &target.model, bpolicy);
             match decision {
                 crate::circuit_breaker::BreakerDecision::Skip => {
+                    // Operational log — NOT a `breaker.state_change` event;
+                    // those are emitted from inside `BreakerState`.
                     tracing::warn!(
+                        target: "agent_shim::resilience",
                         provider = %target.provider,
                         model = %target.model,
                         chain_position = i,
@@ -151,6 +277,7 @@ impl ResilientCaller {
                 }
                 crate::circuit_breaker::BreakerDecision::Probe => {
                     tracing::info!(
+                        target: "agent_shim::resilience",
                         provider = %target.provider,
                         model = %target.model,
                         chain_position = i,
@@ -175,11 +302,14 @@ impl ResilientCaller {
             if let Err((dim, retry_after_secs)) = self.limiters.check_per_upstream(&target.provider)
             {
                 tracing::warn!(
+                    target: "agent_shim::resilience",
+                    event_name = "rate_limit.rejected",
+                    request_id = %request_id,
+                    identity = %identity.log_id(),
+                    dimension = dimension_label(dim),
+                    retry_after_secs = retry_after_secs,
                     upstream = %target.provider,
-                    chain_position = i,
-                    dimension = ?dim,
-                    retry_after_secs,
-                    "per-upstream rate limit exceeded; not falling back"
+                    "rate limit exceeded (per-upstream); not falling back"
                 );
                 return Err(ResilienceError::RateLimited {
                     dimension: dim,
@@ -189,7 +319,8 @@ impl ResilientCaller {
 
             let started = Instant::now();
             // retry_with_policy returns Err on retry exhaustion OR terminal.
-            let result = retry_with_policy(provider, target.clone(), req.clone(), rpolicy).await;
+            let result =
+                retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
             match result {
@@ -197,6 +328,7 @@ impl ResilientCaller {
                     self.breakers
                         .record(&target.provider, &target.model, true, bpolicy);
                     tracing::info!(
+                        target: "agent_shim::resilience",
                         provider = %target.provider,
                         model = %target.model,
                         chain_position = i,
@@ -221,6 +353,7 @@ impl ResilientCaller {
                     });
                     if eligibility == FallbackEligibility::Terminal {
                         tracing::warn!(
+                            target: "agent_shim::resilience",
                             provider = %target.provider,
                             model = %target.model,
                             chain_position = i,
@@ -229,15 +362,18 @@ impl ResilientCaller {
                         );
                         return Err(ResilienceError::TerminalError { error: e, tried });
                     }
-                    last_error = Some(e);
                     if i + 1 < chain.len() {
                         tracing::warn!(
-                            from = %target.provider,
-                            to = %chain[i + 1].provider,
-                            chain_position = i,
+                            target: "agent_shim::resilience",
+                            event_name = "fallback.transition",
+                            request_id = %request_id,
+                            from_upstream = %target.provider,
+                            to_upstream = %chain[i + 1].provider,
+                            reason = "retry_exhausted",
                             "falling back to next upstream"
                         );
                     }
+                    last_error = Some(e);
                     // continue to chain[i+1]
                 }
             }
@@ -261,6 +397,18 @@ impl ResilientCaller {
                 tried: vec![],
             })
         }
+    }
+}
+
+/// Stable label for a [`crate::errors::RateLimitDimension`] in tracing
+/// events (Plan 05 P05 T1).
+fn dimension_label(dim: crate::errors::RateLimitDimension) -> &'static str {
+    use crate::errors::RateLimitDimension as D;
+    match dim {
+        D::PerKey => "per_key",
+        D::PerRoute => "per_route",
+        D::PerUpstream => "per_upstream",
+        D::PerIp => "per_ip",
     }
 }
 

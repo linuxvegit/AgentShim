@@ -86,6 +86,28 @@ pub(crate) fn error_tag(e: &ProviderError) -> &'static str {
     }
 }
 
+/// Stable label for an error class, used as the `error_class` field value
+/// in the `retry.attempt` tracing event. Mirrors [`error_tag`] one-to-one;
+/// kept as a separate function so the tracing field name is discoverable
+/// from the call site.
+///
+/// (Plan 05 P05 T1.)
+pub(crate) fn error_class_label(e: &ProviderError) -> &'static str {
+    // 429 must be matched before the generic >= 500 arm because
+    // `Upstream { status: 429 }` is < 500. (No real risk here since 429 < 500
+    // anyway, but the explicit ordering documents the intent.)
+    match e {
+        ProviderError::Network(_) => "network",
+        ProviderError::Upstream { status, .. } if *status == 429 => "upstream_429",
+        ProviderError::Upstream { status, .. } if *status >= 500 => "upstream_5xx",
+        ProviderError::Upstream { .. } => "upstream_4xx",
+        ProviderError::Decode(_) => "decode",
+        ProviderError::Encode(_) => "encode",
+        ProviderError::CapabilityMismatch(_) => "capability_mismatch",
+        ProviderError::UnknownProvider(_) => "unknown_provider",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +233,53 @@ mod tests {
         );
         assert_eq!(
             error_tag(&ProviderError::UnknownProvider("".into())),
+            "unknown_provider"
+        );
+    }
+
+    #[test]
+    fn error_class_label_pins_canonical_strings() {
+        // Pin operator-facing tracing field values. Changing these breaks
+        // dashboards / alerts keyed on `error_class`.
+        assert_eq!(
+            error_class_label(&ProviderError::Network("".into())),
+            "network"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::Upstream {
+                status: 429,
+                body: "".into()
+            }),
+            "upstream_429"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::Upstream {
+                status: 502,
+                body: "".into()
+            }),
+            "upstream_5xx"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::Upstream {
+                status: 401,
+                body: "".into()
+            }),
+            "upstream_4xx"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::Decode("".into())),
+            "decode"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::Encode("".into())),
+            "encode"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::CapabilityMismatch("".into())),
+            "capability_mismatch"
+        );
+        assert_eq!(
+            error_class_label(&ProviderError::UnknownProvider("".into())),
             "unknown_provider"
         );
     }
