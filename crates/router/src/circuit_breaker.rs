@@ -60,6 +60,13 @@ pub enum BreakerDecision {
     /// Open and within cooldown — skip this chain element.
     Skip,
     /// Open but cooldown elapsed — single probe allowed.
+    ///
+    /// **Caller contract:** when this is returned, the caller MUST follow
+    /// up with [`BreakerState::record`] (or [`BreakerRegistry::record`])
+    /// regardless of whether the probe succeeded or failed. Failing to
+    /// do so leaves `probe_in_flight` set, which wedges the breaker
+    /// permanently in Skip until the process restarts. `ResilientCaller`
+    /// (Plan 03 T3) enforces this by recording every retry-loop outcome.
     Probe,
 }
 
@@ -85,15 +92,19 @@ impl BreakerState {
     }
 
     fn record(&mut self, succeeded: bool, now: Instant, policy: &BreakerPolicy) {
-        // Drop samples outside the window first.
-        let cutoff = now.checked_sub(policy.window).unwrap_or(now);
-        while self
-            .samples
-            .front()
-            .map(|(t, _)| *t < cutoff)
-            .unwrap_or(false)
-        {
-            self.samples.pop_front();
+        // Drop samples outside the window first. If `now - window` underflows
+        // (clock can't go that far back — extremely rare but possible early in
+        // process lifetime), skip eviction entirely rather than collapsing the
+        // cutoff to `now` and evicting almost every sample.
+        if let Some(cutoff) = now.checked_sub(policy.window) {
+            while self
+                .samples
+                .front()
+                .map(|(t, _)| *t < cutoff)
+                .unwrap_or(false)
+            {
+                self.samples.pop_front();
+            }
         }
         self.samples.push_back((now, succeeded));
 
@@ -128,6 +139,11 @@ impl BreakerState {
         }
     }
 
+    /// Returns the breaker's current decision for a fresh request.
+    ///
+    /// When this returns [`BreakerDecision::Probe`], the caller MUST
+    /// pair it with a subsequent [`BreakerState::record`] call (success
+    /// or failure) — see the variant docs for the full contract.
     fn decision(&self, now: Instant, policy: &BreakerPolicy) -> BreakerDecision {
         if !policy.enabled {
             return BreakerDecision::Allow;
