@@ -19,9 +19,12 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Serve the admin router on `listener` until `shutdown` resolves.
-// Plan 01 P01 T4 will call this from `commands::serve::run` when
-// `state.core.admin_config.is_some()`. Until T4 lands, no callsite
-// exists, so suppress the dead-code warning.
+// Plan 01 P01 T3: helper for serving the admin router on a pre-bound
+// listener. T4 chose to inline the admin axum::serve call into
+// `server::run_with_admin` so both listeners share one shutdown
+// notify; this helper remains as a one-listener fallback for future
+// use cases (e.g. admin-only test harnesses). Remove if no callsite
+// materializes by P05.
 #[allow(dead_code)]
 pub async fn run(
     listener: tokio::net::TcpListener,

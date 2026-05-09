@@ -35,11 +35,65 @@ pub async fn run(state: AppState) -> Result<()> {
     .parse()?;
 
     let app = build_router(state);
-    info!("Listening on {}", bind);
+    info!("Listening on {} (public)", bind);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    Ok(())
+}
+
+/// Run BOTH listeners (public + admin) concurrently with shared graceful
+/// shutdown. Used when `state.core.admin_config` is `Some`.
+pub async fn run_with_admin(state: AppState) -> Result<()> {
+    let public_bind: SocketAddr = format!(
+        "{}:{}",
+        state.core.server_config.bind, state.core.server_config.port
+    )
+    .parse()?;
+    let admin_cfg = state
+        .core
+        .admin_config
+        .clone()
+        .expect("run_with_admin called with admin_config = None");
+    let admin_bind: SocketAddr = format!("{}:{}", admin_cfg.bind, admin_cfg.port).parse()?;
+
+    let public_listener = tokio::net::TcpListener::bind(public_bind).await?;
+    let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
+    info!("Listening on {} (public)", public_bind);
+    info!("Listening on {} (admin)", admin_bind);
+
+    let public_app = build_router(state.clone());
+    let admin_app = crate::admin::build_router(state);
+
+    // Share one shutdown signal: when one listener is told to shut down,
+    // the other follows. The original signal future is consumed by a
+    // spawned task that fans out via Notify so both listeners can await
+    // their own clones.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            s.notify_waiters();
+        });
+    }
+
+    let public_shutdown = {
+        let s = shutdown.clone();
+        async move { s.notified().await }
+    };
+    let admin_shutdown = {
+        let s = shutdown.clone();
+        async move { s.notified().await }
+    };
+
+    tokio::select! {
+        res = axum::serve(public_listener, public_app)
+            .with_graceful_shutdown(public_shutdown) => res?,
+        res = axum::serve(admin_listener, admin_app)
+            .with_graceful_shutdown(admin_shutdown) => res?,
+    }
     Ok(())
 }
 
