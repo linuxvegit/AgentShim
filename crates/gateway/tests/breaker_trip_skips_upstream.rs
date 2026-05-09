@@ -21,7 +21,7 @@
 //! decision/record ordering, fallback eligibility) surfaces here as
 //! a hit-count violation rather than as a mystery in production.
 //!
-//! The load-bearing assertion is `mock_a.expect_at_most(10)`. With
+//! The load-bearing assertion is `bad_a.expect_at_most(10)`. With
 //! `min_requests: 5` and 30 inbound requests, a broken breaker would
 //! let all 30 hit A; mockito enforces the bound on `assert_async`.
 
@@ -206,12 +206,22 @@ async fn breaker_trip_short_circuits_first_chain_element() {
             .send()
             .await
             .unwrap_or_else(|e| panic!("request {i} failed: {e}"));
+        let status = resp.status();
+        let body = resp.text().await.expect("body");
         assert_eq!(
-            resp.status(),
-            200,
+            status, 200,
             "request {i}: expected 200 (B is healthy and either chain[0]→chain[1] \
-             fallback succeeds or breaker trips and we go straight to B), got {}",
-            resp.status()
+             fallback succeeds or breaker trips and we go straight to B), got {status}\n\
+             body: {body}"
+        );
+        // Status 200 alone doesn't prove B's payload reached the client —
+        // a regression in the canonical decode → OpenAI Chat encode path
+        // could yield an empty 200. `from B` is server B's `content`
+        // field, so its presence end-to-end is the proof that fallback
+        // (or breaker-skip) actually delivered B's bytes.
+        assert!(
+            body.contains("from B"),
+            "request {i}: expected upstream B's content in response body; got: {body}"
         );
     }
 
