@@ -75,6 +75,22 @@ impl ResilientCaller {
             let bpolicy = &breaker_policies[i];
             let rpolicy = &retry_policies[i];
 
+            // Resolve the provider BEFORE consulting the breaker. If the
+            // provider name is unknown, we'd return TerminalError early
+            // and skip the breaker's record() call — which would leak
+            // a probe authorization (probe_in_flight stuck true) when the
+            // breaker happened to be in HalfOpen. Production routes are
+            // validated at startup so UnknownProvider should never reach
+            // this point, but doing the lookup first makes the invariant
+            // independent of that guarantee.
+            let provider = match self.providers.get(&target.provider) {
+                Some(p) => p,
+                None => {
+                    let e = ProviderError::UnknownProvider(target.provider.clone());
+                    return Err(ResilienceError::TerminalError { error: e, tried });
+                }
+            };
+
             // ── BREAKER GATE ────────────────────────────────────────────────
             let decision = self
                 .breakers
@@ -98,20 +114,14 @@ impl ResilientCaller {
                         "breaker half-open; attempting probe"
                     );
                     // Fall through to call. probe_in_flight is set by
-                    // decision(); record() clears it.
+                    // decision(); record() clears it. Because the provider
+                    // lookup is already complete above, no early-return
+                    // path between here and the record() calls can leak it.
                 }
                 crate::circuit_breaker::BreakerDecision::Allow => {
                     // Normal path.
                 }
             }
-
-            let provider = match self.providers.get(&target.provider) {
-                Some(p) => p,
-                None => {
-                    let e = ProviderError::UnknownProvider(target.provider.clone());
-                    return Err(ResilienceError::TerminalError { error: e, tried });
-                }
-            };
 
             let started = Instant::now();
             // retry_with_policy returns Err on retry exhaustion OR terminal.
