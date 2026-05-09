@@ -25,14 +25,14 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
         server: ServerConfig::default(),
         logging: LoggingConfig::default(),
         upstreams,
-        routes: vec![RouteEntry {
-            frontend: "openai_chat".to_string(),
-            model: "gpt-4o".to_string(),
-            upstream: "test-openai".to_string(),
-            upstream_model: "gpt-4o-2024-11-20".to_string(),
-            reasoning_effort: None,
-            anthropic_beta: None,
-        }],
+        routes: vec![RouteEntry::singular(
+            "openai_chat",
+            "gpt-4o",
+            "test-openai",
+            "gpt-4o-2024-11-20",
+        )],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     }
 }

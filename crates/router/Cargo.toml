@@ -11,9 +11,19 @@ path = "src/lib.rs"
 [dependencies]
 agent-shim-core = { path = "../core" }
 agent-shim-config = { path = "../config" }
+agent-shim-providers = { path = "../providers" }
+governor = "0.6"
+nonzero_ext = "0.3"
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
+tokio = { workspace = true }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
+sha2 = "0.10"
+uuid = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing-test = { version = "0.2", features = ["no-env-filter"] }

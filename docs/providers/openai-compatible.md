@@ -47,3 +47,34 @@ can emit an appropriate error to the client.
 
 The provider does **not** retry automatically. Retry logic belongs in the
 caller or at the infrastructure layer (e.g. a load balancer).
+
+## Resilience behavior
+
+This provider participates in the v0.4 resilience subsystem. See
+[`docs/resilience.md`](../resilience.md) for the operator-facing guide
+and the [Phase 4 design spec](../superpowers/specs/2026-05-08-phase-4-resiliency-design.md)
+for the layering details.
+
+**Default fallback eligibility for this provider:**
+
+| Error class                     | Eligible?              |
+|---------------------------------|------------------------|
+| Network errors (timeout, DNS)   | Eligible — falls back  |
+| Upstream 5xx                    | Eligible — falls back  |
+| Upstream 429 (rate limit)       | Eligible — falls back  |
+| Upstream 4xx (auth, validation) | Terminal — no fallback |
+| Decode/encode errors            | Terminal — no fallback |
+| Capability mismatch             | Terminal — no fallback |
+
+**Provider-specific notes:**
+
+* Vendors that proxy OpenAI may return HTTP 503 for capacity issues —
+  fallback-eligible by default. The provider does not distinguish
+  vendor variants beyond the HTTP status code, so any 5xx from
+  OpenAI / DeepSeek / Together / Fireworks / Azure-OpenAI / Ollama /
+  vLLM / etc. travels the same fallback path.
+
+**Streaming caveat (D4):** Once `provider.complete()` returns
+`Ok(stream)` and bytes flow to the client, fallback is no longer
+possible. Mid-stream failures surface as stream-level errors. This
+matches v0.3 behavior; v0.4 does not introduce buffering.

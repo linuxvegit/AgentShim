@@ -211,3 +211,33 @@ error.
 
 The provider does **not** retry automatically. Retry logic belongs in
 the caller or at the infrastructure layer.
+
+## Resilience behavior
+
+This provider participates in the v0.4 resilience subsystem. See
+[`docs/resilience.md`](../resilience.md) for the operator-facing guide
+and the [Phase 4 design spec](../superpowers/specs/2026-05-08-phase-4-resiliency-design.md)
+for the layering details.
+
+**Default fallback eligibility for this provider:**
+
+| Error class                     | Eligible?              |
+|---------------------------------|------------------------|
+| Network errors (timeout, DNS)   | Eligible — falls back  |
+| Upstream 5xx                    | Eligible — falls back  |
+| Upstream 429 (rate limit)       | Eligible — falls back  |
+| Upstream 4xx (auth, validation) | Terminal — no fallback |
+| Decode/encode errors            | Terminal — no fallback |
+| Capability mismatch             | Terminal — no fallback |
+
+**Provider-specific notes:**
+
+* Anthropic returns HTTP 529 (overloaded) during sustained load. 529
+  is in the 5xx range so the default classifier treats it as
+  fallback-eligible — fallback chains will move to the next upstream.
+  Operators rarely need to override.
+
+**Streaming caveat (D4):** Once `provider.complete()` returns
+`Ok(stream)` and bytes flow to the client, fallback is no longer
+possible. Mid-stream failures surface as stream-level errors. This
+matches v0.3 behavior; v0.4 does not introduce buffering.

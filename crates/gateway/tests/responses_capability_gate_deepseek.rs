@@ -38,7 +38,10 @@ use agent_shim_providers::{
     BackendProvider, ProviderCapabilities, ProviderError, ProviderRegistry,
 };
 use agent_shim_router::model_index::ModelIndex;
-use agent_shim_router::{ModelResolver, Router as RouterTrait, StaticRouter};
+use agent_shim_router::{
+    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, Router as RouterTrait,
+    StaticRouter,
+};
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -122,14 +125,14 @@ fn make_app_state() -> AppState {
         server: Default::default(),
         logging: Default::default(),
         upstreams: Default::default(),
-        routes: vec![RouteEntry {
-            frontend: "openai_responses".to_string(),
-            model: "text-only-model".to_string(),
-            upstream: "text-only-stub".to_string(),
-            upstream_model: "text-only-model".to_string(),
-            reasoning_effort: None,
-            anthropic_beta: None,
-        }],
+        routes: vec![RouteEntry::singular(
+            "openai_responses",
+            "text-only-model",
+            "text-only-stub",
+            "text-only-model",
+        )],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     };
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));
@@ -138,19 +141,44 @@ fn make_app_state() -> AppState {
 
     // Sanity check: route lookup hits the stub. Avoids a cryptic 404 if
     // the route table ever drifts out from under the test.
-    let target = resolver
+    let chain = resolver
         .resolve(FrontendKind::OpenAiResponses, "text-only-model")
         .expect("test setup: openai_responses route must resolve");
-    assert_eq!(target.provider, "text-only-stub");
+    assert_eq!(chain[0].provider, "text-only-stub");
     let _ = RoutePolicy::default(); // silence unused-import lint when policy isn't touched
+
+    // Build the resilient caller against the same provider registry the
+    // gateway exposes to the pipeline. The stub is wrapped in an
+    // `Arc<ProviderRegistry>` so the lookup adapter shares its instance.
+    let providers = Arc::new(registry);
+    struct Lookup(Arc<ProviderRegistry>);
+    impl ProviderLookup for Lookup {
+        fn get(&self, name: &str) -> Option<Arc<dyn BackendProvider>> {
+            self.0.get(name)
+        }
+    }
+    let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(Lookup(Arc::clone(&providers)));
+    let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
+    let limiter_registry = Arc::new(agent_shim_router::LimiterRegistry::disabled());
+    let resilient_caller = Arc::new(ResilientCaller::new(
+        provider_lookup,
+        Arc::clone(&breaker_registry),
+        Arc::clone(&limiter_registry),
+    ));
 
     AppState {
         config: Arc::new(cfg),
         anthropic,
         openai,
         openai_responses,
-        providers: Arc::new(registry),
+        providers,
         resolver,
+        resilient_caller,
+        breaker_registry,
+        limiter_registry,
+        auth_enabled: false,
+        auth_required: false,
+        configured_key_hashes: Arc::new(std::collections::HashSet::new()),
     }
 }
 

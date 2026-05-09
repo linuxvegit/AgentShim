@@ -27,7 +27,8 @@ use agent_shim_core::{
     BackendTarget, CanonicalRequest, CanonicalStream, ContentBlock, StreamEvent, Usage,
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
-use agent_shim_providers::{BackendProvider, ProviderCapabilities, ProviderError};
+use agent_shim_providers::{ProviderCapabilities, ProviderError};
+use agent_shim_router::{AgentIdentity, BreakerPolicy, RetryPolicy};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -94,7 +95,55 @@ pub async fn dispatch(
         alias
     };
 
-    let target = state
+    // Plan 04 P04 T4: extract identity + run the auth.required gate
+    // BEFORE route resolution. Both are in-memory hash lookups so order
+    // is a security choice rather than a perf one: returning 401 ahead
+    // of 404 prevents an unauthenticated probe from enumerating which
+    // routes exist. When `auth.enabled = false` we skip extraction —
+    // identity is always Anonymous and the rate-limit registry is
+    // separately gated by its own `enabled=false` short-circuit.
+    let identity = if state.auth_enabled {
+        let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
+        let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
+
+        if state.auth_required {
+            match &extracted {
+                AgentIdentity::Anonymous => {
+                    tracing::warn!(
+                        endpoint = spec.endpoint_label,
+                        "auth.required=true but request had no Authorization or x-api-key header"
+                    );
+                    return Err(HandlerError::Unauthorized {
+                        kind: spec.frontend.kind(),
+                    });
+                }
+                AgentIdentity::KeyHash(h) => {
+                    // Non-constant-time compare on already-hashed values
+                    // is fine: the hash itself is not a secret, so timing
+                    // leaks reveal nothing about the original key bytes.
+                    if !state.configured_key_hashes.contains(h) {
+                        // Operator log carries the hash (NEVER plaintext) so
+                        // a misconfigured client can be tracked down without
+                        // leaking the secret.
+                        tracing::warn!(
+                            endpoint = spec.endpoint_label,
+                            presented_hash = %h,
+                            "auth.required=true but presented key not in auth.keys allowlist"
+                        );
+                        return Err(HandlerError::Unauthorized {
+                            kind: spec.frontend.kind(),
+                        });
+                    }
+                }
+            }
+        }
+        extracted
+    } else {
+        AgentIdentity::Anonymous
+    };
+
+    let chain = state
         .resolver
         .resolve(spec.frontend.kind(), &model_alias)
         .map_err(|e| {
@@ -102,18 +151,125 @@ pub async fn dispatch(
             HandlerError::Route(e)
         })?;
 
-    let upstream_model = target.model.clone();
+    // Plan 04 P02 D2: route-level retry block governs every chain element
+    // uniformly. Build one `RetryPolicy` and clone it per chain position so
+    // `ResilientCaller::complete` can apply it independently to each
+    // upstream's retry budget.
+    let route_retry_config = match state
+        .resolver
+        .find_retry_policy(spec.frontend.kind(), &model_alias)
+    {
+        Some(c) => c,
+        None => {
+            tracing::debug!(
+                model = %model_alias,
+                "no route-specific retry policy; using RetryConfig defaults"
+            );
+            Default::default()
+        }
+    };
+    let retry_policy = RetryPolicy::from(&route_retry_config);
+    let policies: Vec<RetryPolicy> = vec![retry_policy; chain.len()];
 
-    let provider = state.providers.get(&target.provider).ok_or_else(|| {
-        tracing::error!(provider = %target.provider, "provider not registered");
+    // Plan 04 P03 T4: parallel breaker policies — same uniform-per-route
+    // shape as retry, fed into `ResilientCaller::complete` alongside the
+    // retry policies. Falls back to `BreakerConfig::default()` (the §4.5/D6
+    // defaults) when the route doesn't override.
+    let route_breaker_config = match state
+        .resolver
+        .find_breaker_policy(spec.frontend.kind(), &model_alias)
+    {
+        Some(c) => c,
+        None => {
+            tracing::debug!(
+                model = %model_alias,
+                "no route-specific breaker policy; using BreakerConfig defaults"
+            );
+            Default::default()
+        }
+    };
+    let breaker_policy = BreakerPolicy::from(&route_breaker_config);
+    let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; chain.len()];
+
+    // Plan 04 P04 T4: build `client_ip` and `frontend_model` for the
+    // rate-limit gates. These depend on `model_alias`, so they're built
+    // AFTER the auth.required check but BEFORE the chain walk.
+    //
+    // `x-forwarded-for` is client-controlled when no reverse proxy
+    // strips/rewrites it, so the per-IP bucket is trivially bypassable
+    // by direct-internet-exposed deployments. Operators should front the
+    // gateway with a known proxy that asserts the header. Threading the
+    // socket peer addr through the handler signature is a v0.5 P5 concern.
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Per-route bucket key: `<frontend_kind>/<model_alias>`. Matches
+    // the format the YAML config uses for `rate_limit.per_route` keys
+    // (see Plan 04 P04 T3).
+    let frontend_kind_str = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+    let frontend_model = format!("{frontend_kind_str}/{model_alias}");
+
+    // The chain is non-empty by router invariant (singular routes produce
+    // 1-element vecs; array routes are validated to be non-empty by
+    // `validate_routes`). The capability gate, the request log line, and
+    // the proxy_raw short-circuit all run against `chain[0]`'s provider —
+    // chain-element-aware capability checking is intentionally out of
+    // scope for v0.4 (potential P03+ extension).
+    let first_target = chain
+        .first()
+        .expect("ModelResolver::resolve never returns an empty chain on Ok")
+        .clone();
+    let upstream_model = first_target.model.clone();
+
+    let first_provider = state.providers.get(&first_target.provider).ok_or_else(|| {
+        tracing::error!(provider = %first_target.provider, "provider not registered");
         HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-            target.provider.clone(),
+            first_target.provider.clone(),
         ))
     })?;
 
     // Raw-passthrough short-circuit: only the Responses frontend uses this.
     // We don't know reasoning_effort etc. without decoding the body, so log
-    // the route default as the best approximation.
+    // the route default as the best approximation. The passthrough path is
+    // single-upstream by nature: it bypasses the canonical decode/encode
+    // round-trip and so cannot itself participate in chain fallback.
+    //
+    // Plan 04 P02 T6: when proxy_raw returns `Err`, fall through to the
+    // canonical decode path so the chain walk (`ResilientCaller`) gets the
+    // chance to try chain[1..]. The cost is an extra attempt at chain[0]
+    // via `complete()` — likely also failing — before fallback fires, but
+    // proxy_raw failures are rare and the alternative (terminating on
+    // chain[0]'s passthrough error and skipping fallback) violates the
+    // user-visible contract that a non-empty `upstreams: [...]` chain
+    // tries every element on eligible failures.
+    //
+    // `Ok(None)` (proxy_raw not applicable for this frontend) and `Err(_)`
+    // both fall through. Successful proxy_raw returns the stream as-is —
+    // resilience-layer handling for that case is intentionally out of
+    // scope for v0.4.
+    //
+    // Plan 04 P04 T5 — KNOWN GAP (v0.5): when proxy_raw returns
+    // `Ok(Some(...))` and serves the response without a canonical
+    // round-trip, the rate-limit and breaker gates are bypassed
+    // entirely. Both gates live inside `ResilientCaller::complete`,
+    // which the proxy_raw fast path skips. Gating at the top of the
+    // `try_proxy_raw` block double-consumes when proxy_raw falls
+    // through to the canonical path; gating only inside `Ok(Some(...))`
+    // means proxy_raw has already committed upstream resources by the
+    // time we'd reject. Either fix needs a small refactor (e.g. an
+    // explicit RateLimitTicket value that's only consumed when the
+    // request actually completes) — out of scope for v0.4. The
+    // `crates/gateway/tests/rate_limit_per_key_envelope.rs` Anthropic
+    // test routes through an OAI-compat upstream specifically to
+    // exercise the canonical-path gate.
     if spec.try_proxy_raw {
         tracing::info!(
             "→ {} | model: {} → {} | bodyBytes: {} | reasoning_default: {}",
@@ -121,39 +277,48 @@ pub async fn dispatch(
             model_alias,
             upstream_model,
             body_bytes,
-            target
+            first_target
                 .policy
                 .default_reasoning_effort
                 .map(|e| e.as_str())
                 .unwrap_or("none"),
         );
 
-        if let Some((content_type, byte_stream)) = provider
-            .proxy_raw(body.clone(), target.clone(), spec.frontend.kind())
+        match first_provider
+            .proxy_raw(body.clone(), first_target.clone(), spec.frontend.kind())
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "proxy_raw failed");
-                HandlerError::Provider(e)
-            })?
         {
-            tracing::info!(
-                "← {} (passthrough) | model: {} → {} | {:.1}s",
-                spec.endpoint_label,
-                model_alias,
-                upstream_model,
-                started.elapsed().as_secs_f64()
-            );
-            let body_stream = Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
-            let mut r = Response::new(body_stream);
-            r.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_str(&content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
-            );
-            return Ok(r);
+            Ok(Some((content_type, byte_stream))) => {
+                tracing::info!(
+                    "← {} (passthrough) | model: {} → {} | {:.1}s",
+                    spec.endpoint_label,
+                    model_alias,
+                    upstream_model,
+                    started.elapsed().as_secs_f64()
+                );
+                let body_stream =
+                    Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
+                let mut r = Response::new(body_stream);
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
+                );
+                return Ok(r);
+            }
+            Ok(None) => {
+                // Frontend not supported by this provider's passthrough —
+                // continue to canonical decode below.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proxy_raw failed; falling through to canonical chain walk"
+                );
+            }
         }
 
-        // Passthrough not supported — fall through with a fresh decode.
+        // Passthrough not used (or failed) — fall through with a fresh decode.
         let canonical = spec
             .frontend
             .decode_request(&body)
@@ -169,17 +334,21 @@ pub async fn dispatch(
 
     // Snapshot the merged route policy onto the canonical request. Providers
     // and logging both read from `resolved_policy` so the merge rule lives in
-    // exactly one place (RoutePolicy::resolve).
-    canonical.resolved_policy = target.policy.resolve(&canonical);
+    // exactly one place (RoutePolicy::resolve). v0.4 D2: route-level policy
+    // is uniform across the chain; resolving against `chain[0]`'s policy is
+    // correct because every chain element shares the same `RoutePolicy`.
+    canonical.resolved_policy = first_target.policy.resolve(&canonical);
 
     // Capability gate. Reject before any network call when the request asks
     // for a feature the target provider can't deliver — today this is just
     // vision (image blocks against a text-only backend). The check has to
-    // run after decode (so we can scan content blocks) but before
-    // run_stream / run_unary (so we never reach the upstream).
-    check_capabilities(&canonical, provider.capabilities()).map_err(|e| {
+    // run after decode (so we can scan content blocks) but before the chain
+    // walk (so we never reach the upstream). The check inspects only
+    // `chain[0]`'s capabilities; chain-element-aware gating is out of
+    // scope for v0.4.
+    check_capabilities(&canonical, first_provider.capabilities()).map_err(|e| {
         tracing::warn!(
-            provider = %target.provider,
+            provider = %first_target.provider,
             error = %e,
             "capability mismatch — rejecting before upstream call"
         );
@@ -223,28 +392,47 @@ pub async fn dispatch(
             .unwrap_or_default(),
     );
 
+    // Walk the chain via `ResilientCaller`: per-element retry, eligible
+    // errors fall through to the next chain element, terminal errors
+    // short-circuit. All resilience-shaped errors flow through the
+    // `from_resilience_error` bridge so the response envelope is shaped
+    // by the inbound frontend dialect.
+    let frontend_kind = spec.frontend.kind();
     if is_stream {
         run_stream(
             spec,
-            provider,
+            state,
             canonical,
-            target,
+            chain,
+            policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
             RunContext {
                 model_alias,
                 upstream_model,
                 started,
+                frontend_kind,
             },
         )
+        .await
     } else {
         run_unary(
             spec,
-            provider,
+            state,
             canonical,
-            target,
+            chain,
+            policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
             RunContext {
                 model_alias,
                 upstream_model,
                 started,
+                frontend_kind,
             },
         )
         .await
@@ -256,13 +444,27 @@ struct RunContext {
     model_alias: String,
     upstream_model: String,
     started: std::time::Instant,
+    /// The inbound frontend's wire dialect. Threaded into the run helpers
+    /// so resilience-error → HandlerError mapping can shape the response
+    /// envelope per the client's expected schema.
+    frontend_kind: agent_shim_core::FrontendKind,
 }
 
-fn run_stream(
+// `#[allow(clippy::too_many_arguments)]`: matches the signature of
+// `ResilientCaller::complete` plus the per-frontend pipeline spec and
+// the run-context bundle. Bundling identity/client_ip/frontend_model
+// into a struct would just move the verbosity to the caller.
+#[allow(clippy::too_many_arguments)]
+async fn run_stream(
     spec: PipelineSpec<'_>,
-    provider: Arc<dyn BackendProvider>,
-    canonical: agent_shim_core::CanonicalRequest,
-    target: BackendTarget,
+    state: &AppState,
+    canonical: CanonicalRequest,
+    chain: Vec<BackendTarget>,
+    policies: Vec<RetryPolicy>,
+    breaker_policies: Vec<BreakerPolicy>,
+    identity: AgentIdentity,
+    client_ip: String,
+    frontend_model: String,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let label = spec.endpoint_label;
@@ -270,7 +472,28 @@ fn run_stream(
         model_alias,
         upstream_model,
         started,
+        frontend_kind,
     } = ctx;
+
+    // Walk the chain. `ResilientCaller::complete` returns a single
+    // `CanonicalStream` from whichever upstream succeeded; downstream
+    // encoding is unchanged from the pre-T6 single-upstream world.
+    let upstream_stream = state
+        .resilient_caller
+        .complete(
+            chain,
+            canonical,
+            policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "resilient call failed");
+            HandlerError::from_resilience_error(e, frontend_kind)
+        })?;
 
     if spec.log_streaming_usage_on_drop {
         // Anthropic-style: log final usage when the SSE stream is dropped.
@@ -283,7 +506,6 @@ fn run_stream(
             started,
         };
 
-        let upstream_stream = spawn_provider_stream(provider, canonical, target);
         let logging_stream = upstream_stream.map(move |event| {
             if let Ok(ref ev) = event {
                 match ev {
@@ -324,7 +546,6 @@ fn run_stream(
         }
     } else {
         // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        let upstream_stream = spawn_provider_stream(provider, canonical, target);
         let frontend_response = spec.frontend.encode_stream(upstream_stream);
         tracing::info!(
             "← {} (stream) | model: {} → {} | {:.1}s",
@@ -337,22 +558,45 @@ fn run_stream(
     }
 }
 
+// `#[allow(clippy::too_many_arguments)]`: see `run_stream` above —
+// same justification, the parameters describe the full chain-walk
+// context.
+#[allow(clippy::too_many_arguments)]
 async fn run_unary(
     spec: PipelineSpec<'_>,
-    provider: Arc<dyn BackendProvider>,
-    canonical: agent_shim_core::CanonicalRequest,
-    target: BackendTarget,
+    state: &AppState,
+    canonical: CanonicalRequest,
+    chain: Vec<BackendTarget>,
+    policies: Vec<RetryPolicy>,
+    breaker_policies: Vec<BreakerPolicy>,
+    identity: AgentIdentity,
+    client_ip: String,
+    frontend_model: String,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let RunContext {
         model_alias,
         upstream_model,
         started,
+        frontend_kind,
     } = ctx;
-    let stream = provider.complete(canonical, target).await.map_err(|e| {
-        tracing::error!(error = %e, "provider.complete failed");
-        HandlerError::Provider(e)
-    })?;
+
+    let stream = state
+        .resilient_caller
+        .complete(
+            chain,
+            canonical,
+            policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "resilient call failed");
+            HandlerError::from_resilience_error(e, frontend_kind)
+        })?;
     let response = collect_stream(stream).await?;
     let (input, output) = match &response.usage {
         Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
@@ -394,39 +638,6 @@ fn capture_anthropic_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-/// Spawn the upstream provider call on a background task and return a
-/// CanonicalStream the frontend can encode lazily.
-pub(crate) fn spawn_provider_stream(
-    provider: Arc<dyn BackendProvider>,
-    canonical: agent_shim_core::CanonicalRequest,
-    target: BackendTarget,
-) -> CanonicalStream {
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<Result<StreamEvent, agent_shim_core::StreamError>>(32);
-
-    tokio::spawn(async move {
-        match provider.complete(canonical, target).await {
-            Ok(mut upstream) => {
-                while let Some(event) = upstream.next().await {
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "provider.complete failed");
-                let _ = tx
-                    .send(Err(agent_shim_core::StreamError::Upstream(e.to_string())))
-                    .await;
-            }
-        }
-    });
-
-    Box::pin(futures::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|item| (item, rx))
-    }))
 }
 
 /// Peek at the JSON body to extract the `model` field for raw-passthrough

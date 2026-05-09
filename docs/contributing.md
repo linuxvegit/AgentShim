@@ -126,6 +126,47 @@ should follow the same shape: ADR first, typed shape with open enums
 where the wire is open, double-write window, removal in the next
 minor.
 
+## How to add a resilience subsystem
+
+Phase 4 introduced four subsystems (fallback, retry, circuit breaker,
+rate limit) that share a common shape. If a future feature needs the
+same shape (e.g., distributed state in v0.5, or cost-aware routing),
+follow this pattern:
+
+1. **New module under `crates/router/src/<subsystem>.rs`.** Pure logic
+   first — state machine, math, classification — with property tests
+   that don't touch the rest of the gateway. Unit tests in-module.
+2. **`Registry` newtype.** A `Registry` struct holds the subsystem's
+   per-key state (e.g., `BreakerRegistry`, `LimiterRegistry`). Use
+   `RwLock<HashMap<K, V>>` for state that grows on first-touch and
+   updates on contention; use atomic primitives or lock-free crates
+   (`governor`) for hot-path-only paths.
+3. **Wire into `ResilientCaller`.** Add an `Arc<NewRegistry>` field
+   and a check call at the right point in the layering — see §5.2 of
+   the Phase 4 design spec. Update the [tracing event taxonomy](
+   ../crates/router/src/resilient_caller.rs) module-level doc comment
+   with the new event names + field set.
+4. **Config schema.** Add the subsystem's config block to
+   `crates/config/src/schema.rs` (top-level if cross-cutting; on
+   `RouteEntry` if per-route). Add validation rules to
+   `crates/config/src/validation.rs`. Defaults should reproduce
+   pre-feature behavior — operators opt in explicitly. Validate
+   plaintext-vs-hash, range bounds, and cross-references at startup.
+5. **Tests in three layers** mirroring §8 of the design spec:
+   - Pure unit tests in-module (state machine + math).
+   - Subsystem-composition tests in `crates/router/tests/`
+     (against mock providers, not real HTTP).
+   - End-to-end smokes in `crates/gateway/tests/` (`mockito` for HTTP).
+6. **Operator docs.** A `## <Subsystem>` subsection in
+   `docs/resilience.md`; an entry in the operator log line reference;
+   a config example. If the subsystem changes the error envelope
+   shape, update `docs/providers/*.md` Resilience-behavior tables.
+7. **ADR.** If the layering choice is non-obvious, write an ADR.
+   Otherwise, the ADR can wait until a competing approach surfaces.
+
+The pattern is intentionally light — none of the four Phase 4
+subsystems used all seven steps, but each used at least four.
+
 ## Test Commands
 
 ```bash

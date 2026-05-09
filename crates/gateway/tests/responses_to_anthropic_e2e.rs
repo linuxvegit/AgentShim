@@ -64,14 +64,14 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
         server: ServerConfig::default(),
         logging: LoggingConfig::default(),
         upstreams,
-        routes: vec![RouteEntry {
-            frontend: "openai_responses".to_string(),
-            model: "claude-opus-4-7".to_string(),
-            upstream: "test-anthropic".to_string(),
-            upstream_model: "claude-opus-4-7".to_string(),
-            reasoning_effort: None,
-            anthropic_beta: None,
-        }],
+        routes: vec![RouteEntry::singular(
+            "openai_responses",
+            "claude-opus-4-7",
+            "test-anthropic",
+            "claude-opus-4-7",
+        )],
+        auth: Default::default(),
+        rate_limit: Default::default(),
         copilot: None,
     }
 }
