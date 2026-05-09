@@ -70,6 +70,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
+        admin: None,
     }
 }
 

@@ -140,6 +140,7 @@ fn make_chat_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
         auth,
         rate_limit,
         copilot: None,
+        admin: None,
     }
 }
 
@@ -202,6 +203,7 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
         auth,
         rate_limit,
         copilot: None,
+        admin: None,
     }
 }
 

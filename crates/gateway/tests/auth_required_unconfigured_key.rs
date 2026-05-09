@@ -124,6 +124,7 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
         auth,
         rate_limit: RateLimitConfig::default(),
         copilot: None,
+        admin: None,
     }
 }
 

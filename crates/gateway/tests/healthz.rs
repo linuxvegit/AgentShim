@@ -13,6 +13,7 @@ fn minimal_config() -> GatewayConfig {
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
+        admin: None,
     }
 }
 

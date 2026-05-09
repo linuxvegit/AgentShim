@@ -131,6 +131,7 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
+        admin: None,
     }
 }
 

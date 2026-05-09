@@ -19,6 +19,10 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     pub copilot: Option<CopilotConfig>,
+    /// Optional admin listener. When `None`, no admin endpoints are
+    /// exposed and no second listener is bound. Plan 01 P01.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +54,40 @@ impl Default for ServerConfig {
             bind: default_bind(),
             port: default_port(),
             keepalive_secs: default_keepalive(),
+        }
+    }
+}
+
+/// Admin/operator HTTP listener — distinct from the request-serving listener
+/// (`server.*`). Hosts /metrics, /healthz, /readyz, and /admin/reload.
+///
+/// **Absent → admin listener is disabled entirely.** No default values are
+/// applied; operators opt in by including the `admin:` block in their
+/// gateway YAML. This is the conservative default: a fresh v0.5 binary
+/// upgraded from v0.4 has no exposed admin surface unless the operator
+/// adds the block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+    #[serde(default = "default_admin_port")]
+    pub port: u16,
+}
+
+fn default_admin_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_admin_port() -> u16 {
+    9100
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_admin_bind(),
+            port: default_admin_port(),
         }
     }
 }
@@ -670,5 +708,25 @@ default_headers:
         // template — must continue to deserialize under the new schema.
         let yaml = include_str!("../../../config/gateway.minimal.yaml");
         let _cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("v0.3 minimal parses");
+    }
+
+    #[test]
+    fn admin_config_block_parses() {
+        let yaml = r#"
+admin:
+  bind: 127.0.0.1
+  port: 9100
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let admin = cfg.admin.expect("admin block present");
+        assert_eq!(admin.bind, "127.0.0.1");
+        assert_eq!(admin.port, 9100);
+    }
+
+    #[test]
+    fn admin_config_absent_means_disabled() {
+        let yaml = "server: {bind: 127.0.0.1, port: 8787}";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert!(cfg.admin.is_none(), "admin must be None when block absent");
     }
 }

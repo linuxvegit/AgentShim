@@ -57,6 +57,18 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         return Err(ValidationError::ZeroPort);
     }
 
+    if let Some(admin) = &cfg.admin {
+        if admin.port == 0 {
+            return Err(ValidationError::ZeroPort);
+        }
+        if admin.port == cfg.server.port && admin.bind == cfg.server.bind {
+            return Err(ValidationError::InvalidRoute(format!(
+                "admin.port {} collides with server.port {} on the same bind {}",
+                admin.port, cfg.server.port, admin.bind
+            )));
+        }
+    }
+
     let mut seen = std::collections::HashSet::new();
     for route in &cfg.routes {
         if !VALID_FRONTENDS.contains(&route.frontend.as_str()) {
@@ -429,6 +441,7 @@ mod tests {
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             copilot: None,
+            admin: None,
         }
     }
 
@@ -1162,5 +1175,38 @@ routes:
         assert!(!cfg.auth.enabled);
         assert!(!cfg.auth.required);
         assert!(!cfg.rate_limit.enabled);
+    }
+
+    // ── Plan 01 P01 T1: admin port validation ──────────────────────────────
+
+    fn minimal_cfg() -> crate::GatewayConfig {
+        serde_yaml::from_str("server: {bind: 127.0.0.1, port: 8787}").unwrap()
+    }
+
+    #[test]
+    fn admin_port_zero_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.admin = Some(crate::AdminConfig { bind: "127.0.0.1".into(), port: 0 });
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn admin_port_equal_to_server_port_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.admin = Some(crate::AdminConfig {
+            bind: cfg.server.bind.clone(),
+            port: cfg.server.port,
+        });
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn admin_port_different_bind_or_port_ok() {
+        let mut cfg = minimal_cfg();
+        cfg.admin = Some(crate::AdminConfig {
+            bind: "127.0.0.1".into(),
+            port: 9100,
+        });
+        assert!(validate(&cfg).is_ok());
     }
 }

@@ -250,6 +250,7 @@ mod tests {
             auth: Default::default(),
             rate_limit: Default::default(),
             copilot: None,
+            admin: None,
         }
     }
 
@@ -349,6 +350,7 @@ mod tests {
             auth: Default::default(),
             rate_limit: Default::default(),
             copilot: None,
+            admin: None,
         };
         let router = StaticRouter::from_config(&cfg);
         let chain = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
