@@ -330,26 +330,39 @@ the upstream status.
 The provider does **not** retry automatically. Retry logic belongs in
 the caller or at the infrastructure layer.
 
-### Resilience behavior (v0.4+)
+## Resilience behavior
 
-The v0.4 resilience layer treats this provider's errors as
-follows:
+This provider participates in the v0.4 resilience subsystem. See
+[`docs/resilience.md`](../resilience.md) for the operator-facing guide
+and the [Phase 4 design spec](../superpowers/specs/2026-05-08-phase-4-resiliency-design.md)
+for the layering details.
 
-| Error pattern | Default eligibility |
-|---|---|
-| Connect/DNS/TLS failures (`Network`) | **Eligible** (retry / fall back) |
-| HTTP 5xx (`Upstream{status>=500}`) | **Eligible** |
-| HTTP 429 (`Upstream{status=429}`) | **Eligible** |
-| HTTP 401/403/422 etc. | **Terminal** (return to client) |
-| Decode errors (malformed bytes) | **Terminal** |
+**Default fallback eligibility for this provider:**
 
-Provider-specific notes:
+| Error class                     | Eligible?              |
+|---------------------------------|------------------------|
+| Network errors (timeout, DNS)   | Eligible — falls back  |
+| Upstream 5xx                    | Eligible — falls back  |
+| Upstream 429 (rate limit)       | Eligible — falls back  |
+| Upstream 4xx (auth, validation) | Terminal — no fallback |
+| Decode/encode errors            | Terminal — no fallback |
+| Capability mismatch             | Terminal — no fallback |
 
-* Gemini surfaces safety blocks as HTTP 200 with `promptFeedback.blockReason`
-  or `candidates[0].finishReason: SAFETY` — not as a `ProviderError`. Safety
-  blocks therefore never reach the fallback classifier; they surface as
-  successful responses with empty content (prompt block) or a `ContentFilter`
-  stop reason (response block). Operators relying on fallback to "rescue"
-  content-filtered prompts should not expect that to work — the next
-  upstream would have to be a different model family. Genuine HTTP 400 from
-  AI Studio (malformed request) is terminal per the table above.
+**Provider-specific notes:**
+
+* Gemini returns HTTP 429 with a `RESOURCE_EXHAUSTED` body for quota
+  issues — fallback-eligible. Safety-blocked responses arrive as
+  HTTP 200 with `promptFeedback.blockReason` (or
+  `candidates[0].finishReason: SAFETY`) and never reach the fallback
+  classifier — they surface as successful responses with empty
+  content or a `ContentFilter` stop reason. Operators relying on
+  fallback to "rescue" content-filtered prompts should not expect
+  that to work; the next upstream would have to be a different model
+  family. See [ADR-0003](../adr/0003-promote-safety-ratings.md) for
+  the safety-rating model. Genuine HTTP 400 from AI Studio
+  (malformed request) is terminal per the table above.
+
+**Streaming caveat (D4):** Once `provider.complete()` returns
+`Ok(stream)` and bytes flow to the client, fallback is no longer
+possible. Mid-stream failures surface as stream-level errors. This
+matches v0.3 behavior; v0.4 does not introduce buffering.

@@ -212,22 +212,32 @@ error.
 The provider does **not** retry automatically. Retry logic belongs in
 the caller or at the infrastructure layer.
 
-### Resilience behavior (v0.4+)
+## Resilience behavior
 
-The v0.4 resilience layer treats this provider's errors as
-follows:
+This provider participates in the v0.4 resilience subsystem. See
+[`docs/resilience.md`](../resilience.md) for the operator-facing guide
+and the [Phase 4 design spec](../superpowers/specs/2026-05-08-phase-4-resiliency-design.md)
+for the layering details.
 
-| Error pattern | Default eligibility |
-|---|---|
-| Connect/DNS/TLS failures (`Network`) | **Eligible** (retry / fall back) |
-| HTTP 5xx (`Upstream{status>=500}`) | **Eligible** |
-| HTTP 429 (`Upstream{status=429}`) | **Eligible** |
-| HTTP 401/403/422 etc. | **Terminal** (return to client) |
-| Decode errors (malformed bytes) | **Terminal** |
+**Default fallback eligibility for this provider:**
 
-Provider-specific notes:
+| Error class                     | Eligible?              |
+|---------------------------------|------------------------|
+| Network errors (timeout, DNS)   | Eligible — falls back  |
+| Upstream 5xx                    | Eligible — falls back  |
+| Upstream 429 (rate limit)       | Eligible — falls back  |
+| Upstream 4xx (auth, validation) | Terminal — no fallback |
+| Decode/encode errors            | Terminal — no fallback |
+| Capability mismatch             | Terminal — no fallback |
 
-* Anthropic emits HTTP **529 (overloaded)** during sustained load. 529
-  is in the 5xx range so the default classifier treats it as eligible —
-  fallback chains will move to the next upstream. Operators rarely need
-  to override.
+**Provider-specific notes:**
+
+* Anthropic returns HTTP 529 (overloaded) during sustained load. 529
+  is in the 5xx range so the default classifier treats it as
+  fallback-eligible — fallback chains will move to the next upstream.
+  Operators rarely need to override.
+
+**Streaming caveat (D4):** Once `provider.complete()` returns
+`Ok(stream)` and bytes flow to the client, fallback is no longer
+possible. Mid-stream failures surface as stream-level errors. This
+matches v0.3 behavior; v0.4 does not introduce buffering.

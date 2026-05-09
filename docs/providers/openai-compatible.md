@@ -48,21 +48,33 @@ can emit an appropriate error to the client.
 The provider does **not** retry automatically. Retry logic belongs in the
 caller or at the infrastructure layer (e.g. a load balancer).
 
-### Resilience behavior (v0.4+)
+## Resilience behavior
 
-The v0.4 resilience layer treats this provider's errors as
-follows:
+This provider participates in the v0.4 resilience subsystem. See
+[`docs/resilience.md`](../resilience.md) for the operator-facing guide
+and the [Phase 4 design spec](../superpowers/specs/2026-05-08-phase-4-resiliency-design.md)
+for the layering details.
 
-| Error pattern | Default eligibility |
-|---|---|
-| Connect/DNS/TLS failures (`Network`) | **Eligible** (retry / fall back) |
-| HTTP 5xx (`Upstream{status>=500}`) | **Eligible** |
-| HTTP 429 (`Upstream{status=429}`) | **Eligible** |
-| HTTP 401/403/422 etc. | **Terminal** (return to client) |
-| Decode errors (malformed bytes) | **Terminal** |
+**Default fallback eligibility for this provider:**
 
-Provider-specific notes:
+| Error class                     | Eligible?              |
+|---------------------------------|------------------------|
+| Network errors (timeout, DNS)   | Eligible — falls back  |
+| Upstream 5xx                    | Eligible — falls back  |
+| Upstream 429 (rate limit)       | Eligible — falls back  |
+| Upstream 4xx (auth, validation) | Terminal — no fallback |
+| Decode/encode errors            | Terminal — no fallback |
+| Capability mismatch             | Terminal — no fallback |
 
-* OpenAI-compatible upstreams (OpenAI, DeepSeek, Together, Fireworks,
-  etc.) typically use HTTP 503 for overload and HTTP 429 for
-  rate-limit. Both are eligible by default.
+**Provider-specific notes:**
+
+* Vendors that proxy OpenAI may return HTTP 503 for capacity issues —
+  fallback-eligible by default. The provider does not distinguish
+  vendor variants beyond the HTTP status code, so any 5xx from
+  OpenAI / DeepSeek / Together / Fireworks / Azure-OpenAI / Ollama /
+  vLLM / etc. travels the same fallback path.
+
+**Streaming caveat (D4):** Once `provider.complete()` returns
+`Ok(stream)` and bytes flow to the client, fallback is no longer
+possible. Mid-stream failures surface as stream-level errors. This
+matches v0.3 behavior; v0.4 does not introduce buffering.

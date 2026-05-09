@@ -5,6 +5,147 @@ All notable changes to AgentShim are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-08
+
+Phase 4 release: the gateway becomes **resilient** as well as
+protocol-translating. Four subsystems — fallback chains, per-route
+retries, per-(upstream, model) circuit breakers, and four-dimensional
+token-bucket rate limiting — compose under a new `ResilientCaller`
+orchestrator (see [ADR-0004](docs/adr/0004-resilient-caller.md)). All
+four subsystems are independently configurable and default to behavior
+that preserves v0.3 wire output for healthy upstreams.
+
+### Added
+
+#### Per-route fallback chains (Plan 02)
+
+- Routes can list primary + backup upstreams in an ordered
+  `upstreams: [...]` array. Fallback fires on retry exhaustion against
+  the current upstream when the error is fallback-eligible (network /
+  upstream 5xx / upstream 429).
+- Existing v0.3 singular `upstream` / `upstream_model` shape continues
+  to work — internally it deserializes to a 1-element vec. Mixed
+  shapes (both singular and array on the same route) are rejected at
+  startup.
+- Three new `HandlerError` variants: `NoUpstreamSucceeded` (HTTP 503),
+  `AllBreakersOpen` (HTTP 503), and `RateLimited` (HTTP 429 +
+  `Retry-After`) with dialect-correct envelopes for OpenAI Chat,
+  OpenAI Responses, and Anthropic Messages.
+
+#### Per-route retries (Plan 01)
+
+- Exponential backoff + jitter + total-time budget within a single
+  upstream. Defaults: 2 attempts, 100ms initial, 2.0× multiplier,
+  ±25% jitter, 5000ms total budget.
+- Default fallback eligibility: `network`, `upstream_5xx`,
+  `upstream_429`. Operators override per route via
+  `retry.retry_on: [...]`.
+
+#### Per-(upstream, model) circuit breakers (Plan 03)
+
+- Sliding-window failure-rate breaker. Trips when the failure rate
+  over `window_secs` (default 60s) exceeds `failure_threshold_pct`
+  (default 50%) across at least `min_requests` (default 20). Open
+  state holds for `open_cooldown_secs` (default 30s) before
+  transitioning to half-open.
+- Half-open state allows exactly one probe via
+  `AtomicBool::compare_exchange`. Probe success → Closed; probe
+  failure → Open with a fresh cooldown.
+- Per-(provider_name, model) keying — a misconfigured model on an
+  otherwise healthy provider trips its own breaker without affecting
+  siblings.
+
+#### Four-dimensional token-bucket rate limiting (Plan 04)
+
+- Independent buckets per: API key, route, upstream, source IP. A
+  request must satisfy all applicable buckets; the first to reject
+  names the dimension in the error.
+- Built on the [`governor`](https://crates.io/crates/governor) crate
+  for atomic, lock-free per-bucket math.
+- HTTP 429 responses include `Retry-After` derived from `governor`'s
+  `wait_time_from(now)`.
+
+#### API-key auth (Plan 04)
+
+- Keys come in via `Authorization: Bearer <key>` or
+  `x-api-key: <key>`. The gateway hashes the key with SHA-256 and
+  looks up the hash in `auth.keys.<sha256:hex>`. Plaintext is never
+  stored or logged.
+- `auth.enabled=false` (default) skips header inspection entirely
+  (zero overhead).
+- `auth.enabled=true, required=false`: unknown keys → tagged
+  `Anonymous` (uses anonymous bucket).
+- `auth.required=true`: unknown keys → HTTP 401 before any upstream
+  contact.
+
+#### Structured resilience tracing (Plan 05)
+
+- Every retry attempt, fallback transition, breaker state change,
+  rate-limit rejection, and request completion emits a structured
+  `tracing` event under `target = "agent_shim::resilience"` with a
+  fixed field set (see `crates/router/src/resilient_caller.rs`
+  module-level doc). Identity in logs is the SHA-256 hash form
+  (`sha256:<hex>`) or `anonymous` — plaintext keys never appear in
+  logs.
+- Per-request summary log at request end with the full chain walk.
+
+### Changed
+
+- **Default `retry.max_attempts: 2`** — small behavior change on
+  upgrade (one extra round-trip on transient errors). Operators
+  wanting strict v0.3 behavior (no retries) set
+  `retry: {max_attempts: 1}` per route.
+- `BackendTarget` resolution now returns `Vec<BackendTarget>` instead
+  of `Option<BackendTarget>`. The first element is the primary; the
+  rest are fallback candidates. v0.3 single-upstream routes produce a
+  1-element vec.
+- `ResilientCaller::complete` replaces the direct
+  `provider.complete()` call in `pipeline.rs`. All four subsystems
+  compose at this single point; see
+  [ADR-0004](docs/adr/0004-resilient-caller.md).
+
+### Deprecated
+
+None. Both v0.3 and v0.4 config shapes are supported indefinitely.
+
+### Fixed
+
+None — this release is additive against the v0.3 baseline.
+
+### Documentation
+
+- New [`docs/resilience.md`](docs/resilience.md) operator-facing guide
+  with quick-start config, SHA-256 key generation recipe, retry
+  tuning, layering walkthrough, log-line reference, and the
+  multi-instance caveat.
+- New [`docs/adr/0004-resilient-caller.md`](docs/adr/0004-resilient-caller.md)
+  records the orchestrator-pattern choice over middleware-per-subsystem
+  and inline-in-pipeline alternatives.
+- `docs/architecture.md` capability matrix gains a Resilience row;
+  performance overhead targets paragraph from the design spec.
+- `docs/contributing.md` gains a "How to add a resilience subsystem"
+  subsection.
+- All five provider docs gain a "Resilience behavior" subsection
+  documenting fallback eligibility per provider.
+
+### Known limitations
+
+- **Single-instance state.** Breaker and rate-limit state lives in
+  process memory. Multi-instance deployments behind a load balancer
+  lose strict enforcement until the breaker actually trips at the
+  upstream. Distributed state (Redis backend) is a Phase 5 candidate.
+- **Pre-stream fallback only.** Once `provider.complete()` returns
+  `Ok(stream)` and bytes flow to the client, fallback is no longer
+  possible. Mid-stream failures surface as stream-level errors. This
+  matches v0.3 behavior; v0.4 does not introduce buffering.
+
+### Frozen-core invariant resumes
+
+ADR-0003 (Phase 3) was a bounded one-time exception. All five
+Phase 4 plan files declared `core changes: NONE`, and
+`git diff v0.3.0..master -- crates/core/` is empty for the v0.4.0
+release tag.
+
 ## [0.3.0] — 2026-05-08
 
 Phase 3 release: the OpenAI Responses frontend now routes to every
