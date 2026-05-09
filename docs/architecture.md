@@ -89,6 +89,43 @@ provider can all reuse the canonical→Chat-Completions encoder + parser
 without circular imports. It exposes `canonical_to_chat::build`,
 `chat_sse_parser`, and `chat_unary_parser`.
 
+## Resilience layer (v0.4+)
+
+Phase 4 introduces a `ResilientCaller` orchestrator in `crates/router/`
+that sits between the existing `ModelResolver` and the existing
+`BackendProvider` trait. It composes four subsystems:
+
+1. **Per-route fallback chains.** Each route lists primary + backups
+   in `upstreams: [...]`. The chain is walked in order on retry
+   exhaustion when the last error is fallback-eligible.
+2. **Per-route retries.** Exponential backoff + jitter + total-time
+   budget within a single upstream.
+3. **Per-`(upstream, model)` circuit breakers.** Sliding-window
+   failure-rate trip; single half-open probe.
+4. **Token-bucket rate limiting on four dimensions:** per API key,
+   per route, per upstream, per source IP.
+
+See [ADR-0004](adr/0004-resilient-caller.md) for the layering rationale
+and [`docs/resilience.md`](resilience.md) for the operator-facing guide.
+
+### Performance overhead targets
+
+(From §8 of the [Phase 4 design spec](superpowers/specs/2026-05-08-phase-4-resiliency-design.md).)
+
+- Rate-limit gate disabled: zero atomic ops, zero allocations on hot path.
+- Rate-limit gate enabled, no buckets exceeded: ≤4 atomic loads per request.
+- Breaker gate (always on): one `RwLock::read()` per chain element;
+  uncontended path ~50ns.
+- Retry overhead: zero on success.
+
+No benchmark in v0.4 — Phase 5's metrics will surface real-world overhead.
+
+### Frozen-core invariant resumes
+
+ADR-0003 was a bounded one-time exception in Phase 3. All five Phase 4
+plan files declared `core changes: NONE`, and `git diff v0.3.0..v0.4.0
+-- crates/core/` is empty for the v0.4.0 release tag.
+
 ## Capability gate
 
 Plan 04 added a capability gate at the gateway boundary. It runs after route
