@@ -1,7 +1,7 @@
 use crate::handlers;
 use crate::shutdown::shutdown_signal;
 use crate::state::AppState;
-use agent_shim_observability::RequestIdLayer;
+use agent_shim_observability::{RequestIdLayer, TraceparentLayer};
 use anyhow::Result;
 use axum::{
     routing::{get, post},
@@ -24,6 +24,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(crate::metrics_layer::MetricsLayer)
         .layer(RequestIdLayer)
+        // Plan 03 P03 T4: outermost layer so the OTel parent context is
+        // attached to the current span before request-id assignment, the
+        // metrics middleware, or any tracing-instrumented handler runs.
+        // tower layer order is outside-in, so this is invoked first.
+        .layer(TraceparentLayer)
         .with_state(state)
 }
 

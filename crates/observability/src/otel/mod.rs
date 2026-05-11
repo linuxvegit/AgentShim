@@ -5,6 +5,9 @@
 //! OTel spans. When unset, returns `Ok(None)` and skips exporter init
 //! entirely — spans still exist for the fmt layer.
 
+pub mod extract;
+pub use extract::{TraceparentLayer, TraceparentService};
+
 use agent_shim_config::schema::OtelConfig;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
