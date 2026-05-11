@@ -1,11 +1,15 @@
-//! Plan 03 P03 T4: inbound `traceparent` continues the trace. Inbound-only
-//! for v0.5 — outbound continuation is a v0.6 task pending a provider-side
-//! injection hook (spec §4.3 footnote).
+//! Plan 03 P03 T4 (+ T4 followup): inbound `traceparent` does not crash
+//! the gateway. Inbound-only for v0.5 — outbound continuation is a v0.6
+//! task pending a provider-side injection hook (spec §4.3 footnote).
 //!
-//! These tests assert that the `TraceparentLayer` accepts both well-formed
-//! and malformed `traceparent` headers without rejecting the request.
-//! Positive evidence that the trace context was actually attached to the
-//! span tree is asserted via the in-memory exporter test in T5.
+//! These tests are smoke tests against the public router: they assert
+//! that a well-formed and a garbage `traceparent` header both produce a
+//! 200 response and don't trigger any panics or 5xx codes.
+//!
+//! Positive evidence that the parsed context actually parents a
+//! downstream span lives in the unit test
+//! `agent_shim_observability::otel::extract::tests::extracted_context_parents_a_downstream_span`
+//! and the span-tree shape test in `crates/router/tests/otel_spans.rs`.
 
 use std::net::SocketAddr;
 

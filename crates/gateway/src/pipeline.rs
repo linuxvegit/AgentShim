@@ -110,6 +110,20 @@ pub async fn dispatch(
         "agent_shim.status_class" = tracing::field::Empty,
     );
 
+    // Plan 03 P03 T4 followup: attach any inbound W3C `traceparent`
+    // context to the freshly-created root span. The tower-layer shape
+    // attempted previously was broken because `Span::current()` at the
+    // layer call site is `Span::none()` — the per-request span hadn't
+    // been created yet. Here we own the root span, so `set_parent` has
+    // a real target. Malformed/missing headers yield an empty context
+    // and `set_parent` is a safe no-op.
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let parent_ctx =
+            agent_shim_observability::extract_context_from_headers(&headers);
+        root_span.set_parent(parent_ctx);
+    }
+
     let root_for_record = root_span.clone();
     use tracing::Instrument;
     let result =
