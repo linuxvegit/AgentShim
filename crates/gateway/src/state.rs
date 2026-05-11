@@ -90,6 +90,9 @@ pub struct AppCore {
     /// individual buckets are replaced when policy changes (spec §5.4).
     #[allow(dead_code)]
     pub limiter_registry: Arc<LimiterRegistry>,
+    /// Prometheus metrics handle. Plan 02 P02 T3. Built once at startup;
+    /// the /metrics admin handler renders against it.
+    pub metrics: Arc<agent_shim_observability::MetricsHandle>,
 }
 
 /// Hot-swappable policy-bearing snapshot. Plan 04 will swap this on
@@ -266,6 +269,11 @@ impl AppState {
         let server_config = config.server.clone();
         let admin_config = config.admin.clone();
 
+        // Plan 02 P02 T3: install the global metrics recorder. The
+        // exporter handle lives in AppCore so the /metrics admin handler
+        // can render against it.
+        let metrics = agent_shim_observability::install_metrics(&config.metrics);
+
         let snapshot = AppSnapshot {
             config: Arc::new(config),
             auth_enabled,
@@ -285,6 +293,7 @@ impl AppState {
             resilient_caller,
             breaker_registry,
             limiter_registry,
+            metrics,
         };
 
         Self {

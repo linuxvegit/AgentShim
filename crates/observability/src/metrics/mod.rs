@@ -12,7 +12,7 @@
 //! the global facade — subsequent installs return their own
 //! `PrometheusHandle` that operate on the original recorder's data.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use agent_shim_config::MetricsConfig;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -31,35 +31,47 @@ impl MetricsHandle {
     }
 }
 
-/// Install the global metrics recorder. Returns a [`MetricsHandle`] for
-/// rendering. Production callers invoke this exactly once during startup;
-/// subsequent installs in the same process (e.g. parallel tests) are
-/// no-ops at the global level but still return a `MetricsHandle` whose
-/// `render()` operates against whichever recorder won the install race.
+/// Global recorder install slot. `metrics-exporter-prometheus` panics on a
+/// second `install_recorder()` in the same process, so we cache the very
+/// first handle here and clone it on every subsequent call. In production
+/// the second branch is unreachable (install fires once at `AppState::build`);
+/// in tests it lets each integration test that hand-builds an `AppCore`
+/// share the same underlying recorder. Plan 02 P02 T3.
+static INSTALLED: OnceLock<PrometheusHandle> = OnceLock::new();
+
+/// Install the global metrics recorder (idempotent). Returns a
+/// [`MetricsHandle`] for rendering. Production callers invoke this exactly
+/// once during startup; subsequent calls in the same process return a
+/// fresh handle that renders against the same underlying recorder.
 pub fn install(cfg: &MetricsConfig) -> Arc<MetricsHandle> {
-    let mut builder = PrometheusBuilder::new();
+    let handle = INSTALLED.get_or_init(|| {
+        let mut builder = PrometheusBuilder::new();
 
-    // Per-metric histogram bucket overrides.
-    for (name, buckets) in &cfg.histogram_buckets {
-        // Accept both qualified (`agent_shim_request_duration_seconds`)
-        // and bare (`request_duration_seconds`) forms.
-        let qualified = if name.starts_with("agent_shim_") {
-            name.clone()
-        } else {
-            format!("agent_shim_{name}")
-        };
-        builder = builder
-            .set_buckets_for_metric(Matcher::Full(qualified), buckets)
-            .expect("histogram bucket override must be valid");
-    }
+        // Per-metric histogram bucket overrides.
+        for (name, buckets) in &cfg.histogram_buckets {
+            // Accept both qualified (`agent_shim_request_duration_seconds`)
+            // and bare (`request_duration_seconds`) forms.
+            let qualified = if name.starts_with("agent_shim_") {
+                name.clone()
+            } else {
+                format!("agent_shim_{name}")
+            };
+            builder = builder
+                .set_buckets_for_metric(Matcher::Full(qualified), buckets)
+                .expect("histogram bucket override must be valid");
+        }
 
-    let handle = builder
-        .install_recorder()
-        .expect("failed to install Prometheus recorder");
+        let h = builder
+            .install_recorder()
+            .expect("failed to install Prometheus recorder");
 
-    describe_metrics();
+        describe_metrics();
+        h
+    });
 
-    Arc::new(MetricsHandle { handle })
+    Arc::new(MetricsHandle {
+        handle: handle.clone(),
+    })
 }
 
 /// Register descriptions for every metric so /metrics returns text even

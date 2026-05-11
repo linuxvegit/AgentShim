@@ -190,6 +190,7 @@ fn make_app_state() -> AppState {
             resilient_caller,
             breaker_registry,
             limiter_registry,
+            metrics: agent_shim_observability::install_metrics(&Default::default()),
         }),
         snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
             config: Arc::new(cfg),

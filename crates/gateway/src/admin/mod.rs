@@ -1,6 +1,6 @@
 //! Admin HTTP listener — Plan 01 P01 T3.
 //!
-//! Hosts /healthz, /readyz, and (in later plans) /metrics, /admin/reload.
+//! Hosts /healthz, /readyz, /metrics, and (in later plans) /admin/reload.
 //! Bound to a separate listener from the public request path so operators
 //! can firewall it independently.
 
@@ -9,12 +9,14 @@ use axum::{routing::get, Router};
 use crate::state::AppState;
 
 mod handlers;
+mod metrics_handler;
 
 /// Build the admin Router.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
+        .route("/metrics", get(metrics_handler::metrics))
         .with_state(state)
 }
 
