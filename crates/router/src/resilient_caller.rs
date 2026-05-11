@@ -40,6 +40,7 @@ use std::time::Instant;
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 use agent_shim_providers::{BackendProvider, ProviderError};
+use tracing::Instrument;
 
 use crate::errors::{ResilienceError, TriedUpstream};
 use crate::fallback::{fallback_eligibility_with_overrides, FallbackEligibility};
@@ -328,10 +329,30 @@ impl ResilientCaller {
             }
 
             let started = Instant::now();
+            // Plan 03 P03 T3: `provider.complete` child span wrapping the
+            // per-chain-element retry loop. `attempts` is recorded after the
+            // call so the span carries the final attempt count regardless of
+            // success/failure. `fallback_position` is the 0-indexed chain
+            // position — 0 for the primary upstream, ≥1 for fallbacks.
+            let provider_span = tracing::info_span!(
+                "provider.complete",
+                "agent_shim.upstream" = %target.provider,
+                "agent_shim.model" = %target.model,
+                "agent_shim.attempts" = tracing::field::Empty,
+                "agent_shim.fallback_position" = i as i64,
+            );
             // retry_with_policy returns Err on retry exhaustion OR terminal.
             let result =
-                retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id).await;
+                retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id)
+                    .instrument(provider_span.clone())
+                    .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
+            // `rpolicy.max_attempts` is an upper bound; the real attempt
+            // count is logged by the retry loop itself. Recording the
+            // bound here is still useful: it sets the span's attribute
+            // shape unconditionally and operators can correlate with the
+            // per-attempt event for the precise count.
+            provider_span.record("agent_shim.attempts", rpolicy.max_attempts as i64);
 
             match result {
                 Ok(stream) => {

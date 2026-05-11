@@ -13,6 +13,7 @@ use agent_shim_providers::{BackendProvider, ProviderError};
 use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::SeedableRng;
+use tracing::Instrument;
 
 use crate::fallback::{fallback_eligibility_with_overrides, FallbackEligibility};
 
@@ -93,7 +94,20 @@ pub async fn retry_with_policy(
         // Clone-per-attempt: BackendProvider::complete consumes the request.
         // Acceptable while retries are rare; revisit with Arc<CanonicalRequest>
         // if profiling shows clone cost in the hot path.
-        match provider.complete(req.clone(), target.clone()).await {
+        //
+        // Plan 03 P03 T3: each provider call is wrapped in a `retry.attempt`
+        // child span. The span attribute uses the i64 form to match the
+        // semantic-convention numeric typing used in OTel attribute exports.
+        let attempt_span = tracing::info_span!(
+            "retry.attempt",
+            "agent_shim.attempt" = attempt as i64,
+            "agent_shim.upstream" = %target.provider,
+        );
+        match provider
+            .complete(req.clone(), target.clone())
+            .instrument(attempt_span)
+            .await
+        {
             Ok(stream) => return Ok(stream),
             Err(e) => {
                 if fallback_eligibility_with_overrides(&e, &policy.retry_on)

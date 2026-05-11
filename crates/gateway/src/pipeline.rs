@@ -74,6 +74,28 @@ pub async fn dispatch(
     // 04) does not affect them.
     let snapshot = state.snapshot.load_full();
 
+    // Plan 03 P03 T3: root `gateway.request` span wrapping the dispatch
+    // body. Fields with `tracing::field::Empty` are filled in once route +
+    // identity are resolved. The span's lifetime ends when `_root_guard`
+    // drops — for streaming responses that's after `dispatch` returns, but
+    // child spans on the encoded stream re-enter their own context.
+    let frontend_label = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+    let root_span = tracing::info_span!(
+        "gateway.request",
+        "http.request.method" = "POST",
+        "http.route" = spec.endpoint_label,
+        "agent_shim.frontend" = frontend_label,
+        "agent_shim.route" = tracing::field::Empty,
+        "agent_shim.identity" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "agent_shim.status_class" = tracing::field::Empty,
+    );
+    let _root_guard = root_span.enter();
+
     // Resolve the route up front. The Responses passthrough path needs the
     // target before it has decoded the body, so route resolution has to come
     // first regardless of which path we take.
@@ -107,69 +129,85 @@ pub async fn dispatch(
     // routes exist. When `auth.enabled = false` we skip extraction —
     // identity is always Anonymous and the rate-limit registry is
     // separately gated by its own `enabled=false` short-circuit.
-    let identity = if snapshot.auth_enabled {
-        let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
-        let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-        let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
+    //
+    // Plan 03 P03 T3: wrap the auth gate in an `auth.verify` child span.
+    let identity = {
+        let _auth_span = tracing::info_span!("auth.verify").entered();
+        if snapshot.auth_enabled {
+            let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
+            let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+            let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
 
-        if snapshot.auth_required {
-            match &extracted {
-                AgentIdentity::Anonymous => {
-                    tracing::warn!(
-                        endpoint = spec.endpoint_label,
-                        "auth.required=true but request had no Authorization or x-api-key header"
-                    );
-                    return Err(HandlerError::Unauthorized {
-                        kind: spec.frontend.kind(),
-                    });
-                }
-                AgentIdentity::KeyHash(h) => {
-                    // Non-constant-time compare on already-hashed values
-                    // is fine: the hash itself is not a secret, so timing
-                    // leaks reveal nothing about the original key bytes.
-                    if !snapshot.configured_key_hashes.contains(h) {
-                        // Operator log carries the hash (NEVER plaintext) so
-                        // a misconfigured client can be tracked down without
-                        // leaking the secret.
+            if snapshot.auth_required {
+                match &extracted {
+                    AgentIdentity::Anonymous => {
                         tracing::warn!(
                             endpoint = spec.endpoint_label,
-                            presented_hash = %h,
-                            "auth.required=true but presented key not in auth.keys allowlist"
+                            "auth.required=true but request had no Authorization or x-api-key header"
                         );
                         return Err(HandlerError::Unauthorized {
                             kind: spec.frontend.kind(),
                         });
                     }
+                    AgentIdentity::KeyHash(h) => {
+                        // Non-constant-time compare on already-hashed values
+                        // is fine: the hash itself is not a secret, so timing
+                        // leaks reveal nothing about the original key bytes.
+                        if !snapshot.configured_key_hashes.contains(h) {
+                            // Operator log carries the hash (NEVER plaintext) so
+                            // a misconfigured client can be tracked down without
+                            // leaking the secret.
+                            tracing::warn!(
+                                endpoint = spec.endpoint_label,
+                                presented_hash = %h,
+                                "auth.required=true but presented key not in auth.keys allowlist"
+                            );
+                            return Err(HandlerError::Unauthorized {
+                                kind: spec.frontend.kind(),
+                            });
+                        }
+                    }
                 }
             }
+            extracted
+        } else {
+            AgentIdentity::Anonymous
         }
-        extracted
-    } else {
-        AgentIdentity::Anonymous
     };
 
-    let chain = state
-        .core
-        .resolver
-        .resolve(spec.frontend.kind(), &model_alias)
-        .map_err(|e| {
-            tracing::warn!(model = %model_alias, error = %e, "no route");
-            HandlerError::Route(e)
-        })?;
+    // Plan 03 P03 T3: record identity on the root span. Uses the same
+    // anonymous / sha256-hash form as the resilience-event logs so
+    // operators can correlate across span attributes and event fields.
+    let identity_str = match &identity {
+        AgentIdentity::Anonymous => "anonymous",
+        AgentIdentity::KeyHash(h) => h.as_str(),
+    };
+    root_span.record("agent_shim.identity", identity_str);
+
+    // Plan 03 P03 T3: `route.resolve` child span wrapping the resolver call.
+    let chain = {
+        let _span = tracing::info_span!("route.resolve").entered();
+        state
+            .core
+            .resolver
+            .resolve(spec.frontend.kind(), &model_alias)
+            .map_err(|e| {
+                tracing::warn!(model = %model_alias, error = %e, "no route");
+                HandlerError::Route(e)
+            })?
+    };
+
+    // Plan 03 P03 T3: now that route is resolved, record it on the root.
+    root_span.record("agent_shim.route", model_alias.as_str());
 
     // Plan 02 P02 T5: emit a route-labeled counter parallel to the
     // middleware's `route="unknown"` counter. Operators query either
     // depending on whether they care about pre-resolution failures
     // (404 routes) or post-resolution traffic. The `.increment(0)`
     // registers the label set in /metrics without skewing the count.
-    let frontend_label_str = match spec.frontend.kind() {
-        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
-        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
-        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
-    };
     metrics::counter!(
         agent_shim_observability::metrics::names::REQUESTS_TOTAL,
-        "frontend" => frontend_label_str,
+        "frontend" => frontend_label,
         "route" => model_alias.clone(),
         "status_class" => "pending",
     )
@@ -553,7 +591,14 @@ async fn run_stream(
         });
 
         let canonical_stream: CanonicalStream = Box::pin(logging_stream);
-        let frontend_response = spec.frontend.encode_stream(canonical_stream);
+        // Plan 03 P03 T3: `stream.encode` span around the frontend's stream
+        // encoder. The span guard drops before the response is returned —
+        // the actual byte-streaming work happens inside the axum body
+        // afterward, outside this span.
+        let frontend_response = {
+            let _encode_span = tracing::info_span!("stream.encode").entered();
+            spec.frontend.encode_stream(canonical_stream)
+        };
 
         match frontend_response {
             FrontendResponse::Stream {
@@ -577,7 +622,11 @@ async fn run_stream(
         }
     } else {
         // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        let frontend_response = spec.frontend.encode_stream(upstream_stream);
+        // Plan 03 P03 T3: `stream.encode` span around the encoder.
+        let frontend_response = {
+            let _encode_span = tracing::info_span!("stream.encode").entered();
+            spec.frontend.encode_stream(upstream_stream)
+        };
         tracing::info!(
             "← {} (stream) | model: {} → {} | {:.1}s",
             label,
