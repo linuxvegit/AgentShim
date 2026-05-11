@@ -2,6 +2,7 @@ mod admin;
 mod cli;
 mod commands;
 mod handlers;
+mod metrics_layer;
 mod pipeline;
 mod server;
 mod shutdown;

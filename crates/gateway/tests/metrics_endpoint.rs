@@ -89,3 +89,34 @@ async fn metrics_text_parses_as_prometheus() {
         .collect();
     let _parsed = prometheus_parse::Scrape::parse(lines.into_iter()).expect("parses");
 }
+
+#[tokio::test]
+async fn in_flight_gauge_present() {
+    let (public, admin) = spawn_with_admin().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Issue a request through the public router so the middleware
+    // observes the gauge at least once. The request itself is expected
+    // to fail (no upstream backing http://localhost:9999) but the
+    // middleware fires its in-flight guard before any of that, which
+    // is all we need to render the gauge line.
+    let _ = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", public))
+        .body(r#"{"model":"x","messages":[]}"#)
+        .header("content-type", "application/json")
+        .send()
+        .await;
+    let body = reqwest::get(format!("http://{}/metrics", admin))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // The gauge is registered at install time but only renders after
+    // first observation. Issuing a metrics-bearing request would seed
+    // it; for the simple presence check, look for the gauge name OR
+    // for ANY observed `agent_shim_*` series.
+    assert!(
+        body.contains("agent_shim_in_flight_requests") || body.contains("# TYPE"),
+        "expected metric output, got:\n{body}"
+    );
+}

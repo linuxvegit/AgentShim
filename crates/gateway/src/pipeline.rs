@@ -157,6 +157,24 @@ pub async fn dispatch(
             HandlerError::Route(e)
         })?;
 
+    // Plan 02 P02 T5: emit a route-labeled counter parallel to the
+    // middleware's `route="unknown"` counter. Operators query either
+    // depending on whether they care about pre-resolution failures
+    // (404 routes) or post-resolution traffic. The `.increment(0)`
+    // registers the label set in /metrics without skewing the count.
+    let frontend_label_str = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+    metrics::counter!(
+        agent_shim_observability::metrics::names::REQUESTS_TOTAL,
+        "frontend" => frontend_label_str,
+        "route" => model_alias.clone(),
+        "status_class" => "pending",
+    )
+    .increment(0);
+
     // Plan 04 P02 D2: route-level retry block governs every chain element
     // uniformly. Build one `RetryPolicy` and clone it per chain position so
     // `ResilientCaller::complete` can apply it independently to each
