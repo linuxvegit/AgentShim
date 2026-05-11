@@ -22,6 +22,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

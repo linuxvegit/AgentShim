@@ -32,8 +32,9 @@ routes:
 
 async fn spawn_gateway(yaml: &str) -> SocketAddr {
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(yaml).unwrap();
-    let public_addr: SocketAddr =
-        format!("{}:{}", cfg.server.bind, cfg.server.port).parse().unwrap();
+    let public_addr: SocketAddr = format!("{}:{}", cfg.server.bind, cfg.server.port)
+        .parse()
+        .unwrap();
     let state = agent_shim_gateway::state::AppState::new(cfg).await;
     let listener = tokio::net::TcpListener::bind(public_addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
@@ -46,11 +47,16 @@ async fn spawn_gateway(yaml: &str) -> SocketAddr {
 
 async fn spawn_gateway_with_admin(yaml: &str) -> (SocketAddr, SocketAddr) {
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(yaml).unwrap();
-    let public_addr: SocketAddr =
-        format!("{}:{}", cfg.server.bind, cfg.server.port).parse().unwrap();
-    let admin_cfg = cfg.admin.clone().expect("admin block required for this helper");
-    let admin_addr: SocketAddr =
-        format!("{}:{}", admin_cfg.bind, admin_cfg.port).parse().unwrap();
+    let public_addr: SocketAddr = format!("{}:{}", cfg.server.bind, cfg.server.port)
+        .parse()
+        .unwrap();
+    let admin_cfg = cfg
+        .admin
+        .clone()
+        .expect("admin block required for this helper");
+    let admin_addr: SocketAddr = format!("{}:{}", admin_cfg.bind, admin_cfg.port)
+        .parse()
+        .unwrap();
     let state = agent_shim_gateway::state::AppState::new(cfg).await;
 
     let public_listener = tokio::net::TcpListener::bind(public_addr).await.unwrap();
@@ -76,16 +82,22 @@ async fn admin_disabled_when_block_absent() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Public listener responds at /
-    let resp = reqwest::get(format!("http://{}/", public_addr)).await.unwrap();
+    let resp = reqwest::get(format!("http://{}/", public_addr))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     // /healthz no longer on the public port (was moved to admin in P01 T3)
-    let resp = reqwest::get(format!("http://{}/healthz", public_addr)).await.unwrap();
+    let resp = reqwest::get(format!("http://{}/healthz", public_addr))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
     // /readyz also moved off the public port (was never there in P01,
     // belt-and-braces for future drift).
-    let resp = reqwest::get(format!("http://{}/readyz", public_addr)).await.unwrap();
+    let resp = reqwest::get(format!("http://{}/readyz", public_addr))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -97,7 +109,9 @@ async fn admin_listener_serves_healthz_when_configured() {
     let (_public, admin_addr) = spawn_gateway_with_admin(&yaml).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let resp = reqwest::get(format!("http://{}/healthz", admin_addr)).await.unwrap();
+    let resp = reqwest::get(format!("http://{}/healthz", admin_addr))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok");
 }
@@ -110,7 +124,9 @@ async fn admin_listener_serves_readyz_when_configured() {
     let (_public, admin_addr) = spawn_gateway_with_admin(&yaml).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let resp = reqwest::get(format!("http://{}/readyz", admin_addr)).await.unwrap();
+    let resp = reqwest::get(format!("http://{}/readyz", admin_addr))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ready");
 }

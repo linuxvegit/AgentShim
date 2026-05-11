@@ -62,7 +62,10 @@ async fn metrics_endpoint_serves_prometheus_text() {
         .unwrap()
         .to_str()
         .unwrap();
-    assert!(ct.starts_with("text/plain"), "unexpected content-type: {ct}");
+    assert!(
+        ct.starts_with("text/plain"),
+        "unexpected content-type: {ct}"
+    );
     // Body may legitimately be empty before any observation lands; the
     // Prometheus exporter omits metric lines until the first record_*
     // call. The companion test (metrics_text_parses_as_prometheus)

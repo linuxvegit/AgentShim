@@ -355,7 +355,10 @@ routes:
         // expected defaults on the snapshot side.
         assert!(!snap.auth_required);
         assert!(snap.configured_key_hashes.is_empty());
-        assert!(state.core.admin_config.is_none(), "absent admin block → None");
+        assert!(
+            state.core.admin_config.is_none(),
+            "absent admin block → None"
+        );
         assert!(state.core.providers.get("noop").is_some());
     }
 
@@ -381,9 +384,15 @@ routes:
 
         // The captured Arc still sees the OLD value — in-flight requests
         // are unaffected by the swap.
-        assert!(!captured.auth_required, "captured snapshot stays valid post-swap");
+        assert!(
+            !captured.auth_required,
+            "captured snapshot stays valid post-swap"
+        );
 
         // A fresh load sees the NEW value — new requests pick up the swap.
-        assert!(state.snapshot.load_full().auth_required, "fresh load sees new snapshot");
+        assert!(
+            state.snapshot.load_full().auth_required,
+            "fresh load sees new snapshot"
+        );
     }
 }

@@ -99,6 +99,7 @@ name = "agent-shim-observability"
 version = "0.5.0-dev"
 dependencies = [
  "agent-shim-config",
+ "anyhow",
  "axum",
  "http",
  "metrics",
