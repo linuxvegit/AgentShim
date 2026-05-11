@@ -39,10 +39,23 @@ impl MetricsHandle {
 /// share the same underlying recorder. Plan 02 P02 T3.
 static INSTALLED: OnceLock<PrometheusHandle> = OnceLock::new();
 
-/// Install the global metrics recorder (idempotent). Returns a
-/// [`MetricsHandle`] for rendering. Production callers invoke this exactly
-/// once during startup; subsequent calls in the same process return a
-/// fresh handle that renders against the same underlying recorder.
+/// Install the global metrics recorder. Returns a [`MetricsHandle`] for
+/// rendering. Production callers invoke this exactly once during startup.
+///
+/// **Idempotent across calls.** The module-level [`INSTALLED`] `OnceLock`
+/// caches the underlying `PrometheusHandle` so multiple invocations (e.g.
+/// parallel tests, or any future second `install` call) do not panic the
+/// `metrics-exporter-prometheus` "second install" guard. The returned
+/// `MetricsHandle` wraps a clone of the cached handle and renders against
+/// the same underlying recorder.
+///
+/// **First-config-wins.** Only the FIRST call's [`MetricsConfig`] is
+/// honored — its `histogram_buckets` overrides are baked into the cached
+/// recorder. Subsequent calls receive a `MetricsHandle` over the existing
+/// recorder; their `histogram_buckets` overrides are silently ignored.
+/// This is acceptable for production (one process, one install) and for
+/// tests (each test binary is its own process). Tests that need
+/// per-test bucket configuration must run in separate test binaries.
 pub fn install(cfg: &MetricsConfig) -> Arc<MetricsHandle> {
     let handle = INSTALLED.get_or_init(|| {
         let mut builder = PrometheusBuilder::new();
