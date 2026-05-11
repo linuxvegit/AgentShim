@@ -117,6 +117,7 @@ fn make_config(oai_url: &str, anthropic_url: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

@@ -112,6 +112,7 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

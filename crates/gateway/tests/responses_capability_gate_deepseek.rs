@@ -136,6 +136,7 @@ fn make_app_state() -> AppState {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     };
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));
     let model_index = Arc::new(ModelIndex::new(Default::default()));

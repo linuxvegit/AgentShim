@@ -128,6 +128,7 @@ mod tests {
             copilot: None,
             admin: None,
             metrics: Default::default(),
+            otel: None,
         }
     }
 
@@ -227,6 +228,7 @@ mod tests {
             copilot: None,
             admin: None,
             metrics: Default::default(),
+            otel: None,
         };
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
 

@@ -42,4 +42,8 @@ eventsource-stream = "0.2"
 mockito = "1"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
+opentelemetry = "0.24"
+opentelemetry_sdk = "0.24"
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.25"
 prometheus-parse = "0.2"

@@ -15,6 +15,7 @@ fn minimal_config() -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

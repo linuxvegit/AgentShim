@@ -36,6 +36,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

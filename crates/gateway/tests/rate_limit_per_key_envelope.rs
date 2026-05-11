@@ -142,6 +142,7 @@ fn make_chat_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 
@@ -206,6 +207,7 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

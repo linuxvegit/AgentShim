@@ -126,6 +126,7 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

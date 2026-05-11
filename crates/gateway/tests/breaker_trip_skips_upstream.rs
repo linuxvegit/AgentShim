@@ -133,6 +133,7 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
         copilot: None,
         admin: None,
         metrics: Default::default(),
+        otel: None,
     }
 }
 

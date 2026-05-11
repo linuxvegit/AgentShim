@@ -25,6 +25,8 @@ pub struct GatewayConfig {
     pub admin: Option<AdminConfig>,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub otel: Option<OtelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,45 @@ pub struct MetricsConfig {
     /// Absent → exporter defaults (Prometheus's standard duration buckets).
     #[serde(default)]
     pub histogram_buckets: BTreeMap<String, Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtelConfig {
+    /// OTLP/gRPC collector endpoint. `None` → spans created locally,
+    /// not exported. Spec D4.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    #[serde(default)]
+    pub service_version: Option<String>,
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    /// Operator-supplied resource attributes (e.g. deployment.environment,
+    /// cloud.region). Merged into the OTel `Resource` on init.
+    #[serde(default)]
+    pub resource_attrs: BTreeMap<String, String>,
+}
+
+fn default_service_name() -> String {
+    "agent-shim".to_string()
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            service_name: default_service_name(),
+            service_version: None,
+            sample_ratio: default_sample_ratio(),
+            resource_attrs: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -793,5 +834,40 @@ metrics:
         let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
         let buckets = cfg.metrics.histogram_buckets.get("request_duration_seconds").unwrap();
         assert_eq!(buckets, &vec![0.1, 0.5, 1.0, 5.0]);
+    }
+
+    #[test]
+    fn otel_config_absent_means_disabled() {
+        let yaml = "server: {bind: 127.0.0.1, port: 8787}";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert!(cfg.otel.is_none());
+    }
+
+    #[test]
+    fn otel_config_with_endpoint() {
+        let yaml = r#"
+otel:
+  endpoint: http://otel-collector:4317
+  service_name: gw
+  sample_ratio: 0.5
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let otel = cfg.otel.expect("present");
+        assert_eq!(otel.endpoint.as_deref(), Some("http://otel-collector:4317"));
+        assert_eq!(otel.service_name, "gw");
+        assert_eq!(otel.sample_ratio, 0.5);
+        assert!(otel.resource_attrs.is_empty());
+    }
+
+    #[test]
+    fn otel_config_defaults() {
+        let yaml = r#"
+otel: {}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let otel = cfg.otel.expect("present");
+        assert!(otel.endpoint.is_none(), "default endpoint should be None");
+        assert_eq!(otel.service_name, "agent-shim");
+        assert_eq!(otel.sample_ratio, 1.0);
     }
 }

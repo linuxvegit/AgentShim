@@ -76,6 +76,15 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         }
     }
 
+    if let Some(otel) = &cfg.otel {
+        if !(0.0..=1.0).contains(&otel.sample_ratio) {
+            return Err(ValidationError::InvalidRoute(format!(
+                "otel.sample_ratio {} must be in [0.0, 1.0]",
+                otel.sample_ratio
+            )));
+        }
+    }
+
     let mut seen = std::collections::HashSet::new();
     for route in &cfg.routes {
         if !VALID_FRONTENDS.contains(&route.frontend.as_str()) {
@@ -450,6 +459,7 @@ mod tests {
             copilot: None,
             admin: None,
             metrics: Default::default(),
+            otel: None,
         }
     }
 
@@ -1228,6 +1238,26 @@ routes:
         cfg.admin = Some(crate::AdminConfig {
             bind: "127.0.0.1".into(),
             port: 9100,
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn otel_sample_ratio_out_of_range_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.otel = Some(crate::OtelConfig {
+            sample_ratio: 1.5,
+            ..Default::default()
+        });
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn otel_sample_ratio_in_range_ok() {
+        let mut cfg = minimal_cfg();
+        cfg.otel = Some(crate::OtelConfig {
+            sample_ratio: 0.5,
+            ..Default::default()
         });
         assert!(validate(&cfg).is_ok());
     }

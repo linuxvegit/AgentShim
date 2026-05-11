@@ -18,6 +18,10 @@ http = "1"
 uuid.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
