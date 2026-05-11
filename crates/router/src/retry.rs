@@ -121,6 +121,16 @@ pub async fn retry_with_policy(
                     total_elapsed_ms = total_elapsed_ms,
                     "retrying provider call after eligible error"
                 );
+                // TODO(plan-05): thread a `route_label` (frontend/model) param
+                // when middleware-level plumbing lands; for now the route
+                // label is empty.
+                metrics::counter!(
+                    crate::metric_names::RETRY_ATTEMPTS_TOTAL,
+                    "route" => String::new(),
+                    "upstream" => target.provider.to_string(),
+                    "attempt" => attempt.to_string(),
+                )
+                .increment(1);
                 tokio::time::sleep(backoff).await;
                 total_elapsed_ms += backoff_ms;
                 attempt += 1;
@@ -138,6 +148,13 @@ pub async fn retry_with_policy(
         last_error = %last_err,
         "retry budget exhausted"
     );
+    // TODO(plan-05): thread a `route_label` param when available.
+    metrics::counter!(
+        crate::metric_names::RETRY_EXHAUSTED_TOTAL,
+        "route" => String::new(),
+        "upstream" => target.provider.to_string(),
+    )
+    .increment(1);
     Err(last_err)
 }
 

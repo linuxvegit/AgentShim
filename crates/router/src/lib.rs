@@ -11,6 +11,18 @@ pub mod resolver;
 pub mod retry;
 pub mod static_routes;
 
+/// Metric name constants the router crate emits via the `metrics` facade.
+/// Mirrors `agent_shim_observability::metrics::names` — duplicated here
+/// because the router crate doesn't depend on observability (it's a
+/// lower layer). Plan 02 P02 T4.
+pub(crate) mod metric_names {
+    pub const RETRY_ATTEMPTS_TOTAL: &str = "agent_shim_retry_attempts_total";
+    pub const RETRY_EXHAUSTED_TOTAL: &str = "agent_shim_retry_exhausted_total";
+    pub const FALLBACK_TRANSITIONS_TOTAL: &str = "agent_shim_fallback_transitions_total";
+    pub const BREAKER_STATE_CHANGES_TOTAL: &str = "agent_shim_breaker_state_changes_total";
+    pub const RATE_LIMIT_REJECTED_TOTAL: &str = "agent_shim_rate_limit_rejected_total";
+}
+
 use thiserror::Error;
 
 use agent_shim_config::RetryConfig;

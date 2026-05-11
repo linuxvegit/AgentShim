@@ -24,6 +24,7 @@ uuid = { workspace = true }
 metrics.workspace = true
 
 [dev-dependencies]
+agent-shim-observability = { path = "../observability" }
 proptest = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

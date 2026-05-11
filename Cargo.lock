@@ -165,6 +165,7 @@ version = "0.5.0-dev"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
+ "agent-shim-observability",
  "agent-shim-providers",
  "async-trait",
  "futures",

@@ -110,6 +110,14 @@ impl BreakerState {
             reason = reason,
             "circuit breaker state changed"
         );
+        metrics::counter!(
+            crate::metric_names::BREAKER_STATE_CHANGES_TOTAL,
+            "upstream" => self.upstream.clone(),
+            "model" => self.model.clone(),
+            "from" => from,
+            "to" => to,
+        )
+        .increment(1);
     }
 
     fn record(&mut self, succeeded: bool, now: Instant, policy: &BreakerPolicy) {

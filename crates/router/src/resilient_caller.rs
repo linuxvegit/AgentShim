@@ -227,6 +227,11 @@ impl ResilientCaller {
                 retry_after_secs = retry_after_secs,
                 "rate limit exceeded (pre-chain)"
             );
+            metrics::counter!(
+                crate::metric_names::RATE_LIMIT_REJECTED_TOTAL,
+                "dimension" => dimension_label(dim),
+            )
+            .increment(1);
             return Err(ResilienceError::RateLimited {
                 dimension: dim,
                 retry_after_secs,
@@ -311,6 +316,11 @@ impl ResilientCaller {
                     upstream = %target.provider,
                     "rate limit exceeded (per-upstream); not falling back"
                 );
+                metrics::counter!(
+                    crate::metric_names::RATE_LIMIT_REJECTED_TOTAL,
+                    "dimension" => dimension_label(dim),
+                )
+                .increment(1);
                 return Err(ResilienceError::RateLimited {
                     dimension: dim,
                     retry_after_secs,
@@ -372,6 +382,15 @@ impl ResilientCaller {
                             reason = "retry_exhausted",
                             "falling back to next upstream"
                         );
+                        // TODO(plan-05): thread a `route_label` param when
+                        // available; empty string for now.
+                        metrics::counter!(
+                            crate::metric_names::FALLBACK_TRANSITIONS_TOTAL,
+                            "route" => String::new(),
+                            "from_upstream" => target.provider.clone(),
+                            "to_upstream" => chain[i + 1].provider.clone(),
+                        )
+                        .increment(1);
                     }
                     last_error = Some(e);
                     // continue to chain[i+1]
