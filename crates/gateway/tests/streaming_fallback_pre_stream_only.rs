@@ -111,6 +111,7 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
         rate_limit: Default::default(),
         copilot: None,
         admin: None,
+        metrics: Default::default(),
     }
 }
 

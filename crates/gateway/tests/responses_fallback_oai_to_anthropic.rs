@@ -116,6 +116,7 @@ fn make_config(oai_url: &str, anthropic_url: &str) -> GatewayConfig {
         rate_limit: Default::default(),
         copilot: None,
         admin: None,
+        metrics: Default::default(),
     }
 }
 

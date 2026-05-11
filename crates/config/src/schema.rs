@@ -23,6 +23,8 @@ pub struct GatewayConfig {
     /// exposed and no second listener is bound. Plan 01 P01.
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +92,24 @@ impl Default for AdminConfig {
             port: default_admin_port(),
         }
     }
+}
+
+/// Prometheus metrics configuration. Plan 02 P02.
+///
+/// Currently only exposes per-metric histogram bucket overrides. The
+/// metrics surface itself is wired in T2 (recorder install + /metrics
+/// handler); this struct just lands the schema field so callsites can
+/// reference `config.metrics.histogram_buckets` from T2 onwards.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Per-metric-name histogram bucket overrides. Keys are metric names
+    /// (e.g. `"agent_shim_request_duration_seconds"` or the bare suffix
+    /// `"request_duration_seconds"` — both forms accepted; the bare form
+    /// gets the `agent_shim_` prefix prepended at install time).
+    /// Absent → exporter defaults (Prometheus's standard duration buckets).
+    #[serde(default)]
+    pub histogram_buckets: BTreeMap<String, Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -754,5 +774,24 @@ admin:
             "bind should fall back to default when omitted"
         );
         assert_eq!(admin.port, 9200);
+    }
+
+    #[test]
+    fn metrics_config_defaults() {
+        let yaml = "server: {bind: 127.0.0.1, port: 8787}";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert!(cfg.metrics.histogram_buckets.is_empty());
+    }
+
+    #[test]
+    fn metrics_config_custom_buckets() {
+        let yaml = r#"
+metrics:
+  histogram_buckets:
+    request_duration_seconds: [0.1, 0.5, 1.0, 5.0]
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let buckets = cfg.metrics.histogram_buckets.get("request_duration_seconds").unwrap();
+        assert_eq!(buckets, &vec![0.1, 0.5, 1.0, 5.0]);
     }
 }

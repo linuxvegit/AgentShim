@@ -127,6 +127,7 @@ mod tests {
             rate_limit: Default::default(),
             copilot: None,
             admin: None,
+            metrics: Default::default(),
         }
     }
 
@@ -225,6 +226,7 @@ mod tests {
             rate_limit: Default::default(),
             copilot: None,
             admin: None,
+            metrics: Default::default(),
         };
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
 

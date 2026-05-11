@@ -19,6 +19,7 @@ fn minimal_config() -> GatewayConfig {
         rate_limit: Default::default(),
         copilot: None,
         admin: None,
+        metrics: Default::default(),
     }
 }
 

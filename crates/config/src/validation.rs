@@ -449,6 +449,7 @@ mod tests {
             rate_limit: RateLimitConfig::default(),
             copilot: None,
             admin: None,
+            metrics: Default::default(),
         }
     }
 

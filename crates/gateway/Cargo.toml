@@ -40,6 +40,8 @@ thiserror.workspace = true
 dirs = "5"
 parking_lot.workspace = true
 reqwest.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -49,6 +51,7 @@ serde_json.workspace = true
 serde_yaml = "0.9"
 futures.workspace = true
 criterion = { version = "0.5", features = ["html_reports"] }
+prometheus-parse.workspace = true
 
 [[bench]]
 name = "gateway_overhead"

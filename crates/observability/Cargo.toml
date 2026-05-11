@@ -16,6 +16,10 @@ tower-http.workspace = true
 tower.workspace = true
 http = "1"
 uuid.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+prometheus-parse.workspace = true
+axum = { workspace = true, features = ["macros"] }
