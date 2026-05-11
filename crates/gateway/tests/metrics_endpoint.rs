@@ -120,3 +120,91 @@ async fn in_flight_gauge_present() {
         "expected metric output, got:\n{body}"
     );
 }
+
+#[tokio::test]
+async fn request_increments_counter() {
+    use mockito::Server;
+
+    // Start a mock OpenAI-compatible upstream.
+    let mut mock = Server::new_async().await;
+    let _m = mock
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"id":"x","object":"chat.completion","model":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let public_port = pick_port().await;
+    let admin_port = pick_port().await;
+    let yaml = format!(
+        r#"
+server: {{bind: 127.0.0.1, port: {public_port}}}
+admin: {{bind: 127.0.0.1, port: {admin_port}}}
+upstreams:
+  m:
+    type: open_ai_compatible
+    base_url: {}
+    api_key: dummy
+routes:
+  - frontend: openai_chat
+    model: x
+    upstream: m
+    upstream_model: x
+"#,
+        mock.url()
+    );
+
+    let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
+    let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
+    let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    let state = agent_shim_gateway::state::AppState::new(cfg).await;
+    let pl = tokio::net::TcpListener::bind(public_addr).await.unwrap();
+    let al = tokio::net::TcpListener::bind(admin_addr).await.unwrap();
+    let pa = agent_shim_gateway::server::build_router(state.clone());
+    let aa = agent_shim_gateway::admin::build_router(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(pl, pa).await;
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(al, aa).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Issue a real request.
+    let body = r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", public_addr))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Scrape /metrics, parse, assert the counter advanced.
+    let text = reqwest::get(format!("http://{}/metrics", admin_addr))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let lines: Vec<_> = text
+        .lines()
+        .map(|s| Ok::<String, std::io::Error>(s.to_string()))
+        .collect();
+    let scrape = prometheus_parse::Scrape::parse(lines.into_iter()).unwrap();
+    let total: f64 = scrape
+        .samples
+        .iter()
+        .filter(|s| s.metric == "agent_shim_requests_total")
+        .filter_map(|s| match s.value {
+            prometheus_parse::Value::Counter(v) | prometheus_parse::Value::Untyped(v) => Some(v),
+            _ => None,
+        })
+        .sum();
+    assert!(total >= 1.0, "expected at least 1, got {total}");
+}
