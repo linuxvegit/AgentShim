@@ -30,3 +30,6 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true }
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["testing"] }
+tracing-opentelemetry = "0.25"
