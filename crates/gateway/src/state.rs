@@ -47,11 +47,19 @@ impl ProviderLookup for GatewayProviderLookup {
 /// Plan 01 P01 T2: extracted from the old monolithic `AppState` so Plan 04's
 /// hot-reload path can swap the policy-bearing `AppSnapshot` while leaving
 /// the immutable handles (provider registry, breaker registry, etc.) alone.
+///
+/// Plan 04 P04 T4: `#[derive(Clone)]` so `commands::serve::run` can fork
+/// the freshly constructed core with a pinned `config_path` for
+/// SIGHUP-triggered reloads. All fields are `Arc<...>`, primitives, or
+/// other cheaply cloneable handles.
+#[derive(Clone)]
 pub struct AppCore {
     /// Path the configuration was originally loaded from. `None` when the
     /// state was constructed from an in-memory `GatewayConfig` (tests, ad-hoc
-    /// callers). Plan 04 will read this for SIGHUP-triggered reloads.
-    #[allow(dead_code)]
+    /// callers). Plan 04 P04 T3 reads this from `POST /admin/reload` when
+    /// no body is supplied, and T4's SIGHUP listener re-reads this path on
+    /// every signal. Plan 04 P04 T4 wires `commands::serve::run` to clone
+    /// `AppCore` with this field populated.
     pub config_path: Option<std::path::PathBuf>,
     /// Bind address / keepalive / timeout knobs cached at startup. Server
     /// rebinding mid-process is out of scope, so these never change after

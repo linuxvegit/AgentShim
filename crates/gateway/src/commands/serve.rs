@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
 
 pub async fn run(config_path: &Path) -> Result<()> {
     let cfg = agent_shim_config::load_from_path(config_path)
@@ -7,12 +8,70 @@ pub async fn run(config_path: &Path) -> Result<()> {
     agent_shim_config::validate(&cfg)
         .map_err(|e| anyhow::anyhow!("Config validation failed: {}", e))?;
     let tracing_handles = agent_shim_observability::init(&cfg.logging, cfg.otel.as_ref());
-    let (state, reload_rx) = crate::state::AppState::new(cfg).await;
-    // TODO(P04 T4): spawn reload-applying task that drains `reload_rx`
-    // and performs `state.snapshot.store(Arc::new(new_snap))` for each
-    // request. For now the channel exists so handlers compile against
-    // `core.reload_tx`, but no consumer is wired yet.
-    let _ = reload_rx;
+    let (mut state, mut reload_rx) = crate::state::AppState::new(cfg).await;
+
+    // Plan 04 P04 T4: pin the `--config` path onto `AppCore` so the
+    // SIGHUP listener and `POST /admin/reload` (with no body) can re-read
+    // the original file. `AppState::new` constructs `AppCore` without a
+    // path because it's a `GatewayConfig`-in-memory constructor; we fork
+    // a fresh `AppCore` here with the path filled in. Cheap — every
+    // field is `Arc`-shaped.
+    let core_with_path = Arc::new(crate::state::AppCore {
+        config_path: Some(config_path.to_path_buf()),
+        ..(*state.core).clone()
+    });
+    state.core = core_with_path;
+
+    // Plan 04 P04 T4: reload-applying task. Drains `reload_rx`; for each
+    // request, parses YAML / re-reads disk, validates against the
+    // `AppCore` baseline, builds a fresh `AppSnapshot`, atomic-swaps.
+    // The mpsc has bounded capacity (8 in `AppState::build`) so this
+    // task is the single serializer of reload events — no two swaps can
+    // race for the ArcSwap. Spec §5.2.
+    {
+        let state_for_task = state.clone();
+        tokio::spawn(async move {
+            while let Some(req) = reload_rx.recv().await {
+                let outcome = handle_reload(&state_for_task, req.source).await;
+                let _ = req.respond_to.send(outcome);
+            }
+        });
+    }
+
+    // Plan 04 P04 T4: SIGHUP listener (Unix only). Each `SIGHUP` enqueues
+    // a `ReloadSource::Sighup` into the same channel so reload semantics
+    // match `POST /admin/reload` with no body. The oneshot reply is
+    // discarded — operators reading server logs to confirm a SIGHUP reload
+    // landed should look for the `agent_shim::reload` tracing target.
+    #[cfg(unix)]
+    {
+        let reload_tx = state.core.reload_tx.clone();
+        tokio::spawn(async move {
+            let mut sig = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to install SIGHUP handler");
+                    return;
+                }
+            };
+            while sig.recv().await.is_some() {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                let _ = reload_tx
+                    .send(crate::reload_trigger::ReloadRequest {
+                        source: crate::reload_trigger::ReloadSource::Sighup,
+                        respond_to: tx,
+                    })
+                    .await;
+                tracing::info!(
+                    target = "agent_shim::reload",
+                    "SIGHUP received; reload requested"
+                );
+            }
+        });
+    }
+
     let result = if state.core.admin_config.is_some() {
         crate::server::run_with_admin(state).await
     } else {
@@ -22,4 +81,120 @@ pub async fn run(config_path: &Path) -> Result<()> {
         otel.shutdown();
     }
     result
+}
+
+/// Plan 04 P04 T4: reload-applying handler. One copy runs in the task
+/// spawned by `run`; the mpsc bounds capacity to 8 so this is also the
+/// only place an `ArcSwap` swap happens — no other task ever calls
+/// `state.snapshot.store`. Spec §5.2.
+///
+/// Path/Sighup sources re-read YAML from disk; Yaml sources use the body
+/// directly. The baseline for `validate_for_reload` is built from the
+/// CURRENT running state (live snapshot's upstream keys + the immutable
+/// `AppCore` server/admin config + the snapshot's otel.endpoint), not
+/// from the original startup config — so a future, looser policy on
+/// reload-time validation only has to update the baseline construction
+/// here, never the AppCore plumbing.
+async fn handle_reload(
+    state: &crate::state::AppState,
+    source: crate::reload_trigger::ReloadSource,
+) -> crate::reload_trigger::ReloadOutcome {
+    use crate::reload_trigger::{ReloadOutcome, ReloadSource};
+
+    let yaml: String = match source {
+        ReloadSource::Path(p) => match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) => return ReloadOutcome::Io(e.to_string()),
+        },
+        ReloadSource::Yaml(s) => s,
+        ReloadSource::Sighup => match state.core.config_path.as_ref() {
+            Some(p) => match std::fs::read_to_string(p) {
+                Ok(s) => s,
+                Err(e) => return ReloadOutcome::Io(e.to_string()),
+            },
+            None => {
+                return ReloadOutcome::Io(
+                    "no config path; SIGHUP can't re-read".into(),
+                );
+            }
+        },
+    };
+
+    let candidate: agent_shim_config::GatewayConfig = match serde_yaml::from_str(&yaml) {
+        Ok(c) => c,
+        Err(e) => return ReloadOutcome::Parse(e.to_string()),
+    };
+
+    let current = state.snapshot.load_full();
+    let baseline = agent_shim_config::ReloadBaseline {
+        upstream_names: current.config.upstreams.keys().cloned().collect(),
+        server: state.core.server_config.clone(),
+        admin: state.core.admin_config.clone(),
+        otel_endpoint: current
+            .config
+            .otel
+            .as_ref()
+            .and_then(|o| o.endpoint.clone()),
+    };
+
+    match agent_shim_config::validate_for_reload(&candidate, &baseline) {
+        Ok(diff) => {
+            // Build a fresh snapshot from the candidate config and
+            // atomic-swap. In-flight requests captured the OLD snapshot
+            // at the top of `pipeline::dispatch` and stay on it (spec
+            // §2.2); new requests after this store() see the new one.
+            let build = agent_shim_observability::reload::build(candidate);
+            let new_snap = Arc::new(crate::state::AppSnapshot {
+                config: build.config,
+                auth_enabled: build.auth_enabled,
+                auth_required: build.auth_required,
+                configured_key_hashes: build.configured_key_hashes,
+            });
+            state.snapshot.store(new_snap);
+
+            metrics::counter!(
+                agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
+                "result" => "ok",
+            )
+            .increment(1);
+            tracing::info!(target = "agent_shim::reload", "config reloaded");
+            ReloadOutcome::Ok(diff)
+        }
+        Err(agent_shim_config::ReloadValidationError::ImmutableFieldChanged {
+            field,
+            old,
+            new,
+        }) => {
+            metrics::counter!(
+                agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
+                "result" => "immutable_field",
+            )
+            .increment(1);
+            ReloadOutcome::ImmutableField(format!(
+                "{field}: {old} → {new} forbidden (restart required)"
+            ))
+        }
+        Err(agent_shim_config::ReloadValidationError::UpstreamSetChanged {
+            added,
+            removed,
+        }) => {
+            metrics::counter!(
+                agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
+                "result" => "immutable_field",
+            )
+            .increment(1);
+            ReloadOutcome::ImmutableField(format!(
+                "upstreams.* set changed (added={added:?}, removed={removed:?}); \
+                 immutable in v0.5"
+            ))
+        }
+        Err(other) => {
+            metrics::counter!(
+                agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
+                "result" => "validation_error",
+            )
+            .increment(1);
+            ReloadOutcome::ValidationError(other.to_string())
+        }
+    }
 }
