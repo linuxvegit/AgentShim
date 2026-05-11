@@ -66,6 +66,131 @@ pub async fn dispatch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HandlerError> {
+    // Plan 03 P03 T3: root `gateway.request` span wrapping the dispatch
+    // body. Fields with `tracing::field::Empty` are filled in once route +
+    // identity are resolved.
+    //
+    // Plan 03 P03 T3 followup (IMPORTANT-1): the body is wrapped in
+    // `async move { ... }.instrument(root_span).await` rather than held
+    // open with `root_span.enter()`. Holding a `tracing::Entered` guard
+    // across `.await` points is the documented anti-pattern — on the
+    // multi-threaded runtime, child spans created after a suspension
+    // point may not parent under the root correctly. `.instrument(...)`
+    // attaches the span to the future's poll loop instead, which is
+    // task-aware.
+    //
+    // `root_for_record` is a separate handle kept outside the instrumented
+    // block so we can `record(...)` `http.response.status_code` and
+    // `agent_shim.status_class` after the body returns. Recording fires
+    // a span event (or attribute update) on the same span; the
+    // `record` API does not require the span to be entered.
+    let frontend_label = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+
+    // Plan 03 P03 T3 followup (IMPORTANT-4): generate a fresh request_id
+    // here so it can be stamped on the root span. This matches the same
+    // documented compromise used by `ResilientCaller::complete` — until
+    // middleware-level plumbing lands, we generate a UUID at the pipeline
+    // entry so operators see a stable id correlating with the resilience
+    // events emitted downstream.
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    let root_span = tracing::info_span!(
+        "gateway.request",
+        "http.request.method" = "POST",
+        "http.route" = spec.endpoint_label,
+        "agent_shim.frontend" = frontend_label,
+        "agent_shim.request_id" = %request_id,
+        "agent_shim.route" = tracing::field::Empty,
+        "agent_shim.identity" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "agent_shim.status_class" = tracing::field::Empty,
+    );
+
+    let root_for_record = root_span.clone();
+    use tracing::Instrument;
+    let result =
+        async move { dispatch_inner(state, spec, headers, body, root_for_record.clone()).await }
+            .instrument(root_span.clone())
+            .await;
+
+    // Plan 03 P03 T3 followup (IMPORTANT-3): record the HTTP status class
+    // on the root span before it closes. `Ok(Response)` carries the
+    // axum-level status (200 for streaming; 200 or 4xx/5xx for unary).
+    // `Err(HandlerError)` is rendered to an HTTP status via the
+    // `IntoResponse` impl downstream; we can't observe the final wire
+    // status here without round-tripping through that impl, so we
+    // approximate via the error variant. The exact wire status is also
+    // available on the metrics middleware's `agent_shim_status_class`
+    // label, so the operator-facing data is not lost.
+    let (status_code, status_class): (u16, &'static str) = match &result {
+        Ok(resp) => {
+            let s = resp.status().as_u16();
+            (s, status_class_for(s))
+        }
+        Err(e) => {
+            // Best-effort: map the variant to a representative status code.
+            // The middleware records the exact wire status; this is just
+            // for the trace span's operator-visible class.
+            let s = handler_error_status_hint(e);
+            (s, status_class_for(s))
+        }
+    };
+    root_span.record("http.response.status_code", status_code as i64);
+    root_span.record("agent_shim.status_class", status_class);
+    result
+}
+
+/// Map an HTTP status code to its `agent_shim.status_class` label.
+fn status_class_for(status: u16) -> &'static str {
+    match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+/// Best-effort hint for the wire status that the `IntoResponse` impl
+/// will emit for a given [`HandlerError`]. Used only to set the root
+/// span's `agent_shim.status_class` when dispatch returns `Err(_)`; the
+/// metrics middleware records the exact wire status on its own labels.
+fn handler_error_status_hint(e: &HandlerError) -> u16 {
+    use agent_shim_providers::ProviderError;
+    use agent_shim_router::RouteError;
+    match e {
+        HandlerError::Route(RouteError::NoRoute { .. }) => 404,
+        HandlerError::Unauthorized { .. } => 401,
+        HandlerError::CapabilityMismatch { .. } => 400,
+        HandlerError::Frontend(agent_shim_frontends::FrontendError::InvalidBody(_)) => 400,
+        HandlerError::Frontend(agent_shim_frontends::FrontendError::Unsupported(_)) => 422,
+        HandlerError::Frontend(_) => 400,
+        HandlerError::Provider(ProviderError::Upstream { status, .. }) => *status,
+        HandlerError::Provider(_) => 502,
+        HandlerError::NoUpstreamSucceeded { .. } | HandlerError::AllBreakersOpen { .. } => 503,
+        HandlerError::RateLimited { .. } => 429,
+        HandlerError::TerminalUpstream {
+            error: ProviderError::Upstream { status, .. },
+            ..
+        } => *status,
+        HandlerError::TerminalUpstream { .. } => 502,
+    }
+}
+
+/// Body of [`dispatch`], pulled into a separate async fn so the parent can
+/// wrap it with `.instrument(root_span)` rather than holding an `Entered`
+/// guard across `.await` (Plan 03 P03 T3 followup, IMPORTANT-1).
+async fn dispatch_inner(
+    state: &AppState,
+    spec: PipelineSpec<'_>,
+    headers: HeaderMap,
+    body: Bytes,
+    root_span: tracing::Span,
+) -> Result<Response, HandlerError> {
     let body_bytes = body.len();
     let started = std::time::Instant::now();
 
@@ -74,27 +199,11 @@ pub async fn dispatch(
     // 04) does not affect them.
     let snapshot = state.snapshot.load_full();
 
-    // Plan 03 P03 T3: root `gateway.request` span wrapping the dispatch
-    // body. Fields with `tracing::field::Empty` are filled in once route +
-    // identity are resolved. The span's lifetime ends when `_root_guard`
-    // drops — for streaming responses that's after `dispatch` returns, but
-    // child spans on the encoded stream re-enter their own context.
     let frontend_label = match spec.frontend.kind() {
         agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
         agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
         agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
     };
-    let root_span = tracing::info_span!(
-        "gateway.request",
-        "http.request.method" = "POST",
-        "http.route" = spec.endpoint_label,
-        "agent_shim.frontend" = frontend_label,
-        "agent_shim.route" = tracing::field::Empty,
-        "agent_shim.identity" = tracing::field::Empty,
-        "http.response.status_code" = tracing::field::Empty,
-        "agent_shim.status_class" = tracing::field::Empty,
-    );
-    let _root_guard = root_span.enter();
 
     // Resolve the route up front. The Responses passthrough path needs the
     // target before it has decoded the body, so route resolution has to come

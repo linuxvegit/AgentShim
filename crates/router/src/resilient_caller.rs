@@ -215,10 +215,19 @@ impl ResilientCaller {
         // buckets are consulted before any breaker decision or provider
         // lookup. A rejection here is request-scoped (not chain-element
         // scoped) so we never enter the chain walk.
-        if let Err((dim, retry_after_secs)) =
+        //
+        // Plan 03 P03 T3 followup: wrap the pre-chain gate in a
+        // `rate_limit.check` child span per spec §4.1. The span guard
+        // drops immediately after the check; per-upstream rate-limit
+        // checks inside the chain loop don't need a separate span (the
+        // dimension label on the `rate_limit.rejected` event already
+        // distinguishes pre-chain from per-upstream).
+        let pre_chain_result = {
+            let _rl_span = tracing::info_span!("rate_limit.check").entered();
             self.limiters
                 .check_pre_chain(identity, frontend_model, client_ip)
-        {
+        };
+        if let Err((dim, retry_after_secs)) = pre_chain_result {
             tracing::warn!(
                 target: "agent_shim::resilience",
                 event_name = "rate_limit.rejected",
@@ -342,17 +351,18 @@ impl ResilientCaller {
                 "agent_shim.fallback_position" = i as i64,
             );
             // retry_with_policy returns Err on retry exhaustion OR terminal.
-            let result =
+            // Plan 03 P03 T3 followup: `RetryOutcome` carries the realized
+            // attempt count so the span attribute reflects the actual number
+            // of provider calls made, not `policy.max_attempts` (the upper
+            // bound).
+            let outcome =
                 retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id)
                     .instrument(provider_span.clone())
                     .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            // `rpolicy.max_attempts` is an upper bound; the real attempt
-            // count is logged by the retry loop itself. Recording the
-            // bound here is still useful: it sets the span's attribute
-            // shape unconditionally and operators can correlate with the
-            // per-attempt event for the precise count.
-            provider_span.record("agent_shim.attempts", rpolicy.max_attempts as i64);
+            provider_span.record("agent_shim.attempts", outcome.attempts as i64);
+            let result = outcome.result;
+            let realized_attempts = outcome.attempts;
 
             match result {
                 Ok(stream) => {
@@ -376,8 +386,7 @@ impl ResilientCaller {
                     tried.push(TriedUpstream {
                         provider: target.provider.clone(),
                         model: target.model.clone(),
-                        attempts: rpolicy.max_attempts, // upper bound; real count
-                        // is logged by retry loop
+                        attempts: realized_attempts,
                         last_error_tag: tag.to_string(),
                         last_error_msg: e.to_string(),
                         elapsed_ms,

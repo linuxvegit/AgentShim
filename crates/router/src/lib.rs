@@ -85,5 +85,5 @@ pub use fallback::{
 pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry};
 pub use resilient_caller::{ProviderLookup, ResilientCaller};
 pub use resolver::ModelResolver;
-pub use retry::{compute_backoff, retry_with_policy, RetryPolicy};
+pub use retry::{compute_backoff, retry_with_policy, RetryOutcome, RetryPolicy};
 pub use static_routes::StaticRouter;
