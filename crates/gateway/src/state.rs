@@ -93,6 +93,15 @@ pub struct AppCore {
     /// Prometheus metrics handle. Plan 02 P02 T3. Built once at startup;
     /// the /metrics admin handler renders against it.
     pub metrics: Arc<agent_shim_observability::MetricsHandle>,
+    /// Sender side of the reload trigger channel. SIGHUP listener and
+    /// `/admin/reload` handler push onto this; the reload-applying task
+    /// drains it and performs the `ArcSwap` of `snapshot`. Plan 04 P04
+    /// T2 spec §5.1. The receiver is returned from `AppState::new` and
+    /// consumed by the reload-applying task that `commands::serve::run`
+    /// spawns in T4. `#[allow(dead_code)]` falls off in T3 once
+    /// `/admin/reload` clones this sender.
+    #[allow(dead_code)]
+    pub reload_tx: tokio::sync::mpsc::Sender<crate::reload_trigger::ReloadRequest>,
 }
 
 /// Hot-swappable policy-bearing snapshot. Plan 04 will swap this on
@@ -132,7 +141,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn new(config: agent_shim_config::GatewayConfig) -> Self {
+    pub async fn new(
+        config: agent_shim_config::GatewayConfig,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
+    ) {
         Self::build(config, Arc::new(SystemClock)).await
     }
 
@@ -153,7 +167,10 @@ impl AppState {
     pub async fn new_with_clock(
         config: agent_shim_config::GatewayConfig,
         clock: Arc<dyn Clock>,
-    ) -> Self {
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
+    ) {
         Self::build(config, clock).await
     }
 
@@ -162,7 +179,13 @@ impl AppState {
     /// `BreakerRegistry::new` — everything else (provider registry,
     /// resolver, frontend handlers) is identical, so extracting this
     /// helper keeps the two public constructors as one-liners.
-    async fn build(config: agent_shim_config::GatewayConfig, clock: Arc<dyn Clock>) -> Self {
+    async fn build(
+        config: agent_shim_config::GatewayConfig,
+        clock: Arc<dyn Clock>,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
+    ) {
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
         let anthropic = Arc::new(AnthropicMessages {
             keepalive: Some(keepalive),
@@ -274,6 +297,13 @@ impl AppState {
         // can render against it.
         let metrics = agent_shim_observability::install_metrics(&config.metrics);
 
+        // Plan 04 P04 T2: reload trigger channel. SIGHUP and
+        // `/admin/reload` push onto the sender stored in `AppCore`; the
+        // receiver is returned to the caller (`commands::serve::run`),
+        // which moves it into the reload-applying task in T4. Bounded
+        // at 8 so a stuck applier rejects rather than ballooning memory.
+        let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(8);
+
         let snapshot = AppSnapshot {
             config: Arc::new(config),
             auth_enabled,
@@ -294,12 +324,16 @@ impl AppState {
             breaker_registry,
             limiter_registry,
             metrics,
+            reload_tx,
         };
 
-        Self {
-            core: Arc::new(core),
-            snapshot: Arc::new(ArcSwap::new(Arc::new(snapshot))),
-        }
+        (
+            Self {
+                core: Arc::new(core),
+                snapshot: Arc::new(ArcSwap::new(Arc::new(snapshot))),
+            },
+            reload_rx,
+        )
     }
 }
 
@@ -335,7 +369,7 @@ routes:
     #[tokio::test]
     async fn appstate_split_into_core_and_snapshot() {
         let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
-        let state = AppState::new(cfg).await;
+        let (state, _reload_rx) = AppState::new(cfg).await;
 
         // Compile-time assertions: each half holds the right type. Pinning
         // the types here ensures a future refactor can't quietly move a
@@ -367,7 +401,7 @@ routes:
         // The §2.2 invariant: in-flight requests use the snapshot at the
         // time of their start. Mid-request swap doesn't reach them.
         let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
-        let state = AppState::new(cfg).await;
+        let (state, _reload_rx) = AppState::new(cfg).await;
 
         // Simulate request capture (what pipeline::dispatch does at the top).
         let captured = state.snapshot.load_full();

@@ -28,7 +28,7 @@ fn minimal_config() -> GatewayConfig {
 async fn spawn_server() -> (String, tokio::sync::oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state = AppState::new(minimal_config()).await;
+    let (state, _reload_rx) = AppState::new(minimal_config()).await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         run_on_listener(listener, state, async {

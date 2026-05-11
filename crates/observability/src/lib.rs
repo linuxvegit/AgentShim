@@ -3,6 +3,7 @@
 pub mod metrics;
 pub mod otel;
 pub mod redaction;
+pub mod reload;
 pub mod request_id;
 pub mod tracing_setup;
 

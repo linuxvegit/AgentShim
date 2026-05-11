@@ -192,6 +192,10 @@ fn make_app_state() -> AppState {
             breaker_registry,
             limiter_registry,
             metrics: agent_shim_observability::install_metrics(&Default::default()),
+            // The test bypasses AppState::new so the channel sender has
+            // no real consumer; that's fine because this test never
+            // triggers a reload. Plan 04 P04 T2.
+            reload_tx: tokio::sync::mpsc::channel(1).0,
         }),
         snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
             config: Arc::new(cfg),

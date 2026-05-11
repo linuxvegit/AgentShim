@@ -45,7 +45,7 @@ async fn spawn_gateway(yaml: &str) -> SocketAddr {
     let public_addr: SocketAddr = format!("{}:{}", cfg.server.bind, cfg.server.port)
         .parse()
         .unwrap();
-    let state = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, _reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
     let listener = tokio::net::TcpListener::bind(public_addr).await.unwrap();
     let actual = listener.local_addr().unwrap();
     let app = agent_shim_gateway::server::build_router(state);

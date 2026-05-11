@@ -33,7 +33,7 @@ routes:
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
     let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
-    let state = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, _reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
     let pl = tokio::net::TcpListener::bind(public_addr).await.unwrap();
     let al = tokio::net::TcpListener::bind(admin_addr).await.unwrap();
     let pa = agent_shim_gateway::server::build_router(state.clone());
@@ -164,7 +164,7 @@ routes:
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
     let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
-    let state = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, _reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
     let pl = tokio::net::TcpListener::bind(public_addr).await.unwrap();
     let al = tokio::net::TcpListener::bind(admin_addr).await.unwrap();
     let pa = agent_shim_gateway::server::build_router(state.clone());

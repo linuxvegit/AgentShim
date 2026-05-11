@@ -138,7 +138,7 @@ async fn spawn_gateway(
     known_hash: &str,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let cfg = make_config(upstream_url, known_hash);
-    let state = AppState::new(cfg).await;
+    let (state, _reload_rx) = AppState::new(cfg).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
