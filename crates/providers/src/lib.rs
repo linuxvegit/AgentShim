@@ -7,7 +7,8 @@ pub mod github_copilot;
 pub mod oai_chat_wire;
 pub mod openai_compatible;
 
-pub(crate) mod http_client;
+pub mod http_client;
+pub use http_client::ProviderHttpClient;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

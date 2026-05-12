@@ -52,7 +52,7 @@ pub struct GeminiProvider {
     auth: AiStudioAuth,
     default_headers: HeaderMap,
     _timeout: Duration,
-    client: reqwest::Client,
+    client: crate::ProviderHttpClient,
     capabilities: ProviderCapabilities,
 }
 

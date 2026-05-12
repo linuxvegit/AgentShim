@@ -33,12 +33,12 @@ use token_manager::{CopilotToken, CopilotTokenManager};
 
 pub struct CopilotProvider {
     manager: CopilotTokenManager,
-    http: reqwest::Client,
+    http: crate::ProviderHttpClient,
     capabilities: ProviderCapabilities,
 }
 
 impl CopilotProvider {
-    fn build_http_client() -> Result<reqwest::Client, ProviderError> {
+    fn build_http_client() -> Result<crate::ProviderHttpClient, ProviderError> {
         // 300s read_timeout — maximum gap between successive body reads.
         // This is *not* a total request timeout; long Claude tool-call
         // streams can run several minutes total but emit fragments well
@@ -57,7 +57,7 @@ impl CopilotProvider {
     pub fn spawn(credential_path: PathBuf) -> Result<Self, ProviderError> {
         let http = Self::build_http_client()?;
 
-        let manager = CopilotTokenManager::new_lazy(http.clone(), credential_path);
+        let manager = CopilotTokenManager::new_lazy(http.inner().clone(), credential_path);
 
         Ok(Self {
             manager,
@@ -87,7 +87,7 @@ impl CopilotProvider {
     ) -> Result<Self, ProviderError> {
         let http = Self::build_http_client()?;
 
-        let manager = CopilotTokenManager::new(http.clone(), creds, base_url);
+        let manager = CopilotTokenManager::new(http.inner().clone(), creds, base_url);
 
         Ok(Self {
             manager,
@@ -276,7 +276,7 @@ impl BackendProvider for CopilotProvider {
 
     async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
         let token = self.manager.get().await?;
-        let models = models::list_models(&self.http, &token).await?;
+        let models = models::list_models(self.http.inner(), &token).await?;
         if models.is_empty() {
             return Ok(None);
         }

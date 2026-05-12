@@ -29,7 +29,7 @@ pub struct DeepseekProvider {
     api_key: String,
     default_headers: HeaderMap,
     _timeout: Duration,
-    client: reqwest::Client,
+    client: crate::ProviderHttpClient,
     capabilities: ProviderCapabilities,
 }
 
