@@ -14,6 +14,7 @@ upstreams:
   deepseek:
     type: deepseek
     api_key: "sk-your-deepseek-api-key-here"
+    tier: standard
     # Optional overrides (defaults shown):
     # base_url: https://api.deepseek.com/v1
     # request_timeout_secs: 30

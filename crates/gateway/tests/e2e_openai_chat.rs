@@ -2,7 +2,9 @@
 use std::collections::BTreeMap;
 
 use agent_shim_config::{
-    schema::{LoggingConfig, OpenAiCompatibleUpstream, RouteEntry, ServerConfig, UpstreamConfig},
+    schema::{
+        LoggingConfig, OpenAiCompatibleUpstream, RouteEntry, ServerConfig, Tier, UpstreamConfig,
+    },
     GatewayConfig, Secret,
 };
 use agent_shim_gateway::{server::run_on_listener, state::AppState};
@@ -18,6 +20,9 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
 

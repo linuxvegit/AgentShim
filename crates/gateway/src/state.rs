@@ -219,7 +219,7 @@ impl AppState {
                         Err(e) => tracing::error!("failed to build provider {name}: {e}"),
                     }
                 }
-                UpstreamConfig::GithubCopilot => {
+                UpstreamConfig::GithubCopilot(_cfg) => {
                     let credential_path = config
                         .copilot
                         .as_ref()

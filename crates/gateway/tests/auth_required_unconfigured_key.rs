@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use agent_shim_config::{
     schema::{
         AuthConfig, AuthKeyEntry, BreakerConfig, LoggingConfig, OpenAiCompatibleUpstream,
-        RateLimitConfig, RetryConfig, RouteEntry, ServerConfig, UpstreamConfig, UpstreamRef,
+        RateLimitConfig, RetryConfig, RouteEntry, ServerConfig, Tier, UpstreamConfig, UpstreamRef,
     },
     GatewayConfig, Secret,
 };
@@ -72,6 +72,9 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
 
@@ -120,6 +123,8 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
                 ],
             },
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         }],
         auth,
         rate_limit: RateLimitConfig::default(),

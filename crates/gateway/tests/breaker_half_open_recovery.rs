@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use agent_shim_config::{
     schema::{
         BreakerConfig, LoggingConfig, OpenAiCompatibleUpstream, RetryConfig, RouteEntry,
-        ServerConfig, UpstreamConfig, UpstreamRef,
+        ServerConfig, Tier, UpstreamConfig, UpstreamRef,
     },
     GatewayConfig, Secret,
 };
@@ -84,6 +84,9 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
     upstreams.insert(
@@ -93,6 +96,9 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
 
@@ -139,6 +145,8 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
                 window_secs: 60,
                 open_cooldown_secs: 30,
             },
+            min_tier: None,
+            max_cost_usd: None,
         }],
         auth: Default::default(),
         rate_limit: Default::default(),

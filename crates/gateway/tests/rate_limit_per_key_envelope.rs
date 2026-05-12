@@ -19,7 +19,7 @@ use agent_shim_config::{
     schema::{
         AuthConfig, AuthKeyEntry, BreakerConfig, BucketConfigYaml, LoggingConfig,
         OpenAiCompatibleUpstream, PerKeyConfig, RateLimitConfig, RetryConfig, RouteEntry,
-        ServerConfig, UpstreamConfig, UpstreamRef,
+        ServerConfig, Tier, UpstreamConfig, UpstreamRef,
     },
     GatewayConfig, Secret,
 };
@@ -103,6 +103,9 @@ fn make_chat_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
 
@@ -136,6 +139,8 @@ fn make_chat_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
                 ],
             },
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         }],
         auth,
         rate_limit,
@@ -168,6 +173,9 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
 
@@ -201,6 +209,8 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
                 ],
             },
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         }],
         auth,
         rate_limit,

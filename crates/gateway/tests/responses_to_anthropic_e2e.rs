@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use agent_shim_config::{
-    schema::{AnthropicUpstream, LoggingConfig, RouteEntry, ServerConfig, UpstreamConfig},
+    schema::{AnthropicUpstream, LoggingConfig, RouteEntry, ServerConfig, Tier, UpstreamConfig},
     GatewayConfig, Secret,
 };
 use agent_shim_gateway::{server::run_on_listener, state::AppState};
@@ -57,6 +57,9 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             anthropic_version: "2023-06-01".to_string(),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         }),
     );
 

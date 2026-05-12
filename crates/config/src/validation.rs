@@ -1,4 +1,4 @@
-use crate::schema::{BucketConfigYaml, GatewayConfig, UpstreamConfig};
+use crate::schema::{BucketConfigYaml, GatewayConfig, Tier, UpstreamConfig, UpstreamCost};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,6 +20,36 @@ pub enum ValidationError {
         admin: u16,
         server: u16,
         bind: String,
+    },
+    /// Rule 15 (Plan 06 P03): cost.* fields must both be present or both
+    /// absent. `Option<UpstreamCost>` already enforces this at the schema
+    /// layer for the normal parse path; this variant exists for the
+    /// hand-rolled / partial-parse path described in spec §5.5.
+    #[error(
+        "upstream `{upstream}` declares partial `cost` block; both `input_per_million_usd` and `output_per_million_usd` are required"
+    )]
+    IncompleteCost { upstream: String },
+    /// Rule 15 (Plan 06 P03): cost.* fields must be non-negative.
+    #[error("upstream `{upstream}` has negative `cost.{field}` (must be >= 0)")]
+    NegativeCost {
+        upstream: String,
+        field: &'static str,
+    },
+    /// Rule 16 (Plan 06 P03): tier must be one of economy/standard/premium.
+    /// Schema-level enum normally catches this; the variant exists to give
+    /// operators a clearer error string on hand-crafted invalid YAML.
+    #[error("upstream `{upstream}` has invalid tier `{value}` (must be economy/standard/premium)")]
+    InvalidTier { upstream: String, value: String },
+    /// Rule 17 (Plan 06 P03): a route's `min_tier` must be satisfied by
+    /// at least one upstream in its chain — otherwise the route would
+    /// always 503 with `NoEligibleUpstream`.
+    #[error(
+        "route `{route}` requires min_tier={min_tier:?} but no upstream in its chain meets it (chain tiers: {chain_tiers:?})"
+    )]
+    ImpossibleMinTier {
+        route: String,
+        min_tier: crate::schema::Tier,
+        chain_tiers: Vec<(String, crate::schema::Tier)>,
     },
 }
 
@@ -99,11 +129,40 @@ fn upstream_is_configured(cfg: &GatewayConfig, name: &str) -> bool {
         && cfg
             .upstreams
             .values()
-            .any(|u| matches!(u, UpstreamConfig::GithubCopilot))
+            .any(|u| matches!(u, UpstreamConfig::GithubCopilot(_)))
     {
         return true;
     }
     false
+}
+
+// ── Plan 06 P03: cost-aware routing accessor helpers ────────────────────────
+//
+// Phase 6 cost-aware routing needs to read the new `tier` and `cost` fields
+// without exhaustively matching every variant at every call site. The
+// helpers below centralise that pattern. Add new arms here when a new
+// upstream variant is introduced.
+
+/// Returns the `cost` field for any upstream variant.
+fn upstream_cost(u: &UpstreamConfig) -> Option<&UpstreamCost> {
+    match u {
+        UpstreamConfig::OpenAiCompatible(c) => c.cost.as_ref(),
+        UpstreamConfig::GithubCopilot(c) => c.cost.as_ref(),
+        UpstreamConfig::Anthropic(c) => c.cost.as_ref(),
+        UpstreamConfig::Deepseek(c) => c.cost.as_ref(),
+        UpstreamConfig::Gemini(c) => c.cost.as_ref(),
+    }
+}
+
+/// Returns the `tier` field for any upstream variant.
+fn upstream_tier(u: &UpstreamConfig) -> Tier {
+    match u {
+        UpstreamConfig::OpenAiCompatible(c) => c.tier,
+        UpstreamConfig::GithubCopilot(c) => c.tier,
+        UpstreamConfig::Anthropic(c) => c.tier,
+        UpstreamConfig::Deepseek(c) => c.tier,
+        UpstreamConfig::Gemini(c) => c.tier,
+    }
 }
 
 pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
@@ -202,6 +261,77 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
     // existing CLI surfaces these errors without churning the public enum.
     validate_rate_limit(cfg).map_err(ValidationError::InvalidRoute)?;
     validate_auth(cfg).map_err(ValidationError::InvalidRoute)?;
+
+    // Rule 15 (Plan 06 P03): cost.* fields must be non-negative when
+    // declared. `Option<UpstreamCost>` already guarantees both fields are
+    // present-or-absent together at the schema layer — we just check the
+    // sign here.
+    for (name, upstream) in &cfg.upstreams {
+        if let Some(cost) = upstream_cost(upstream) {
+            if cost.input_per_million_usd < 0.0 {
+                return Err(ValidationError::NegativeCost {
+                    upstream: name.clone(),
+                    field: "input_per_million_usd",
+                });
+            }
+            if cost.output_per_million_usd < 0.0 {
+                return Err(ValidationError::NegativeCost {
+                    upstream: name.clone(),
+                    field: "output_per_million_usd",
+                });
+            }
+        }
+    }
+
+    // Rule 17 (Plan 06 P03): every route with `min_tier` set must have at
+    // least one upstream in its chain that meets it. Otherwise the route is
+    // guaranteed to produce 503 NoEligibleUpstream forever.
+    for route in &cfg.routes {
+        let Some(min_tier) = route.min_tier else {
+            continue;
+        };
+        // Build the route's effective chain: prefer the array shape if
+        // populated, else fall back to the singular shape.
+        let chain_names: Vec<&str> = if !route.upstreams.is_empty() {
+            route.upstreams.iter().map(|u| u.name.as_str()).collect()
+        } else if let Some(u) = route.upstream.as_deref() {
+            vec![u]
+        } else {
+            // No upstream declared — earlier rules already flag this.
+            continue;
+        };
+        let chain_tiers: Vec<(String, Tier)> = chain_names
+            .iter()
+            .filter_map(|n| {
+                // Honor the `copilot` virtual-name fallback (see
+                // `upstream_is_configured`): if the literal key isn't in
+                // `upstreams`, look for any GithubCopilot block.
+                let upstream = cfg.upstreams.get(*n).or_else(|| {
+                    if *n == "copilot" {
+                        cfg.upstreams
+                            .values()
+                            .find(|u| matches!(u, UpstreamConfig::GithubCopilot(_)))
+                    } else {
+                        None
+                    }
+                });
+                upstream.map(|u| ((*n).to_string(), upstream_tier(u)))
+            })
+            .collect();
+        // If we couldn't resolve any chain entry, earlier validation will
+        // surface the unknown-upstream error; don't double-fire here.
+        if chain_tiers.is_empty() {
+            continue;
+        }
+        let any_meets = chain_tiers.iter().any(|(_, t)| *t >= min_tier);
+        if !any_meets {
+            return Err(ValidationError::ImpossibleMinTier {
+                route: format!("{}/{}", route.frontend, route.model),
+                min_tier,
+                chain_tiers,
+            });
+        }
+    }
 
     Ok(())
 }
@@ -637,6 +767,8 @@ mod tests {
             anthropic_beta: None,
             retry: RetryConfig::default(),
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -654,6 +786,9 @@ mod tests {
                 api_key: Secret::new("key"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         cfg.routes.push(RouteEntry {
@@ -666,6 +801,8 @@ mod tests {
             anthropic_beta: None,
             retry: RetryConfig::default(),
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         });
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
@@ -677,6 +814,8 @@ mod tests {
             anthropic_beta: None,
             retry: RetryConfig::default(),
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -694,6 +833,9 @@ mod tests {
                 api_key: Secret::new("key"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         cfg.routes.push(RouteEntry {
@@ -706,6 +848,8 @@ mod tests {
             anthropic_beta: None,
             retry: RetryConfig::default(),
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -724,6 +868,9 @@ mod tests {
                 anthropic_version: "2023-06-01".to_string(),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         assert!(validate(&cfg).is_ok());
@@ -740,6 +887,9 @@ mod tests {
                 anthropic_version: "2023-06-01".to_string(),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         assert!(matches!(
@@ -759,6 +909,9 @@ mod tests {
                 anthropic_version: "2023-06-01".to_string(),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         assert!(matches!(
@@ -777,6 +930,9 @@ mod tests {
                 api_key: Secret::new("sk-deepseek-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         assert!(validate(&cfg).is_ok());
@@ -792,6 +948,9 @@ mod tests {
                 api_key: Secret::new(""),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         match validate(&cfg) {
@@ -816,6 +975,9 @@ mod tests {
                 api_key: Secret::new("sk-deepseek-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         match validate(&cfg) {
@@ -840,6 +1002,9 @@ mod tests {
                 api_key: Secret::new("sk-deepseek-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 0,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         match validate(&cfg) {
@@ -864,6 +1029,9 @@ mod tests {
                 api_key: Secret::new("ai-studio-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         assert!(validate(&cfg).is_ok());
@@ -879,6 +1047,9 @@ mod tests {
                 api_key: Secret::new(""),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         match validate(&cfg) {
@@ -903,6 +1074,9 @@ mod tests {
                 api_key: Secret::new("ai-studio-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         match validate(&cfg) {
@@ -927,6 +1101,9 @@ mod tests {
                 api_key: Secret::new("ai-studio-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 0,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         match validate(&cfg) {
@@ -955,6 +1132,9 @@ mod tests {
                 api_key: Secret::new("sk-test"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         let route: RouteEntry = serde_yaml::from_str(route_yaml).expect("route YAML parses");
@@ -1066,8 +1246,14 @@ mod tests {
     fn validate_routes_accepts_copilot_virtual_name() {
         let mut cfg = minimal_config();
         // Upstream block is keyed `github_copilot` (not `copilot`).
-        cfg.upstreams
-            .insert("github_copilot".to_string(), UpstreamConfig::GithubCopilot);
+        cfg.upstreams.insert(
+            "github_copilot".to_string(),
+            UpstreamConfig::GithubCopilot(GithubCopilotUpstream {
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
         let route: RouteEntry = serde_yaml::from_str(
             r#"
             frontend: openai_chat
@@ -1143,7 +1329,7 @@ mod tests {
         // here so the YAML parses far enough to exercise the rate_limit rule.
         let cfg_yaml = r#"
 upstreams:
-  oai: {type: open_ai_compatible, base_url: "https://x", api_key: "x"}
+  oai: {type: open_ai_compatible, base_url: "https://x", api_key: "x", tier: standard}
 routes:
   - frontend: openai_chat
     model: gpt-4o
@@ -1206,7 +1392,7 @@ auth:
         // by inspection.
         let cfg_yaml = r#"
 upstreams:
-  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x"}
+  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x", tier: standard}
 routes:
   - frontend: openai_chat
     model: gpt-4o
@@ -1299,7 +1485,7 @@ auth:
         // same time.
         let cfg_yaml = r#"
 upstreams:
-  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x"}
+  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x", tier: standard}
 routes:
   - frontend: openai_chat
     model: gpt-4o
@@ -1327,7 +1513,7 @@ rate_limit:
         // assertion is fragile under future schema changes.
         let cfg_yaml = r#"
 upstreams:
-  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x"}
+  oai: {type: open_ai_compatible, base_url: "http://x", api_key: "x", tier: standard}
 routes:
   - frontend: openai_chat
     model: gpt-4o
@@ -1426,7 +1612,7 @@ routes:
         let yaml = r#"
 server: {bind: 127.0.0.1, port: 8787}
 upstreams:
-  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}
 routes:
   - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
 "#;
@@ -1449,7 +1635,7 @@ routes:
         let yaml = r#"
 server: {bind: 127.0.0.1, port: 8787}
 upstreams:
-  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}
 routes:
   - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
 "#;
@@ -1463,6 +1649,9 @@ routes:
                 api_key: Secret::new("b"),
                 default_headers: BTreeMap::new(),
                 request_timeout_secs: 120,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
             }),
         );
         let err = validate_for_reload(&candidate, &baseline).unwrap_err();
@@ -1477,7 +1666,7 @@ routes:
         let yaml = r#"
 server: {bind: 127.0.0.1, port: 8787}
 upstreams:
-  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}
 routes:
   - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
 "#;
@@ -1495,6 +1684,8 @@ routes:
             breaker: Default::default(),
             reasoning_effort: None,
             anthropic_beta: None,
+            min_tier: None,
+            max_cost_usd: None,
         });
         let diff = validate_for_reload(&candidate, &baseline).expect("ok");
         assert_eq!(diff.routes_total, 2);
@@ -1506,7 +1697,7 @@ routes:
 server: {bind: 127.0.0.1, port: 8787}
 otel: {endpoint: "http://c:4317", sample_ratio: 1.0}
 upstreams:
-  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}
 routes:
   - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
 "#;
@@ -1523,7 +1714,7 @@ routes:
 server: {bind: 127.0.0.1, port: 8787}
 otel: {endpoint: "http://c:4317"}
 upstreams:
-  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}
 routes:
   - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
 "#;
@@ -1539,5 +1730,158 @@ routes:
                 ..
             }
         ));
+    }
+
+    // ── Plan 06 P03 T4: cost / tier / min_tier validation tests ─────────────
+
+    /// Build a single-route GatewayConfig with one OpenAI-compatible upstream
+    /// `m` configured to the given tier and cost. Used by the rule-15 and
+    /// rule-17 tests below.
+    fn cfg_with_one_oai_upstream(input_cost: f64, output_cost: f64, tier: Tier) -> GatewayConfig {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "m".to_string(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+                base_url: "http://x/v1".into(),
+                api_key: Secret::new("a"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 120,
+                tier,
+                cost: Some(UpstreamCost {
+                    input_per_million_usd: input_cost,
+                    output_per_million_usd: output_cost,
+                }),
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes
+            .push(RouteEntry::singular("openai_chat", "x", "m", "x-real"));
+        cfg
+    }
+
+    #[test]
+    fn cost_negative_input_rejected() {
+        let cfg = cfg_with_one_oai_upstream(-1.0, 1.0, Tier::Standard);
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ValidationError::NegativeCost { upstream, field } => {
+                assert_eq!(upstream, "m");
+                assert_eq!(field, "input_per_million_usd");
+            }
+            other => panic!("expected NegativeCost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_negative_output_rejected() {
+        let cfg = cfg_with_one_oai_upstream(1.0, -1.0, Tier::Standard);
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            ValidationError::NegativeCost { upstream, field } => {
+                assert_eq!(upstream, "m");
+                assert_eq!(field, "output_per_million_usd");
+            }
+            other => panic!("expected NegativeCost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn impossible_min_tier_rejected() {
+        let mut cfg = cfg_with_one_oai_upstream(1.0, 1.0, Tier::Economy);
+        // Demand Premium when the only upstream is Economy → rule 17 fires.
+        cfg.routes[0].min_tier = Some(Tier::Premium);
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::ImpossibleMinTier { .. }),
+            "expected ImpossibleMinTier, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn impossible_min_tier_chain_with_one_match_passes() {
+        // Chain has two upstreams: eco (economy) + std (standard). Route
+        // demands min_tier=standard → satisfied by std, rule 17 must not fire.
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "eco".to_string(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+                base_url: "http://eco/v1".into(),
+                api_key: Secret::new("a"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+                tier: Tier::Economy,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.upstreams.insert(
+            "std".to_string(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+                base_url: "http://std/v1".into(),
+                api_key: Secret::new("a"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(RouteEntry {
+            frontend: "openai_chat".into(),
+            model: "x".into(),
+            upstream: None,
+            upstream_model: None,
+            upstreams: vec![
+                UpstreamRef {
+                    name: "eco".into(),
+                    model: "eco-real".into(),
+                },
+                UpstreamRef {
+                    name: "std".into(),
+                    model: "std-real".into(),
+                },
+            ],
+            reasoning_effort: None,
+            anthropic_beta: None,
+            retry: RetryConfig::default(),
+            breaker: BreakerConfig::default(),
+            min_tier: Some(Tier::Standard),
+            max_cost_usd: None,
+        });
+        validate(&cfg).expect("chain has std which meets min_tier=standard");
+    }
+
+    #[test]
+    fn reload_allows_tier_change() {
+        // Rule 18 (Plan 06 P03): tier is reloadable, not immutable.
+        let cfg = cfg_with_one_oai_upstream(1.0, 2.0, Tier::Standard);
+        let baseline = baseline_from(&cfg);
+        let mut candidate = cfg.clone();
+        if let UpstreamConfig::OpenAiCompatible(c) = candidate.upstreams.get_mut("m").unwrap() {
+            c.tier = Tier::Premium;
+        }
+        validate_for_reload(&candidate, &baseline).expect("tier change must be reloadable");
+    }
+
+    #[test]
+    fn reload_rejects_tier_change_that_breaks_rule_17() {
+        // Reload re-runs validate(candidate). If the tier drop makes the
+        // route's min_tier unsatisfiable, rule 17 must fire on reload too.
+        let mut cfg = cfg_with_one_oai_upstream(1.0, 2.0, Tier::Premium);
+        cfg.routes[0].min_tier = Some(Tier::Premium);
+        let baseline = baseline_from(&cfg);
+
+        let mut candidate = cfg.clone();
+        if let UpstreamConfig::OpenAiCompatible(c) = candidate.upstreams.get_mut("m").unwrap() {
+            c.tier = Tier::Economy; // breaks min_tier=Premium
+        }
+        let err = validate_for_reload(&candidate, &baseline).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReloadValidationError::StartupError(ValidationError::ImpossibleMinTier { .. })
+            ),
+            "expected StartupError(ImpossibleMinTier), got {err:?}"
+        );
     }
 }
