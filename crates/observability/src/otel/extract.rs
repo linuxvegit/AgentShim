@@ -66,6 +66,10 @@ impl<'a> Injector for HeaderMapInjector<'a> {
 /// arrived without a `traceparent` header and no internal span attached
 /// one), the propagator writes nothing and this is a no-op. No 5xx is
 /// ever produced from injection failure.
+///
+/// `TraceContextPropagator` is constructed per call. It is effectively a
+/// unit struct (no allocation, no state), so caching it behind a
+/// `OnceLock` would add complexity without a measurable win.
 pub fn inject_context_into_headers(headers: &mut http::HeaderMap) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     let cx = tracing::Span::current().context();
@@ -173,8 +177,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn inject_writes_traceparent_when_parent_set() {
+    #[test]
+    fn inject_writes_traceparent_when_parent_set() {
         use opentelemetry::trace::TracerProvider as _;
         use opentelemetry_sdk::testing::trace::InMemorySpanExporter;
         use opentelemetry_sdk::trace::TracerProvider;
@@ -217,5 +221,36 @@ mod tests {
             tp.contains("0af7651916cd43dd8448eb211c80319c"),
             "outbound trace_id must match inbound; got: {tp}"
         );
+    }
+
+    /// Fail-open coverage (spec §6.4): if the propagator ever tries to
+    /// `set` a malformed HTTP header name or value, the injector must
+    /// silently drop it rather than panic or surface an error. Today's
+    /// `TraceContextPropagator` only emits well-formed
+    /// `traceparent`/`tracestate`, so this path is unreachable in practice,
+    /// but the test pins the contract: observability is diagnostic, never
+    /// an admission gate.
+    #[test]
+    fn injector_silently_drops_malformed_pairs() {
+        let mut h = http::HeaderMap::new();
+        {
+            let mut injector = HeaderMapInjector(&mut h);
+            // Bad header NAME: spaces are not valid in HTTP token chars.
+            injector.set("invalid header name with space", "v".to_string());
+            // Bad header VALUE: control characters / CRLF are rejected.
+            injector.set("x-test", "value\r\nwith-crlf".to_string());
+        }
+        assert!(
+            h.is_empty(),
+            "malformed name/value pairs must be dropped silently; got {:?}",
+            h
+        );
+
+        // Sanity: a well-formed pair still goes through.
+        {
+            let mut injector = HeaderMapInjector(&mut h);
+            injector.set("x-test", "ok".to_string());
+        }
+        assert_eq!(h.get("x-test").map(|v| v.as_bytes()), Some(&b"ok"[..]));
     }
 }

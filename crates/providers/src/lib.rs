@@ -8,6 +8,11 @@ pub mod oai_chat_wire;
 pub mod openai_compatible;
 
 pub mod http_client;
+/// Re-export the wrapped HTTP client so the gateway binary can build a
+/// provider through `http_client::build` without taking a direct dependency
+/// on the module path. Plan 06 P01 T2 — all v0.6 providers hold this type
+/// instead of a raw `reqwest::Client` so outbound W3C `traceparent` is
+/// auto-injected on `post`/`get`/`delete`.
 pub use http_client::ProviderHttpClient;
 
 use std::collections::BTreeMap;

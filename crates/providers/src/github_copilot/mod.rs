@@ -57,6 +57,10 @@ impl CopilotProvider {
     pub fn spawn(credential_path: PathBuf) -> Result<Self, ProviderError> {
         let http = Self::build_http_client()?;
 
+        // Auth-discovery hop — spec D8 carve-out: outbound `traceparent` is
+        // intentionally NOT injected on Copilot OAuth token refresh.
+        // `CopilotTokenManager` holds a bare `reqwest::Client`, so we hand
+        // it the inner client via the escape hatch.
         let manager = CopilotTokenManager::new_lazy(http.inner().clone(), credential_path);
 
         Ok(Self {
@@ -87,6 +91,7 @@ impl CopilotProvider {
     ) -> Result<Self, ProviderError> {
         let http = Self::build_http_client()?;
 
+        // Auth-discovery hop — spec D8 carve-out (see [`spawn`]).
         let manager = CopilotTokenManager::new(http.inner().clone(), creds, base_url);
 
         Ok(Self {
@@ -276,6 +281,9 @@ impl BackendProvider for CopilotProvider {
 
     async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
         let token = self.manager.get().await?;
+        // Discovery hop — spec D8 carve-out: outbound `traceparent` is
+        // intentionally NOT injected on `models.list`. The escape hatch
+        // hands `models::list_models` a bare `&reqwest::Client`.
         let models = models::list_models(self.http.inner(), &token).await?;
         if models.is_empty() {
             return Ok(None);

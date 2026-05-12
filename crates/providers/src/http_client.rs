@@ -69,11 +69,18 @@ pub struct ProviderHttpClient {
 impl ProviderHttpClient {
     /// Wrap an existing `reqwest::Client`. Internal — external callers
     /// should go through [`build`].
-    pub(crate) fn from_inner(inner: reqwest::Client) -> Self {
+    fn from_inner(inner: reqwest::Client) -> Self {
         Self { inner }
     }
 
     /// Start a POST request to `url` with `traceparent` auto-injected.
+    ///
+    /// **Merge semantics:** the wrapper seeds the request with a `HeaderMap`
+    /// (`.headers(...)`) holding `traceparent`/`tracestate`. Subsequent
+    /// `.header(name, val)` calls by providers *append* (reqwest's
+    /// `HeaderMap::append`), they do NOT replace by name. Do not pass
+    /// `traceparent`/`tracestate` to `.header(...)` afterwards — that would
+    /// produce duplicate headers, not a replacement.
     pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
         let mut headers = reqwest::header::HeaderMap::new();
         inject_context_into_headers(&mut headers);
@@ -81,6 +88,8 @@ impl ProviderHttpClient {
     }
 
     /// Start a GET request to `url` with `traceparent` auto-injected.
+    ///
+    /// See [`post`](Self::post) for header merge semantics.
     pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
         let mut headers = reqwest::header::HeaderMap::new();
         inject_context_into_headers(&mut headers);
@@ -89,6 +98,8 @@ impl ProviderHttpClient {
 
     /// Start a DELETE request with `traceparent` auto-injected.
     /// Included for symmetry — none of the v0.6 providers use DELETE today.
+    ///
+    /// See [`post`](Self::post) for header merge semantics.
     #[allow(dead_code)]
     pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -97,10 +108,15 @@ impl ProviderHttpClient {
     }
 
     /// Escape hatch: return the inner `reqwest::Client` for code paths
-    /// that build their own `RequestBuilder` shape (e.g. `multipart`).
-    /// Outbound `traceparent` will NOT be auto-injected on requests
-    /// constructed this way — callers must handle it themselves.
-    pub fn inner(&self) -> &reqwest::Client {
+    /// that build their own `RequestBuilder` shape (e.g. `multipart`) or
+    /// for crates that hold an owned `reqwest::Client` (e.g. the Copilot
+    /// `CopilotTokenManager` and `models::list_models` — see spec D8
+    /// "auth/discovery carve-out"). Outbound `traceparent` will NOT be
+    /// auto-injected on requests constructed this way.
+    ///
+    /// Scoped to the providers crate so no external crate can accidentally
+    /// bypass trace injection on a primary request path.
+    pub(crate) fn inner(&self) -> &reqwest::Client {
         &self.inner
     }
 }
