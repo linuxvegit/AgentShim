@@ -110,6 +110,9 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
     }
 }
 
@@ -118,7 +121,7 @@ async fn spawn_gateway(
     b_url: &str,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let cfg = make_config(a_url, b_url);
-    let state = AppState::new(cfg).await;
+    let (state, _reload_rx) = AppState::new(cfg).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

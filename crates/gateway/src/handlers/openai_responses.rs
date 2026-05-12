@@ -14,7 +14,7 @@ pub async fn handle(
     body: Bytes,
 ) -> Result<Response, HandlerError> {
     let spec = PipelineSpec {
-        frontend: state.openai_responses.as_ref(),
+        frontend: state.core.openai_responses.as_ref(),
         endpoint_label: "/v1/responses",
         capture_anthropic_headers: false,
         try_proxy_raw: true,

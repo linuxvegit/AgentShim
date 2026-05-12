@@ -180,3 +180,81 @@ start. Common errors:
 See [`config/gateway.example.yaml`](../config/gateway.example.yaml) for
 a complete annotated example covering DeepSeek, Anthropic, Gemini, and
 Copilot upstreams plus their respective Tier-1 routes.
+
+## Admin listener (v0.5+)
+
+Optional. When the `admin:` block is absent, no admin listener is bound
+and no observability endpoints are exposed.
+
+```yaml
+admin:
+  bind: 127.0.0.1   # default
+  port: 9100        # default
+```
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `admin.bind` | string | `127.0.0.1` | Listen address for /metrics, /healthz, /readyz, /admin/reload |
+| `admin.port` | u16 | `9100` | Listen port |
+
+The admin listener serves `/metrics` (Prometheus text format),
+`/healthz` (liveness), `/readyz` (readiness — providers initialized,
+`AppSnapshot` populated), and `POST /admin/reload` (config reload). See
+[`docs/observability.md`](observability.md) for the operator guide.
+
+## OpenTelemetry (v0.5+)
+
+```yaml
+otel:
+  endpoint: http://otel-collector:4317   # absent → no export
+  service_name: agent-shim
+  sample_ratio: 1.0
+  resource_attrs:
+    deployment.environment: prod
+```
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `otel.endpoint` | string | (none) | OTLP/gRPC collector. Absent → no export, spans local-only |
+| `otel.service_name` | string | `agent-shim` | OTel resource attribute |
+| `otel.service_version` | string | (none) | OTel resource attribute |
+| `otel.sample_ratio` | f64 | `1.0` | Head-sample ratio, parent-based |
+| `otel.resource_attrs` | map<string, string> | `{}` | Additional OTel resource attributes |
+
+When `otel.endpoint` is absent the OTel layer is omitted; spans still
+flow through the existing fmt subscriber so `RUST_LOG` enter/exit
+events keep working in development. Inbound W3C `traceparent` headers
+are honored regardless of whether export is configured.
+
+**Outbound `traceparent` propagation onto upstream HTTP calls is
+deferred to v0.6.** See `docs/observability.md` "What's NOT in v0.5"
+and spec §4.3 for context.
+
+## Reload-validation rules (v0.5+)
+
+The reload path runs additional rules beyond startup validation:
+
+| Rule | Description |
+| --- | --- |
+| 11 | Every route's upstream must be declared in the running upstreams set. |
+| 12 | Adding/removing entries in `upstreams.*` is forbidden. |
+| 13 | `server.bind`, `server.port`, `admin.bind`, `admin.port` are immutable. |
+| 14 | `otel.endpoint` is immutable. Other `otel.*` fields can change. |
+
+Reload requests violating rules 11-14 return HTTP 403; rules 1-10
+violations return HTTP 400. See ADR-0005 for the layering rationale and
+`docs/observability.md` for the operator-facing reload guide.
+
+### Observability behavior on reload
+
+- **Routes, retry/breaker/rate-limit policies, auth keys + flags,
+  logging filter, and most `otel.*` fields** swap atomically via
+  `arc-swap`.
+- **Breaker state is preserved across reload** — only policy
+  (thresholds, windows, cooldowns) updates. Empirical signal about
+  unhealthy upstreams survives.
+- **Rate-limit bucket changes are inert in v0.5.** `LimiterRegistry`
+  lives on the immutable `AppCore`; a reload that changes
+  `rate_limit.*` has no effect on running buckets until the process
+  restarts. v0.6 candidate. See ADR-0005 §3 and
+  `docs/observability.md` for details.

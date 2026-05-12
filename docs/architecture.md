@@ -126,6 +126,36 @@ ADR-0003 was a bounded one-time exception in Phase 3. All five Phase 4
 plan files declared `core changes: NONE`, and `git diff v0.3.0..v0.4.0
 -- crates/core/` is empty for the v0.4.0 release tag.
 
+## Observability layer (v0.5)
+
+Three subsystems, all running concurrently with each request, all
+optional:
+
+- **Prometheus metrics** — `agent_shim_*` counters/histograms via
+  `metrics-rs`, scraped from `/metrics` on the admin port.
+- **OpenTelemetry tracing** — `gateway.request` root span, child spans
+  for `route.resolve`, `auth.verify`, `rate_limit.check`,
+  `provider.complete`, `retry.attempt`, `stream.encode`. Exported via
+  OTLP/gRPC when `otel.endpoint` is configured.
+- **Hot-reload** — `arc-swap`-backed `AppSnapshot` swap on SIGHUP or
+  POST /admin/reload. Validates rules 11-14 against the running
+  `AppCore` baseline before swap. ADR-0005.
+
+The boundary between immutable lifecycle state (`AppCore`, itself
+`#[derive(Clone)]` so the reload-applying task can fork a handle
+alongside the gateway server) and hot-swappable policy state
+(`AppSnapshot`) is the architectural seam that makes hot-reload
+tractable. See ADR-0005.
+
+### Performance overhead targets (v0.5 additions over v0.4)
+
+| Subsystem | Per-request cost (export disabled) | Per-request cost (export enabled) |
+| --- | --- | --- |
+| Metrics counter increment | < 5µs | (same) |
+| OTel span allocation | < 10µs | < 25µs |
+| ArcSwap snapshot read | < 100ns | (same) |
+| Reload validation (50-route config) | n/a | < 100ms |
+
 ## Capability gate
 
 Plan 04 added a capability gate at the gateway boundary. It runs after route

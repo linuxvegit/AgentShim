@@ -7,4 +7,7 @@ pub mod validation;
 pub use loader::{load_from_path, ConfigError};
 pub use schema::*;
 pub use secrets::Secret;
-pub use validation::{validate, validate_routes, ValidationError};
+pub use validation::{
+    validate, validate_for_reload, validate_routes, ReloadBaseline, ReloadDiff,
+    ReloadValidationError, ValidationError,
+};

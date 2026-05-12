@@ -13,6 +13,7 @@ use agent_shim_providers::{BackendProvider, ProviderError};
 use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::SeedableRng;
+use tracing::Instrument;
 
 use crate::fallback::{fallback_eligibility_with_overrides, FallbackEligibility};
 
@@ -60,6 +61,19 @@ pub fn compute_backoff<R: Rng>(attempt: u32, policy: &RetryPolicy, rng: &mut R) 
     Duration::from_millis(final_ms)
 }
 
+/// Outcome of a [`retry_with_policy`] call. Carries the realized attempt
+/// count alongside the result so callers (today: `ResilientCaller`) can
+/// record the count on tracing spans without re-deriving it from
+/// `policy.max_attempts` (which is the upper bound, not the truth).
+///
+/// `attempts` is the 1-indexed count of provider calls made: 1 on
+/// first-try success, ≥1 on every error path (terminal, exhausted,
+/// budget overrun). Always within `1..=policy.max_attempts`.
+pub struct RetryOutcome {
+    pub result: Result<CanonicalStream, ProviderError>,
+    pub attempts: u32,
+}
+
 /// Drive a single `provider.complete()` call under the supplied retry policy.
 ///
 /// On success: returns Ok(stream) on the first attempt that succeeds.
@@ -78,13 +92,19 @@ pub fn compute_backoff<R: Rng>(attempt: u32, policy: &RetryPolicy, rng: &mut R) 
 ///
 /// This helper is **single-upstream**. Plan 02's `ResilientCaller` walks
 /// the chain across multiple upstreams.
+///
+/// Returns [`RetryOutcome`] carrying both the result and the realized
+/// attempt count. The result is the value that used to be returned bare;
+/// the count exposes the actual number of provider calls made (1 on
+/// first-try success; ≥1 on every error path) so callers can record it
+/// on tracing spans without conflating it with `policy.max_attempts`.
 pub async fn retry_with_policy(
     provider: Arc<dyn BackendProvider>,
     target: BackendTarget,
     req: CanonicalRequest,
     policy: &RetryPolicy,
     request_id: &str,
-) -> Result<CanonicalStream, ProviderError> {
+) -> RetryOutcome {
     let mut rng = SmallRng::from_entropy();
     let mut attempt: u32 = 1;
     let mut total_elapsed_ms: u64 = 0;
@@ -93,13 +113,34 @@ pub async fn retry_with_policy(
         // Clone-per-attempt: BackendProvider::complete consumes the request.
         // Acceptable while retries are rare; revisit with Arc<CanonicalRequest>
         // if profiling shows clone cost in the hot path.
-        match provider.complete(req.clone(), target.clone()).await {
-            Ok(stream) => return Ok(stream),
+        //
+        // Plan 03 P03 T3: each provider call is wrapped in a `retry.attempt`
+        // child span. The span attribute uses the i64 form to match the
+        // semantic-convention numeric typing used in OTel attribute exports.
+        let attempt_span = tracing::info_span!(
+            "retry.attempt",
+            "agent_shim.attempt" = attempt as i64,
+            "agent_shim.upstream" = %target.provider,
+        );
+        match provider
+            .complete(req.clone(), target.clone())
+            .instrument(attempt_span)
+            .await
+        {
+            Ok(stream) => {
+                return RetryOutcome {
+                    result: Ok(stream),
+                    attempts: attempt,
+                };
+            }
             Err(e) => {
                 if fallback_eligibility_with_overrides(&e, &policy.retry_on)
                     == FallbackEligibility::Terminal
                 {
-                    return Err(e);
+                    return RetryOutcome {
+                        result: Err(e),
+                        attempts: attempt,
+                    };
                 }
                 if attempt >= policy.max_attempts {
                     break e;
@@ -121,6 +162,16 @@ pub async fn retry_with_policy(
                     total_elapsed_ms = total_elapsed_ms,
                     "retrying provider call after eligible error"
                 );
+                // TODO(plan-05): thread a `route_label` (frontend/model) param
+                // when middleware-level plumbing lands; for now the route
+                // label is empty.
+                metrics::counter!(
+                    crate::metric_names::RETRY_ATTEMPTS_TOTAL,
+                    "route" => String::new(),
+                    "upstream" => target.provider.to_string(),
+                    "attempt" => attempt.to_string(),
+                )
+                .increment(1);
                 tokio::time::sleep(backoff).await;
                 total_elapsed_ms += backoff_ms;
                 attempt += 1;
@@ -138,7 +189,17 @@ pub async fn retry_with_policy(
         last_error = %last_err,
         "retry budget exhausted"
     );
-    Err(last_err)
+    // TODO(plan-05): thread a `route_label` param when available.
+    metrics::counter!(
+        crate::metric_names::RETRY_EXHAUSTED_TOTAL,
+        "route" => String::new(),
+        "upstream" => target.provider.to_string(),
+    )
+    .increment(1);
+    RetryOutcome {
+        result: Err(last_err),
+        attempts: attempt,
+    }
 }
 
 #[cfg(test)]
@@ -366,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn retry_with_policy_succeeds_on_first_attempt() {
         let provider = Arc::new(MockProvider::new(vec![MockOutcome::Ok]));
-        let result = retry_with_policy(
+        let outcome = retry_with_policy(
             provider.clone(),
             dummy_target(),
             dummy_request(),
@@ -374,7 +435,8 @@ mod tests {
             "test-req",
         )
         .await;
-        assert!(result.is_ok());
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.attempts, 1);
         assert_eq!(provider.calls(), 1);
     }
 
@@ -384,7 +446,7 @@ mod tests {
             MockOutcome::upstream(502, "bad"),
             MockOutcome::Ok,
         ]));
-        let result = retry_with_policy(
+        let outcome = retry_with_policy(
             provider.clone(),
             dummy_target(),
             dummy_request(),
@@ -392,7 +454,8 @@ mod tests {
             "test-req",
         )
         .await;
-        assert!(result.is_ok());
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.attempts, 2);
         assert_eq!(provider.calls(), 2);
     }
 
@@ -402,7 +465,7 @@ mod tests {
             MockOutcome::upstream(401, "auth"),
             MockOutcome::Ok, // would-be "never reached"
         ]));
-        let result = retry_with_policy(
+        let outcome = retry_with_policy(
             provider.clone(),
             dummy_target(),
             dummy_request(),
@@ -411,9 +474,10 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            result,
+            outcome.result,
             Err(ProviderError::Upstream { status: 401, .. })
         ));
+        assert_eq!(outcome.attempts, 1);
         assert_eq!(provider.calls(), 1);
     }
 
@@ -424,7 +488,7 @@ mod tests {
             MockOutcome::upstream(502, "bad"),
             MockOutcome::upstream(502, "bad"),
         ]));
-        let result = retry_with_policy(
+        let outcome = retry_with_policy(
             provider.clone(),
             dummy_target(),
             dummy_request(),
@@ -433,9 +497,10 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            result,
+            outcome.result,
             Err(ProviderError::Upstream { status: 502, .. })
         ));
+        assert_eq!(outcome.attempts, 3);
         assert_eq!(provider.calls(), 3);
     }
 
@@ -455,7 +520,7 @@ mod tests {
             MockOutcome::upstream(502, "bad"),
             MockOutcome::upstream(502, "bad"),
         ]));
-        let result = retry_with_policy(
+        let outcome = retry_with_policy(
             provider.clone(),
             dummy_target(),
             dummy_request(),
@@ -464,9 +529,10 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            result,
+            outcome.result,
             Err(ProviderError::Upstream { status: 502, .. })
         ));
+        assert_eq!(outcome.attempts, 1);
         assert_eq!(provider.calls(), 1);
     }
 }

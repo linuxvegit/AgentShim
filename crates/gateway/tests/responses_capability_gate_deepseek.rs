@@ -33,7 +33,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_gateway::server::build_router;
-use agent_shim_gateway::state::AppState;
+use agent_shim_gateway::state::{AppCore, AppSnapshot, AppState};
 use agent_shim_providers::{
     BackendProvider, ProviderCapabilities, ProviderError, ProviderRegistry,
 };
@@ -134,6 +134,9 @@ fn make_app_state() -> AppState {
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
     };
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));
     let model_index = Arc::new(ModelIndex::new(Default::default()));
@@ -167,18 +170,30 @@ fn make_app_state() -> AppState {
     ));
 
     AppState {
-        config: Arc::new(cfg),
-        anthropic,
-        openai,
-        openai_responses,
-        providers,
-        resolver,
-        resilient_caller,
-        breaker_registry,
-        limiter_registry,
-        auth_enabled: false,
-        auth_required: false,
-        configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+        core: Arc::new(AppCore {
+            config_path: None,
+            server_config: cfg.server.clone(),
+            admin_config: cfg.admin.clone(),
+            anthropic,
+            openai,
+            openai_responses,
+            providers,
+            resolver,
+            resilient_caller,
+            breaker_registry,
+            limiter_registry,
+            metrics: agent_shim_observability::install_metrics(&Default::default()),
+            // The test bypasses AppState::new so the channel sender has
+            // no real consumer; that's fine because this test never
+            // triggers a reload. Plan 04 P04 T2.
+            reload_tx: tokio::sync::mpsc::channel(1).0,
+        }),
+        snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
+            config: Arc::new(cfg),
+            auth_enabled: false,
+            auth_required: false,
+            configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+        }))),
     }
 }
 

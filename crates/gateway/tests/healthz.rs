@@ -13,6 +13,9 @@ fn minimal_config() -> GatewayConfig {
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
     }
 }
 
@@ -22,7 +25,7 @@ async fn healthz_returns_200_ok() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let state = AppState::new(minimal_config()).await;
+    let (state, _reload_rx) = AppState::new(minimal_config()).await;
 
     // Spawn the server in the background; send shutdown immediately after test.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -37,14 +40,18 @@ async fn healthz_returns_200_ok() {
     // Give the server a moment to start.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let url = format!("http://{}/healthz", addr);
+    // Plan 01 P01 T3: /healthz moved to the admin listener. The public
+    // root "/" still returns "ok" for backwards-compat probes — assert
+    // against that here. T5 will add admin-port integration tests for
+    // /healthz proper.
+    let url = format!("http://{}/", addr);
     let resp = reqwest::Client::builder()
         .build()
         .unwrap()
         .get(&url)
         .send()
         .await
-        .expect("request to /healthz failed");
+        .expect("request to / failed");
 
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();

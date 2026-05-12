@@ -16,6 +16,16 @@ tower-http.workspace = true
 tower.workspace = true
 http = "1"
 uuid.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+prometheus-parse.workspace = true
+axum = { workspace = true, features = ["macros"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }

@@ -19,6 +19,14 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     pub copilot: Option<CopilotConfig>,
+    /// Optional admin listener. When `None`, no admin endpoints are
+    /// exposed and no second listener is bound. Plan 01 P01.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub otel: Option<OtelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +58,97 @@ impl Default for ServerConfig {
             bind: default_bind(),
             port: default_port(),
             keepalive_secs: default_keepalive(),
+        }
+    }
+}
+
+/// Admin/operator HTTP listener — distinct from the request-serving listener
+/// (`server.*`). Hosts /metrics, /healthz, /readyz, and /admin/reload.
+///
+/// **Absent → admin listener is disabled entirely.** No default values are
+/// applied; operators opt in by including the `admin:` block in their
+/// gateway YAML. This is the conservative default: a fresh v0.5 binary
+/// upgraded from v0.4 has no exposed admin surface unless the operator
+/// adds the block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+    #[serde(default = "default_admin_port")]
+    pub port: u16,
+}
+
+fn default_admin_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_admin_port() -> u16 {
+    9100
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_admin_bind(),
+            port: default_admin_port(),
+        }
+    }
+}
+
+/// Prometheus metrics configuration. Plan 02 P02.
+///
+/// Currently only exposes per-metric histogram bucket overrides. The
+/// metrics surface itself is wired in T2 (recorder install + /metrics
+/// handler); this struct just lands the schema field so callsites can
+/// reference `config.metrics.histogram_buckets` from T2 onwards.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Per-metric-name histogram bucket overrides. Keys are metric names
+    /// (e.g. `"agent_shim_request_duration_seconds"` or the bare suffix
+    /// `"request_duration_seconds"` — both forms accepted; the bare form
+    /// gets the `agent_shim_` prefix prepended at install time).
+    /// Absent → exporter defaults (Prometheus's standard duration buckets).
+    #[serde(default)]
+    pub histogram_buckets: BTreeMap<String, Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtelConfig {
+    /// OTLP/gRPC collector endpoint. `None` → spans created locally,
+    /// not exported. Spec D4.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    #[serde(default)]
+    pub service_version: Option<String>,
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+    /// Operator-supplied resource attributes (e.g. deployment.environment,
+    /// cloud.region). Merged into the OTel `Resource` on init.
+    #[serde(default)]
+    pub resource_attrs: BTreeMap<String, String>,
+}
+
+fn default_service_name() -> String {
+    "agent-shim".to_string()
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            service_name: default_service_name(),
+            service_version: None,
+            sample_ratio: default_sample_ratio(),
+            resource_attrs: BTreeMap::new(),
         }
     }
 }
@@ -670,5 +769,109 @@ default_headers:
         // template — must continue to deserialize under the new schema.
         let yaml = include_str!("../../../config/gateway.minimal.yaml");
         let _cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("v0.3 minimal parses");
+    }
+
+    #[test]
+    fn admin_config_block_parses() {
+        let yaml = r#"
+admin:
+  bind: 127.0.0.1
+  port: 9100
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let admin = cfg.admin.expect("admin block present");
+        assert_eq!(admin.bind, "127.0.0.1");
+        assert_eq!(admin.port, 9100);
+    }
+
+    #[test]
+    fn admin_config_absent_means_disabled() {
+        let yaml = "server: {bind: 127.0.0.1, port: 8787}";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert!(cfg.admin.is_none(), "admin must be None when block absent");
+    }
+
+    #[test]
+    fn admin_config_empty_block_uses_defaults() {
+        let yaml = r#"
+admin: {}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let admin = cfg.admin.expect("admin block present");
+        assert_eq!(admin.bind, "127.0.0.1");
+        assert_eq!(admin.port, 9100);
+    }
+
+    #[test]
+    fn admin_config_partial_block_uses_field_defaults() {
+        let yaml = r#"
+admin:
+  port: 9200
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let admin = cfg.admin.expect("admin block present");
+        assert_eq!(
+            admin.bind, "127.0.0.1",
+            "bind should fall back to default when omitted"
+        );
+        assert_eq!(admin.port, 9200);
+    }
+
+    #[test]
+    fn metrics_config_defaults() {
+        let yaml = "server: {bind: 127.0.0.1, port: 8787}";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert!(cfg.metrics.histogram_buckets.is_empty());
+    }
+
+    #[test]
+    fn metrics_config_custom_buckets() {
+        let yaml = r#"
+metrics:
+  histogram_buckets:
+    request_duration_seconds: [0.1, 0.5, 1.0, 5.0]
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let buckets = cfg
+            .metrics
+            .histogram_buckets
+            .get("request_duration_seconds")
+            .unwrap();
+        assert_eq!(buckets, &vec![0.1, 0.5, 1.0, 5.0]);
+    }
+
+    #[test]
+    fn otel_config_absent_means_disabled() {
+        let yaml = "server: {bind: 127.0.0.1, port: 8787}";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        assert!(cfg.otel.is_none());
+    }
+
+    #[test]
+    fn otel_config_with_endpoint() {
+        let yaml = r#"
+otel:
+  endpoint: http://otel-collector:4317
+  service_name: gw
+  sample_ratio: 0.5
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let otel = cfg.otel.expect("present");
+        assert_eq!(otel.endpoint.as_deref(), Some("http://otel-collector:4317"));
+        assert_eq!(otel.service_name, "gw");
+        assert_eq!(otel.sample_ratio, 0.5);
+        assert!(otel.resource_attrs.is_empty());
+    }
+
+    #[test]
+    fn otel_config_defaults() {
+        let yaml = r#"
+otel: {}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
+        let otel = cfg.otel.expect("present");
+        assert!(otel.endpoint.is_none(), "default endpoint should be None");
+        assert_eq!(otel.service_name, "agent-shim");
+        assert_eq!(otel.sample_ratio, 1.0);
     }
 }

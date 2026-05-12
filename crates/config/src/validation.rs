@@ -15,6 +15,60 @@ pub enum ValidationError {
     InvalidUpstream(String, String),
     #[error("invalid route: {0}")]
     InvalidRoute(String),
+    #[error("admin.port {admin} collides with server.port {server} on bind {bind}")]
+    PortCollision {
+        admin: u16,
+        server: u16,
+        bind: String,
+    },
+}
+
+/// What "baseline" means for reload validation. Built from the running
+/// `AppCore` and passed to [`validate_for_reload`]. Spec §5.5 rules
+/// 11-14.
+#[derive(Debug, Clone)]
+pub struct ReloadBaseline {
+    /// Names of upstreams declared at startup. Reload may not add or
+    /// remove entries (rule 12).
+    pub upstream_names: std::collections::BTreeSet<String>,
+    /// Server bind/port at startup; immutable across reload (rule 13).
+    pub server: crate::schema::ServerConfig,
+    /// Admin block at startup; immutable across reload (rule 13).
+    pub admin: Option<crate::schema::AdminConfig>,
+    /// OTel endpoint at startup; immutable across reload (rule 14).
+    pub otel_endpoint: Option<String>,
+}
+
+/// Summary returned on successful validation. Used to render the
+/// /admin/reload response (spec §5.6).
+#[derive(Debug, Clone, Default)]
+pub struct ReloadDiff {
+    pub routes_total: usize,
+    pub routes_added: usize,
+    pub routes_removed: usize,
+    pub routes_modified: usize,
+    pub policies_changed: Vec<String>,
+    pub auth_keys_added: usize,
+    pub auth_keys_removed: usize,
+    pub warnings: Vec<String>,
+}
+
+/// New error variants used only by reload validation.
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadValidationError {
+    #[error("upstreams.* set changed: added={added:?}, removed={removed:?}")]
+    UpstreamSetChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+    #[error("immutable field changed: {field}: {old} → {new}")]
+    ImmutableFieldChanged {
+        field: &'static str,
+        old: String,
+        new: String,
+    },
+    #[error("startup validation error: {0}")]
+    StartupError(#[from] ValidationError),
 }
 
 const VALID_FRONTENDS: &[&str] = &[
@@ -55,6 +109,28 @@ fn upstream_is_configured(cfg: &GatewayConfig, name: &str) -> bool {
 pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
     if cfg.server.port == 0 {
         return Err(ValidationError::ZeroPort);
+    }
+
+    if let Some(admin) = &cfg.admin {
+        if admin.port == 0 {
+            return Err(ValidationError::ZeroPort);
+        }
+        if admin.port == cfg.server.port && admin.bind == cfg.server.bind {
+            return Err(ValidationError::PortCollision {
+                admin: admin.port,
+                server: cfg.server.port,
+                bind: admin.bind.clone(),
+            });
+        }
+    }
+
+    if let Some(otel) = &cfg.otel {
+        if !(0.0..=1.0).contains(&otel.sample_ratio) {
+            return Err(ValidationError::InvalidRoute(format!(
+                "otel.sample_ratio {} must be in [0.0, 1.0]",
+                otel.sample_ratio
+            )));
+        }
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -413,6 +489,106 @@ fn check_sha256_key(key: &str, ctx: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reload-time validation. Called BY the reload path only; startup uses
+/// [`validate`]. Applies rules 1-10 (via `validate`) plus rules 11-14:
+///
+/// - Rule 11: every route's upstream is declared in the baseline.
+/// - Rule 12: candidate.upstreams keys equal baseline.upstream_names.
+/// - Rule 13: server.* and admin.* fields equal baseline values.
+/// - Rule 14: otel.endpoint equals baseline.otel_endpoint.
+pub fn validate_for_reload(
+    candidate: &crate::schema::GatewayConfig,
+    baseline: &ReloadBaseline,
+) -> Result<ReloadDiff, ReloadValidationError> {
+    // Rule 13: immutable server/admin
+    if candidate.server.bind != baseline.server.bind {
+        return Err(ReloadValidationError::ImmutableFieldChanged {
+            field: "server.bind",
+            old: baseline.server.bind.clone(),
+            new: candidate.server.bind.clone(),
+        });
+    }
+    if candidate.server.port != baseline.server.port {
+        return Err(ReloadValidationError::ImmutableFieldChanged {
+            field: "server.port",
+            old: baseline.server.port.to_string(),
+            new: candidate.server.port.to_string(),
+        });
+    }
+    match (&baseline.admin, &candidate.admin) {
+        (Some(b), Some(c)) => {
+            if b.bind != c.bind {
+                return Err(ReloadValidationError::ImmutableFieldChanged {
+                    field: "admin.bind",
+                    old: b.bind.clone(),
+                    new: c.bind.clone(),
+                });
+            }
+            if b.port != c.port {
+                return Err(ReloadValidationError::ImmutableFieldChanged {
+                    field: "admin.port",
+                    old: b.port.to_string(),
+                    new: c.port.to_string(),
+                });
+            }
+        }
+        (None, Some(_)) => {
+            return Err(ReloadValidationError::ImmutableFieldChanged {
+                field: "admin",
+                old: "absent".into(),
+                new: "present".into(),
+            });
+        }
+        (Some(_), None) => {
+            return Err(ReloadValidationError::ImmutableFieldChanged {
+                field: "admin",
+                old: "present".into(),
+                new: "absent".into(),
+            });
+        }
+        (None, None) => {}
+    }
+
+    // Rule 14: immutable otel.endpoint (other otel.* fields can change)
+    let candidate_endpoint = candidate.otel.as_ref().and_then(|o| o.endpoint.clone());
+    if candidate_endpoint != baseline.otel_endpoint {
+        return Err(ReloadValidationError::ImmutableFieldChanged {
+            field: "otel.endpoint",
+            old: format!("{:?}", baseline.otel_endpoint),
+            new: format!("{:?}", candidate_endpoint),
+        });
+    }
+
+    // Rule 12: upstream set unchanged
+    let candidate_names: std::collections::BTreeSet<String> =
+        candidate.upstreams.keys().cloned().collect();
+    let added: Vec<String> = candidate_names
+        .difference(&baseline.upstream_names)
+        .cloned()
+        .collect();
+    let removed: Vec<String> = baseline
+        .upstream_names
+        .difference(&candidate_names)
+        .cloned()
+        .collect();
+    if !added.is_empty() || !removed.is_empty() {
+        return Err(ReloadValidationError::UpstreamSetChanged { added, removed });
+    }
+
+    // Rules 1-10 (and Rule 11 implicitly via the existing
+    // `validate_routes`/`UnknownUpstream` check).
+    validate(candidate)?;
+
+    // Build a minimal diff. Detailed diffing (which routes were added/
+    // removed) is left as a future improvement; for v0.5 we report the
+    // route count only.
+    let diff = ReloadDiff {
+        routes_total: candidate.routes.len(),
+        ..ReloadDiff::default()
+    };
+    Ok(diff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +605,9 @@ mod tests {
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             copilot: None,
+            admin: None,
+            metrics: Default::default(),
+            otel: None,
         }
     }
 
@@ -1162,5 +1341,203 @@ routes:
         assert!(!cfg.auth.enabled);
         assert!(!cfg.auth.required);
         assert!(!cfg.rate_limit.enabled);
+    }
+
+    // ── Plan 01 P01 T1: admin port validation ──────────────────────────────
+
+    fn minimal_cfg() -> crate::GatewayConfig {
+        serde_yaml::from_str("server: {bind: 127.0.0.1, port: 8787}").unwrap()
+    }
+
+    #[test]
+    fn admin_port_zero_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.admin = Some(crate::AdminConfig {
+            bind: "127.0.0.1".into(),
+            port: 0,
+        });
+        assert!(matches!(validate(&cfg), Err(ValidationError::ZeroPort)));
+    }
+
+    #[test]
+    fn admin_port_equal_to_server_port_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.admin = Some(crate::AdminConfig {
+            bind: cfg.server.bind.clone(),
+            port: cfg.server.port,
+        });
+        match validate(&cfg) {
+            Err(ValidationError::PortCollision {
+                admin,
+                server,
+                bind,
+            }) => {
+                assert_eq!(admin, cfg.server.port);
+                assert_eq!(server, cfg.server.port);
+                assert_eq!(bind, cfg.server.bind);
+            }
+            other => panic!("expected PortCollision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_port_different_bind_or_port_ok() {
+        let mut cfg = minimal_cfg();
+        cfg.admin = Some(crate::AdminConfig {
+            bind: "127.0.0.1".into(),
+            port: 9100,
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn otel_sample_ratio_out_of_range_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.otel = Some(crate::OtelConfig {
+            sample_ratio: 1.5,
+            ..Default::default()
+        });
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn otel_sample_ratio_in_range_ok() {
+        let mut cfg = minimal_cfg();
+        cfg.otel = Some(crate::OtelConfig {
+            sample_ratio: 0.5,
+            ..Default::default()
+        });
+        assert!(validate(&cfg).is_ok());
+    }
+
+    // ── Plan 04 P04 T1: validate_for_reload (rules 11-14) ───────────────────
+
+    fn baseline_from(cfg: &GatewayConfig) -> ReloadBaseline {
+        ReloadBaseline {
+            upstream_names: cfg.upstreams.keys().cloned().collect(),
+            server: cfg.server.clone(),
+            admin: cfg.admin.clone(),
+            otel_endpoint: cfg.otel.as_ref().and_then(|o| o.endpoint.clone()),
+        }
+    }
+
+    #[test]
+    fn reload_rejects_changed_server_port() {
+        let yaml = r#"
+server: {bind: 127.0.0.1, port: 8787}
+upstreams:
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+routes:
+  - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let baseline = baseline_from(&cfg);
+        let mut candidate = cfg.clone();
+        candidate.server.port = 9999;
+        let err = validate_for_reload(&candidate, &baseline).unwrap_err();
+        assert!(matches!(
+            err,
+            ReloadValidationError::ImmutableFieldChanged {
+                field: "server.port",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reload_rejects_added_upstream() {
+        let yaml = r#"
+server: {bind: 127.0.0.1, port: 8787}
+upstreams:
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+routes:
+  - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let baseline = baseline_from(&cfg);
+        let mut candidate = cfg.clone();
+        candidate.upstreams.insert(
+            "n".into(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+                base_url: "http://y/v1".into(),
+                api_key: Secret::new("b"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 120,
+            }),
+        );
+        let err = validate_for_reload(&candidate, &baseline).unwrap_err();
+        assert!(matches!(
+            err,
+            ReloadValidationError::UpstreamSetChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn reload_accepts_route_change_with_same_upstreams() {
+        let yaml = r#"
+server: {bind: 127.0.0.1, port: 8787}
+upstreams:
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+routes:
+  - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let baseline = baseline_from(&cfg);
+        let mut candidate = cfg.clone();
+        // Add a second route alias pointing at the same upstream — fine.
+        candidate.routes.push(RouteEntry {
+            frontend: "openai_chat".into(),
+            model: "y".into(),
+            upstream: Some("m".into()),
+            upstream_model: Some("y-real".into()),
+            upstreams: vec![],
+            retry: Default::default(),
+            breaker: Default::default(),
+            reasoning_effort: None,
+            anthropic_beta: None,
+        });
+        let diff = validate_for_reload(&candidate, &baseline).expect("ok");
+        assert_eq!(diff.routes_total, 2);
+    }
+
+    #[test]
+    fn reload_accepts_otel_sample_ratio_change() {
+        let yaml = r#"
+server: {bind: 127.0.0.1, port: 8787}
+otel: {endpoint: "http://c:4317", sample_ratio: 1.0}
+upstreams:
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+routes:
+  - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let baseline = baseline_from(&cfg);
+        let mut candidate = cfg.clone();
+        candidate.otel.as_mut().unwrap().sample_ratio = 0.5;
+        let _diff = validate_for_reload(&candidate, &baseline).expect("ok");
+    }
+
+    #[test]
+    fn reload_rejects_otel_endpoint_change() {
+        let yaml = r#"
+server: {bind: 127.0.0.1, port: 8787}
+otel: {endpoint: "http://c:4317"}
+upstreams:
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+routes:
+  - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        let baseline = baseline_from(&cfg);
+        let mut candidate = cfg.clone();
+        candidate.otel.as_mut().unwrap().endpoint = Some("http://other:4317".into());
+        let err = validate_for_reload(&candidate, &baseline).unwrap_err();
+        assert!(matches!(
+            err,
+            ReloadValidationError::ImmutableFieldChanged {
+                field: "otel.endpoint",
+                ..
+            }
+        ));
     }
 }

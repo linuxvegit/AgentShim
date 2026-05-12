@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends", "crates/protocol-tests", "crates/providers", "crates/router"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
@@ -24,6 +24,7 @@ futures-util = "0.3"
 parking_lot = "0.12"
 tokio-stream = { version = "0.1", features = ["time"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs", "time"] }
+tokio-util = "0.7"
 axum = { version = "0.7", features = ["macros", "tokio", "http1"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "request-id", "cors"] }
@@ -33,8 +34,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["yaml", "env"] }
 anyhow = "1"
+arc-swap = "1"
 async-trait = "0.1"
 pretty_assertions = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip"] }
 eventsource-stream = "0.2"
 mockito = "1"
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+opentelemetry = "0.24"
+opentelemetry_sdk = "0.24"
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.25"
+prometheus-parse = "0.2"

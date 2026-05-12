@@ -66,8 +66,157 @@ pub async fn dispatch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HandlerError> {
+    // Plan 03 P03 T3: root `gateway.request` span wrapping the dispatch
+    // body. Fields with `tracing::field::Empty` are filled in once route +
+    // identity are resolved.
+    //
+    // Plan 03 P03 T3 followup (IMPORTANT-1): the body is wrapped in
+    // `async move { ... }.instrument(root_span).await` rather than held
+    // open with `root_span.enter()`. Holding a `tracing::Entered` guard
+    // across `.await` points is the documented anti-pattern — on the
+    // multi-threaded runtime, child spans created after a suspension
+    // point may not parent under the root correctly. `.instrument(...)`
+    // attaches the span to the future's poll loop instead, which is
+    // task-aware.
+    //
+    // `root_for_record` is a separate handle kept outside the instrumented
+    // block so we can `record(...)` `http.response.status_code` and
+    // `agent_shim.status_class` after the body returns. Recording fires
+    // a span event (or attribute update) on the same span; the
+    // `record` API does not require the span to be entered.
+    let frontend_label = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+
+    // Plan 03 P03 T3 followup (IMPORTANT-4): generate a fresh request_id
+    // here so it can be stamped on the root span. This matches the same
+    // documented compromise used by `ResilientCaller::complete` — until
+    // middleware-level plumbing lands, we generate a UUID at the pipeline
+    // entry so operators see a stable id correlating with the resilience
+    // events emitted downstream.
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    let root_span = tracing::info_span!(
+        "gateway.request",
+        "http.request.method" = "POST",
+        "http.route" = spec.endpoint_label,
+        "agent_shim.frontend" = frontend_label,
+        "agent_shim.request_id" = %request_id,
+        "agent_shim.route" = tracing::field::Empty,
+        "agent_shim.identity" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "agent_shim.status_class" = tracing::field::Empty,
+    );
+
+    // Plan 03 P03 T4 followup: attach any inbound W3C `traceparent`
+    // context to the freshly-created root span. The tower-layer shape
+    // attempted previously was broken because `Span::current()` at the
+    // layer call site is `Span::none()` — the per-request span hadn't
+    // been created yet. Here we own the root span, so `set_parent` has
+    // a real target. Malformed/missing headers yield an empty context
+    // and `set_parent` is a safe no-op.
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let parent_ctx = agent_shim_observability::extract_context_from_headers(&headers);
+        root_span.set_parent(parent_ctx);
+    }
+
+    let root_for_record = root_span.clone();
+    use tracing::Instrument;
+    let result =
+        async move { dispatch_inner(state, spec, headers, body, root_for_record.clone()).await }
+            .instrument(root_span.clone())
+            .await;
+
+    // Plan 03 P03 T3 followup (IMPORTANT-3): record the HTTP status class
+    // on the root span before it closes. `Ok(Response)` carries the
+    // axum-level status (200 for streaming; 200 or 4xx/5xx for unary).
+    // `Err(HandlerError)` is rendered to an HTTP status via the
+    // `IntoResponse` impl downstream; we can't observe the final wire
+    // status here without round-tripping through that impl, so we
+    // approximate via the error variant. The exact wire status is also
+    // available on the metrics middleware's `agent_shim_status_class`
+    // label, so the operator-facing data is not lost.
+    let (status_code, status_class): (u16, &'static str) = match &result {
+        Ok(resp) => {
+            let s = resp.status().as_u16();
+            (s, status_class_for(s))
+        }
+        Err(e) => {
+            // Best-effort: map the variant to a representative status code.
+            // The middleware records the exact wire status; this is just
+            // for the trace span's operator-visible class.
+            let s = handler_error_status_hint(e);
+            (s, status_class_for(s))
+        }
+    };
+    root_span.record("http.response.status_code", status_code as i64);
+    root_span.record("agent_shim.status_class", status_class);
+    result
+}
+
+/// Map an HTTP status code to its `agent_shim.status_class` label.
+fn status_class_for(status: u16) -> &'static str {
+    match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+/// Best-effort hint for the wire status that the `IntoResponse` impl
+/// will emit for a given [`HandlerError`]. Used only to set the root
+/// span's `agent_shim.status_class` when dispatch returns `Err(_)`; the
+/// metrics middleware records the exact wire status on its own labels.
+fn handler_error_status_hint(e: &HandlerError) -> u16 {
+    use agent_shim_providers::ProviderError;
+    use agent_shim_router::RouteError;
+    match e {
+        HandlerError::Route(RouteError::NoRoute { .. }) => 404,
+        HandlerError::Unauthorized { .. } => 401,
+        HandlerError::CapabilityMismatch { .. } => 400,
+        HandlerError::Frontend(agent_shim_frontends::FrontendError::InvalidBody(_)) => 400,
+        HandlerError::Frontend(agent_shim_frontends::FrontendError::Unsupported(_)) => 422,
+        HandlerError::Frontend(_) => 400,
+        HandlerError::Provider(ProviderError::Upstream { status, .. }) => *status,
+        HandlerError::Provider(_) => 502,
+        HandlerError::NoUpstreamSucceeded { .. } | HandlerError::AllBreakersOpen { .. } => 503,
+        HandlerError::RateLimited { .. } => 429,
+        HandlerError::TerminalUpstream {
+            error: ProviderError::Upstream { status, .. },
+            ..
+        } => *status,
+        HandlerError::TerminalUpstream { .. } => 502,
+    }
+}
+
+/// Body of [`dispatch`], pulled into a separate async fn so the parent can
+/// wrap it with `.instrument(root_span)` rather than holding an `Entered`
+/// guard across `.await` (Plan 03 P03 T3 followup, IMPORTANT-1).
+async fn dispatch_inner(
+    state: &AppState,
+    spec: PipelineSpec<'_>,
+    headers: HeaderMap,
+    body: Bytes,
+    root_span: tracing::Span,
+) -> Result<Response, HandlerError> {
     let body_bytes = body.len();
     let started = std::time::Instant::now();
+
+    // Plan 01 P01 T2: capture the policy snapshot once. In-flight requests
+    // use this snapshot for their entire lifetime; mid-request reload (Plan
+    // 04) does not affect them.
+    let snapshot = state.snapshot.load_full();
+
+    let frontend_label = match spec.frontend.kind() {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
 
     // Resolve the route up front. The Responses passthrough path needs the
     // target before it has decoded the body, so route resolution has to come
@@ -102,60 +251,96 @@ pub async fn dispatch(
     // routes exist. When `auth.enabled = false` we skip extraction —
     // identity is always Anonymous and the rate-limit registry is
     // separately gated by its own `enabled=false` short-circuit.
-    let identity = if state.auth_enabled {
-        let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
-        let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-        let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
+    //
+    // Plan 03 P03 T3: wrap the auth gate in an `auth.verify` child span.
+    let identity = {
+        let _auth_span = tracing::info_span!("auth.verify").entered();
+        if snapshot.auth_enabled {
+            let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
+            let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+            let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
 
-        if state.auth_required {
-            match &extracted {
-                AgentIdentity::Anonymous => {
-                    tracing::warn!(
-                        endpoint = spec.endpoint_label,
-                        "auth.required=true but request had no Authorization or x-api-key header"
-                    );
-                    return Err(HandlerError::Unauthorized {
-                        kind: spec.frontend.kind(),
-                    });
-                }
-                AgentIdentity::KeyHash(h) => {
-                    // Non-constant-time compare on already-hashed values
-                    // is fine: the hash itself is not a secret, so timing
-                    // leaks reveal nothing about the original key bytes.
-                    if !state.configured_key_hashes.contains(h) {
-                        // Operator log carries the hash (NEVER plaintext) so
-                        // a misconfigured client can be tracked down without
-                        // leaking the secret.
+            if snapshot.auth_required {
+                match &extracted {
+                    AgentIdentity::Anonymous => {
                         tracing::warn!(
                             endpoint = spec.endpoint_label,
-                            presented_hash = %h,
-                            "auth.required=true but presented key not in auth.keys allowlist"
+                            "auth.required=true but request had no Authorization or x-api-key header"
                         );
                         return Err(HandlerError::Unauthorized {
                             kind: spec.frontend.kind(),
                         });
                     }
+                    AgentIdentity::KeyHash(h) => {
+                        // Non-constant-time compare on already-hashed values
+                        // is fine: the hash itself is not a secret, so timing
+                        // leaks reveal nothing about the original key bytes.
+                        if !snapshot.configured_key_hashes.contains(h) {
+                            // Operator log carries the hash (NEVER plaintext) so
+                            // a misconfigured client can be tracked down without
+                            // leaking the secret.
+                            tracing::warn!(
+                                endpoint = spec.endpoint_label,
+                                presented_hash = %h,
+                                "auth.required=true but presented key not in auth.keys allowlist"
+                            );
+                            return Err(HandlerError::Unauthorized {
+                                kind: spec.frontend.kind(),
+                            });
+                        }
+                    }
                 }
             }
+            extracted
+        } else {
+            AgentIdentity::Anonymous
         }
-        extracted
-    } else {
-        AgentIdentity::Anonymous
     };
 
-    let chain = state
-        .resolver
-        .resolve(spec.frontend.kind(), &model_alias)
-        .map_err(|e| {
-            tracing::warn!(model = %model_alias, error = %e, "no route");
-            HandlerError::Route(e)
-        })?;
+    // Plan 03 P03 T3: record identity on the root span. Uses the same
+    // anonymous / sha256-hash form as the resilience-event logs so
+    // operators can correlate across span attributes and event fields.
+    let identity_str = match &identity {
+        AgentIdentity::Anonymous => "anonymous",
+        AgentIdentity::KeyHash(h) => h.as_str(),
+    };
+    root_span.record("agent_shim.identity", identity_str);
+
+    // Plan 03 P03 T3: `route.resolve` child span wrapping the resolver call.
+    let chain = {
+        let _span = tracing::info_span!("route.resolve").entered();
+        state
+            .core
+            .resolver
+            .resolve(spec.frontend.kind(), &model_alias)
+            .map_err(|e| {
+                tracing::warn!(model = %model_alias, error = %e, "no route");
+                HandlerError::Route(e)
+            })?
+    };
+
+    // Plan 03 P03 T3: now that route is resolved, record it on the root.
+    root_span.record("agent_shim.route", model_alias.as_str());
+
+    // Plan 02 P02 T5: emit a route-labeled counter parallel to the
+    // middleware's `route="unknown"` counter. Operators query either
+    // depending on whether they care about pre-resolution failures
+    // (404 routes) or post-resolution traffic. The `.increment(0)`
+    // registers the label set in /metrics without skewing the count.
+    metrics::counter!(
+        agent_shim_observability::metrics::names::REQUESTS_TOTAL,
+        "frontend" => frontend_label,
+        "route" => model_alias.clone(),
+        "status_class" => "pending",
+    )
+    .increment(0);
 
     // Plan 04 P02 D2: route-level retry block governs every chain element
     // uniformly. Build one `RetryPolicy` and clone it per chain position so
     // `ResilientCaller::complete` can apply it independently to each
     // upstream's retry budget.
     let route_retry_config = match state
+        .core
         .resolver
         .find_retry_policy(spec.frontend.kind(), &model_alias)
     {
@@ -176,6 +361,7 @@ pub async fn dispatch(
     // retry policies. Falls back to `BreakerConfig::default()` (the §4.5/D6
     // defaults) when the route doesn't override.
     let route_breaker_config = match state
+        .core
         .resolver
         .find_breaker_policy(spec.frontend.kind(), &model_alias)
     {
@@ -229,12 +415,16 @@ pub async fn dispatch(
         .clone();
     let upstream_model = first_target.model.clone();
 
-    let first_provider = state.providers.get(&first_target.provider).ok_or_else(|| {
-        tracing::error!(provider = %first_target.provider, "provider not registered");
-        HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-            first_target.provider.clone(),
-        ))
-    })?;
+    let first_provider = state
+        .core
+        .providers
+        .get(&first_target.provider)
+        .ok_or_else(|| {
+            tracing::error!(provider = %first_target.provider, "provider not registered");
+            HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
+                first_target.provider.clone(),
+            ))
+        })?;
 
     // Raw-passthrough short-circuit: only the Responses frontend uses this.
     // We don't know reasoning_effort etc. without decoding the body, so log
@@ -479,6 +669,7 @@ async fn run_stream(
     // `CanonicalStream` from whichever upstream succeeded; downstream
     // encoding is unchanged from the pre-T6 single-upstream world.
     let upstream_stream = state
+        .core
         .resilient_caller
         .complete(
             chain,
@@ -522,7 +713,14 @@ async fn run_stream(
         });
 
         let canonical_stream: CanonicalStream = Box::pin(logging_stream);
-        let frontend_response = spec.frontend.encode_stream(canonical_stream);
+        // Plan 03 P03 T3: `stream.encode` span around the frontend's stream
+        // encoder. The span guard drops before the response is returned —
+        // the actual byte-streaming work happens inside the axum body
+        // afterward, outside this span.
+        let frontend_response = {
+            let _encode_span = tracing::info_span!("stream.encode").entered();
+            spec.frontend.encode_stream(canonical_stream)
+        };
 
         match frontend_response {
             FrontendResponse::Stream {
@@ -546,7 +744,11 @@ async fn run_stream(
         }
     } else {
         // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        let frontend_response = spec.frontend.encode_stream(upstream_stream);
+        // Plan 03 P03 T3: `stream.encode` span around the encoder.
+        let frontend_response = {
+            let _encode_span = tracing::info_span!("stream.encode").entered();
+            spec.frontend.encode_stream(upstream_stream)
+        };
         tracing::info!(
             "← {} (stream) | model: {} → {} | {:.1}s",
             label,
@@ -582,6 +784,7 @@ async fn run_unary(
     } = ctx;
 
     let stream = state
+        .core
         .resilient_caller
         .complete(
             chain,

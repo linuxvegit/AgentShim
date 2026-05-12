@@ -40,6 +40,7 @@ use std::time::Instant;
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
 use agent_shim_providers::{BackendProvider, ProviderError};
+use tracing::Instrument;
 
 use crate::errors::{ResilienceError, TriedUpstream};
 use crate::fallback::{fallback_eligibility_with_overrides, FallbackEligibility};
@@ -214,10 +215,19 @@ impl ResilientCaller {
         // buckets are consulted before any breaker decision or provider
         // lookup. A rejection here is request-scoped (not chain-element
         // scoped) so we never enter the chain walk.
-        if let Err((dim, retry_after_secs)) =
+        //
+        // Plan 03 P03 T3 followup: wrap the pre-chain gate in a
+        // `rate_limit.check` child span per spec §4.1. The span guard
+        // drops immediately after the check; per-upstream rate-limit
+        // checks inside the chain loop don't need a separate span (the
+        // dimension label on the `rate_limit.rejected` event already
+        // distinguishes pre-chain from per-upstream).
+        let pre_chain_result = {
+            let _rl_span = tracing::info_span!("rate_limit.check").entered();
             self.limiters
                 .check_pre_chain(identity, frontend_model, client_ip)
-        {
+        };
+        if let Err((dim, retry_after_secs)) = pre_chain_result {
             tracing::warn!(
                 target: "agent_shim::resilience",
                 event_name = "rate_limit.rejected",
@@ -227,6 +237,11 @@ impl ResilientCaller {
                 retry_after_secs = retry_after_secs,
                 "rate limit exceeded (pre-chain)"
             );
+            metrics::counter!(
+                crate::metric_names::RATE_LIMIT_REJECTED_TOTAL,
+                "dimension" => dimension_label(dim),
+            )
+            .increment(1);
             return Err(ResilienceError::RateLimited {
                 dimension: dim,
                 retry_after_secs,
@@ -311,6 +326,11 @@ impl ResilientCaller {
                     upstream = %target.provider,
                     "rate limit exceeded (per-upstream); not falling back"
                 );
+                metrics::counter!(
+                    crate::metric_names::RATE_LIMIT_REJECTED_TOTAL,
+                    "dimension" => dimension_label(dim),
+                )
+                .increment(1);
                 return Err(ResilienceError::RateLimited {
                     dimension: dim,
                     retry_after_secs,
@@ -318,10 +338,31 @@ impl ResilientCaller {
             }
 
             let started = Instant::now();
+            // Plan 03 P03 T3: `provider.complete` child span wrapping the
+            // per-chain-element retry loop. `attempts` is recorded after the
+            // call so the span carries the final attempt count regardless of
+            // success/failure. `fallback_position` is the 0-indexed chain
+            // position — 0 for the primary upstream, ≥1 for fallbacks.
+            let provider_span = tracing::info_span!(
+                "provider.complete",
+                "agent_shim.upstream" = %target.provider,
+                "agent_shim.model" = %target.model,
+                "agent_shim.attempts" = tracing::field::Empty,
+                "agent_shim.fallback_position" = i as i64,
+            );
             // retry_with_policy returns Err on retry exhaustion OR terminal.
-            let result =
-                retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id).await;
+            // Plan 03 P03 T3 followup: `RetryOutcome` carries the realized
+            // attempt count so the span attribute reflects the actual number
+            // of provider calls made, not `policy.max_attempts` (the upper
+            // bound).
+            let outcome =
+                retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id)
+                    .instrument(provider_span.clone())
+                    .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
+            provider_span.record("agent_shim.attempts", outcome.attempts as i64);
+            let result = outcome.result;
+            let realized_attempts = outcome.attempts;
 
             match result {
                 Ok(stream) => {
@@ -345,8 +386,7 @@ impl ResilientCaller {
                     tried.push(TriedUpstream {
                         provider: target.provider.clone(),
                         model: target.model.clone(),
-                        attempts: rpolicy.max_attempts, // upper bound; real count
-                        // is logged by retry loop
+                        attempts: realized_attempts,
                         last_error_tag: tag.to_string(),
                         last_error_msg: e.to_string(),
                         elapsed_ms,
@@ -372,6 +412,15 @@ impl ResilientCaller {
                             reason = "retry_exhausted",
                             "falling back to next upstream"
                         );
+                        // TODO(plan-05): thread a `route_label` param when
+                        // available; empty string for now.
+                        metrics::counter!(
+                            crate::metric_names::FALLBACK_TRANSITIONS_TOTAL,
+                            "route" => String::new(),
+                            "from_upstream" => target.provider.clone(),
+                            "to_upstream" => chain[i + 1].provider.clone(),
+                        )
+                        .increment(1);
                     }
                     last_error = Some(e);
                     // continue to chain[i+1]

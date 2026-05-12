@@ -21,9 +21,15 @@ tokio = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
 sha2 = "0.10"
 uuid = { workspace = true }
+metrics.workspace = true
 
 [dev-dependencies]
+agent-shim-observability = { path = "../observability" }
 proptest = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+tracing-subscriber = { workspace = true }
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["testing"] }
+tracing-opentelemetry = "0.25"

@@ -1,7 +1,10 @@
+mod admin;
 mod cli;
 mod commands;
 mod handlers;
+mod metrics_layer;
 mod pipeline;
+mod reload_trigger;
 mod server;
 mod shutdown;
 mod state;
