@@ -59,10 +59,7 @@ async fn retry_attempt_span_created_per_attempt() {
     }
 
     let names = capture.names.lock().unwrap().clone();
-    assert_eq!(
-        names.iter().filter(|n| *n == "retry.attempt").count(),
-        3
-    );
+    assert_eq!(names.iter().filter(|n| *n == "retry.attempt").count(), 3);
 }
 
 /// Plan 03 P03 T5: in-memory exporter test for the gateway request
@@ -101,8 +98,7 @@ async fn span_tree_has_required_attributes() {
             );
             let _pe = provider_span.enter();
             for n in 1..=2u32 {
-                let s =
-                    tracing::info_span!("retry.attempt", "agent_shim.attempt" = n as i64);
+                let s = tracing::info_span!("retry.attempt", "agent_shim.attempt" = n as i64);
                 let _e = s.enter();
             }
         }

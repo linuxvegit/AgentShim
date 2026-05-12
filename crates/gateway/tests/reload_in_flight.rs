@@ -45,11 +45,9 @@ routes:
     let state_for_task = state.clone();
     tokio::spawn(async move {
         while let Some(req) = reload_rx.recv().await {
-            let outcome = agent_shim_gateway::commands::serve::handle_reload(
-                &state_for_task,
-                req.source,
-            )
-            .await;
+            let outcome =
+                agent_shim_gateway::commands::serve::handle_reload(&state_for_task, req.source)
+                    .await;
             let _ = req.respond_to.send(outcome);
         }
     });
@@ -89,7 +87,10 @@ routes:
         .unwrap();
     let outcome = rx.await.unwrap();
     assert!(
-        matches!(outcome, agent_shim_gateway::reload_trigger::ReloadOutcome::Ok(_)),
+        matches!(
+            outcome,
+            agent_shim_gateway::reload_trigger::ReloadOutcome::Ok(_)
+        ),
         "reload must succeed for same-yaml input",
     );
 

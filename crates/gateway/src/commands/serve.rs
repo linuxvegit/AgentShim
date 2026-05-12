@@ -47,15 +47,14 @@ pub async fn run(config_path: &Path) -> Result<()> {
     {
         let reload_tx = state.core.reload_tx.clone();
         tokio::spawn(async move {
-            let mut sig = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::hangup(),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to install SIGHUP handler");
-                    return;
-                }
-            };
+            let mut sig =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to install SIGHUP handler");
+                        return;
+                    }
+                };
             while sig.recv().await.is_some() {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
                 let _ = reload_tx
@@ -123,9 +122,7 @@ pub async fn handle_reload(
                 Err(e) => return ReloadOutcome::Io(e.to_string()),
             },
             None => {
-                return ReloadOutcome::Io(
-                    "no config path; SIGHUP can't re-read".into(),
-                );
+                return ReloadOutcome::Io("no config path; SIGHUP can't re-read".into());
             }
         },
     };
@@ -184,10 +181,7 @@ pub async fn handle_reload(
                 "{field}: {old} → {new} forbidden (restart required)"
             ))
         }
-        Err(agent_shim_config::ReloadValidationError::UpstreamSetChanged {
-            added,
-            removed,
-        }) => {
+        Err(agent_shim_config::ReloadValidationError::UpstreamSetChanged { added, removed }) => {
             metrics::counter!(
                 agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
                 "result" => "immutable_field",

@@ -10,7 +10,10 @@ fn router_metric_names_match_observability() {
     // The router emits these names; they must match observability's.
     let pairs: &[(&str, &str)] = &[
         ("agent_shim_retry_attempts_total", obs::RETRY_ATTEMPTS_TOTAL),
-        ("agent_shim_retry_exhausted_total", obs::RETRY_EXHAUSTED_TOTAL),
+        (
+            "agent_shim_retry_exhausted_total",
+            obs::RETRY_EXHAUSTED_TOTAL,
+        ),
         (
             "agent_shim_fallback_transitions_total",
             obs::FALLBACK_TRANSITIONS_TOTAL,

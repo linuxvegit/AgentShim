@@ -832,7 +832,11 @@ metrics:
     request_duration_seconds: [0.1, 0.5, 1.0, 5.0]
 "#;
         let cfg: GatewayConfig = serde_yaml::from_str(yaml).expect("parses");
-        let buckets = cfg.metrics.histogram_buckets.get("request_duration_seconds").unwrap();
+        let buckets = cfg
+            .metrics
+            .histogram_buckets
+            .get("request_duration_seconds")
+            .unwrap();
         assert_eq!(buckets, &vec![0.1, 0.5, 1.0, 5.0]);
     }
 

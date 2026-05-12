@@ -119,8 +119,7 @@ pub async fn dispatch(
     // and `set_parent` is a safe no-op.
     {
         use tracing_opentelemetry::OpenTelemetrySpanExt;
-        let parent_ctx =
-            agent_shim_observability::extract_context_from_headers(&headers);
+        let parent_ctx = agent_shim_observability::extract_context_from_headers(&headers);
         root_span.set_parent(parent_ctx);
     }
 
