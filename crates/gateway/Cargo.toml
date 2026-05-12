@@ -56,6 +56,13 @@ futures.workspace = true
 criterion = { version = "0.5", features = ["html_reports"] }
 prometheus-parse.workspace = true
 tempfile = "3"
+# Plan 01 P01 T4/T5: outbound-traceparent integration tests install a
+# minimal OTel-backed subscriber so root spans carry a valid OTel
+# context and `inject_context_into_headers` produces a `traceparent`.
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "gateway_overhead"

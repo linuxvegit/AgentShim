@@ -32,6 +32,8 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mockito",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "prometheus-parse",
  "reqwest",
@@ -46,6 +48,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
