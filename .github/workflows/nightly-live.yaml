@@ -39,14 +39,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      # Per-provider tests live in `crates/protocol-tests/tests/{anthropic,
-      # deepseek,gemini}_live.rs`. Each test should runtime-skip itself
-      # (eprintln + early return) when its API key env var is missing,
-      # so a tenant that hasn't provisioned all three secrets still gets
-      # signal from the ones that are wired up.
+      # Per-provider tests live in `crates/gateway/tests/{anthropic,deepseek,
+      # gemini}_live.rs`. Each test runtime-skips itself (eprintln + early
+      # return) when its API key env var is missing, so a tenant that hasn't
+      # provisioned all three secrets still gets signal from the ones that
+      # are wired up.
       - name: Run live tests
-        # The `live` feature is the build-time gate; AGENT_SHIM_E2E is the
-        # runtime gate. Both must be on for tests to actually fire. This
-        # belt-and-braces design keeps `cargo test --workspace` (default
-        # CI run) from accidentally calling out to billed APIs.
-        run: cargo nextest run --features live --test '*_live'
+        # The `live` feature on `agent-shim` (the gateway crate) is the
+        # build-time gate; AGENT_SHIM_E2E is the runtime gate. Both must be
+        # on for tests to actually fire. This belt-and-braces design keeps
+        # `cargo test --workspace` (default CI run) from accidentally
+        # calling out to billed APIs. `-p agent-shim` is required because
+        # this is a virtual workspace — an unqualified `--features` would
+        # error out with "feature `live` is required, but ... is a virtual
+        # manifest".
+        run: cargo nextest run -p agent-shim --features live --test '*_live'

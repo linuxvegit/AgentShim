@@ -13,6 +13,15 @@ path = "src/lib.rs"
 name = "agent-shim"
 path = "src/main.rs"
 
+[features]
+# Enables nightly live end-to-end tests that call real upstream APIs
+# (Anthropic, DeepSeek, Gemini). Compile-time gate: the `*_live.rs`
+# integration tests are entirely `#![cfg(feature = "live")]`, so the
+# default `cargo test --workspace` invocation never touches billed
+# endpoints. The CI nightly workflow is the only place this is enabled.
+# AGENT_SHIM_E2E + per-provider API keys are the runtime gate on top.
+live = []
+
 [dependencies]
 agent-shim-core = { path = "../core" }
 agent-shim-config = { path = "../config" }
