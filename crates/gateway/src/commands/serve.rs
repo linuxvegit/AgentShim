@@ -32,7 +32,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         let state_for_task = state.clone();
         tokio::spawn(async move {
             while let Some(req) = reload_rx.recv().await {
-                let outcome = handle_reload(&state_for_task, req.source).await;
+                let outcome = handle_reload_for_test(&state_for_task, req.source).await;
                 let _ = req.respond_to.send(outcome);
             }
         });
@@ -95,7 +95,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
 /// from the original startup config — so a future, looser policy on
 /// reload-time validation only has to update the baseline construction
 /// here, never the AppCore plumbing.
-async fn handle_reload(
+pub async fn handle_reload_for_test(
     state: &crate::state::AppState,
     source: crate::reload_trigger::ReloadSource,
 ) -> crate::reload_trigger::ReloadOutcome {

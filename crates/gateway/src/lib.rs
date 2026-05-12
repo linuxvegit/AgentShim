@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod commands;
 pub mod handlers;
 pub mod metrics_layer;
 pub mod pipeline;
