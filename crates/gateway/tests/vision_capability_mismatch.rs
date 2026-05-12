@@ -178,6 +178,8 @@ fn make_app_state() -> AppState {
         provider_lookup,
         Arc::clone(&breaker_registry),
         Arc::clone(&limiter_registry),
+        Arc::new(agent_shim_router::DisabledLatencyProbe)
+            as Arc<dyn agent_shim_router::LatencyProbe>,
     ));
 
     AppState {

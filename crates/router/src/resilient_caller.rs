@@ -52,11 +52,35 @@ pub trait ProviderLookup: Send + Sync {
     fn get(&self, provider: &str) -> Option<Arc<dyn BackendProvider>>;
 }
 
+/// Plan 06 P04 T4: inputs required by the cost filter when `complete()`
+/// is asked to run a pre-chain four-axis pass.
+///
+/// Bundled into a single optional struct so existing call sites (tests
+/// that build a `ResilientCaller` without any route/config context) can
+/// continue to pass `None` and get the v0.4 chain-walk semantics
+/// unchanged. The pipeline always supplies `Some(...)`.
+pub struct CostFilterInputs<'a> {
+    /// The matching route entry, source of `min_tier` and `max_cost_usd`.
+    pub route: &'a agent_shim_config::RouteEntry,
+    /// The full gateway config, used to look up per-upstream
+    /// `tier`/`cost`/`p95_latency_budget_ms`.
+    pub config: &'a agent_shim_config::GatewayConfig,
+    /// Stable label for `agent_shim_cost_filtered_total{route=...}`.
+    /// Pre-computed by the caller so all resilience metrics for one
+    /// request share a single string form (typically
+    /// `"<frontend>/<model>"`).
+    pub route_label: String,
+}
+
 /// The resilience-layer entry point.
 pub struct ResilientCaller {
     providers: Arc<dyn ProviderLookup>,
     breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
     limiters: Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>>,
+    /// Plan 06 P04 T4: latency observation source for the cost filter's
+    /// latency axis. Production wires `PrometheusLatencyProbe`; tests
+    /// that don't care about latency filtering pass `DisabledLatencyProbe`.
+    probe: Arc<dyn crate::latency_probe::LatencyProbe>,
 }
 
 impl ResilientCaller {
@@ -64,11 +88,13 @@ impl ResilientCaller {
         providers: Arc<dyn ProviderLookup>,
         breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
         limiters: Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>>,
+        probe: Arc<dyn crate::latency_probe::LatencyProbe>,
     ) -> Self {
         Self {
             providers,
             breakers,
             limiters,
+            probe,
         }
     }
 
@@ -93,8 +119,152 @@ impl ResilientCaller {
     /// per-element retry/breaker policies, and identity/IP/model for
     /// the rate-limit gates. Bundling them into a struct would just
     /// move the verbosity to the caller without buying anything.
+    ///
+    /// Plan 06 P04 T4: the cost-filter pre-pass is exposed via a
+    /// separate entry point [`Self::complete_with_cost_filter`]; this
+    /// method skips it, preserving v0.4 semantics for callers (notably
+    /// the unit tests in this module) that don't supply a `RouteEntry`
+    /// or `GatewayConfig`.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete(
+        &self,
+        chain: Vec<BackendTarget>,
+        req: CanonicalRequest,
+        retry_policies: Vec<RetryPolicy>,
+        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        identity: crate::auth::AgentIdentity,
+        client_ip: String,
+        frontend_model: String,
+    ) -> Result<CanonicalStream, ResilienceError> {
+        self.complete_inner_with_optional_filter(
+            chain,
+            req,
+            retry_policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+            None,
+        )
+        .await
+    }
+
+    /// Plan 06 P04 T4: `complete()` plus the four-axis cost filter
+    /// pre-pass. Skipped upstreams emit `agent_shim_cost_filtered_total`
+    /// counters; if every chain element is filtered, returns
+    /// [`ResilienceError::NoEligibleUpstream`] before any provider is
+    /// contacted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn complete_with_cost_filter(
+        &self,
+        chain: Vec<BackendTarget>,
+        req: CanonicalRequest,
+        retry_policies: Vec<RetryPolicy>,
+        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        identity: crate::auth::AgentIdentity,
+        client_ip: String,
+        frontend_model: String,
+        cost_inputs: CostFilterInputs<'_>,
+    ) -> Result<CanonicalStream, ResilienceError> {
+        self.complete_inner_with_optional_filter(
+            chain,
+            req,
+            retry_policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+            Some(cost_inputs),
+        )
+        .await
+    }
+
+    /// Shared body: optionally pre-filters the chain, then performs the
+    /// usual chain walk via [`Self::complete_inner`].
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_inner_with_optional_filter(
+        &self,
+        chain: Vec<BackendTarget>,
+        req: CanonicalRequest,
+        retry_policies: Vec<RetryPolicy>,
+        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        identity: crate::auth::AgentIdentity,
+        client_ip: String,
+        frontend_model: String,
+        cost_inputs: Option<CostFilterInputs<'_>>,
+    ) -> Result<CanonicalStream, ResilienceError> {
+        // Plan 06 P04 T4: cost filter pre-pass. Skip upstreams that
+        // don't meet the route's tier / latency / cost constraints.
+        // If the entire chain is filtered, return NoEligibleUpstream
+        // before any provider is contacted, before any rate-limit
+        // bucket is debited, and before the resilience `complete`
+        // summary is emitted.
+        let (chain, retry_policies, breaker_policies) = if let Some(ref ci) = cost_inputs {
+            let outcome = crate::cost_filter::filter_chain(
+                chain.clone(),
+                ci.route,
+                &req,
+                ci.config,
+                self.probe.as_ref(),
+            );
+            for skip in &outcome.skipped {
+                metrics::counter!(
+                    crate::metric_names::COST_FILTERED_TOTAL,
+                    "reason" => skip.reason.as_str(),
+                    "upstream" => skip.upstream.clone(),
+                    "route" => ci.route_label.clone(),
+                )
+                .increment(1);
+            }
+            for note in &outcome.notes {
+                metrics::counter!(
+                    crate::metric_names::COST_FILTERED_TOTAL,
+                    "reason" => note.reason.as_str(),
+                    "upstream" => note.upstream.clone(),
+                    "route" => ci.route_label.clone(),
+                )
+                .increment(1);
+            }
+            if outcome.survivors.is_empty() {
+                return Err(ResilienceError::NoEligibleUpstream {
+                    filtered: outcome.skipped,
+                });
+            }
+            // Re-align the per-position retry/breaker policy vectors
+            // with the surviving chain. The pipeline builds these as
+            // `vec![policy; chain.len()]` (uniform per route), so we
+            // truncate to the new length to keep the
+            // `debug_assert_eq!(chain.len(), retry_policies.len())`
+            // invariant in `complete_inner` holding.
+            let survivor_count = outcome.survivors.len();
+            let mut retry_policies = retry_policies;
+            let mut breaker_policies = breaker_policies;
+            retry_policies.truncate(survivor_count);
+            breaker_policies.truncate(survivor_count);
+            (outcome.survivors, retry_policies, breaker_policies)
+        } else {
+            (chain, retry_policies, breaker_policies)
+        };
+
+        self.complete_inner_summary(
+            chain,
+            req,
+            retry_policies,
+            breaker_policies,
+            identity,
+            client_ip,
+            frontend_model,
+        )
+        .await
+    }
+
+    /// Wrapper that emits the `request.completed` summary on every exit
+    /// path. Pulled out of `complete()` so the cost-filter wrapper can
+    /// short-circuit BEFORE the summary span is recorded (the summary
+    /// reports on attempted upstreams; a NoEligibleUpstream rejection
+    /// has none).
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_inner_summary(
         &self,
         chain: Vec<BackendTarget>,
         req: CanonicalRequest,
@@ -142,6 +312,7 @@ impl ResilientCaller {
             Err(ResilienceError::NoUpstreamSucceeded { .. }) => "no_upstream_succeeded",
             Err(ResilienceError::AllBreakersOpen { .. }) => "all_breakers_open",
             Err(ResilienceError::TerminalError { .. }) => "terminal_error",
+            Err(ResilienceError::NoEligibleUpstream { .. }) => "no_eligible_upstream",
         };
         let tried_summary: Vec<String> = match &result {
             Ok(_) => Vec::new(),
@@ -165,6 +336,7 @@ impl ResilientCaller {
                 .collect(),
             Err(ResilienceError::AllBreakersOpen { tried }) => tried.clone(),
             Err(ResilienceError::RateLimited { .. }) => Vec::new(),
+            Err(ResilienceError::NoEligibleUpstream { .. }) => Vec::new(),
         };
 
         if result.is_ok() {
@@ -504,6 +676,14 @@ mod tests {
         ))
     }
 
+    /// Plan 06 P04 T4: a probe handle for tests that don't exercise the
+    /// cost-filter latency axis. `complete()` skips the filter entirely,
+    /// so the probe is never consulted — but the new field still has to
+    /// be supplied to `ResilientCaller::new`.
+    fn disabled_probe() -> Arc<dyn crate::latency_probe::LatencyProbe> {
+        Arc::new(crate::latency_probe::DisabledLatencyProbe)
+    }
+
     /// Standard test identity — no real key in tests, so use Anonymous.
     /// Combined with `disabled_limiter()`, the pre-chain gate is a no-op
     /// regardless of identity, but the helper keeps call sites readable.
@@ -617,7 +797,8 @@ mod tests {
             )]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller = ResilientCaller::new(providers, registry, disabled_limiter());
+        let caller =
+            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a")];
         let policies = vec![fast_policy(2)];
         let result = caller
@@ -661,7 +842,8 @@ mod tests {
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller = ResilientCaller::new(providers, registry, disabled_limiter());
+        let caller =
+            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
         let policies = vec![fast_policy(2), fast_policy(2)];
         let result = caller
@@ -699,7 +881,8 @@ mod tests {
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller = ResilientCaller::new(providers, registry, disabled_limiter());
+        let caller =
+            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
         let policies = vec![fast_policy(2), fast_policy(2)];
         let result = caller
@@ -743,7 +926,8 @@ mod tests {
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller = ResilientCaller::new(providers, registry, disabled_limiter());
+        let caller =
+            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
         let policies = vec![fast_policy(2), fast_policy(2)];
         let result = caller
@@ -797,7 +981,8 @@ mod tests {
             BreakerDecision::Skip
         );
 
-        let caller = ResilientCaller::new(providers, registry, disabled_limiter());
+        let caller =
+            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
         let result = caller
             .complete(
@@ -838,7 +1023,8 @@ mod tests {
         for _ in 0..5 {
             registry.record("b", "gpt-4o", false, &policy);
         }
-        let caller = ResilientCaller::new(providers, registry, disabled_limiter());
+        let caller =
+            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
         let result = caller
             .complete(
@@ -911,7 +1097,7 @@ mod tests {
         }
 
         let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
-        let caller = ResilientCaller::new(providers, breakers, limiters);
+        let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
         let chain = vec![target("a")];
         let result = caller
             .complete(
@@ -973,7 +1159,7 @@ mod tests {
         let id = crate::auth::AgentIdentity::KeyHash("sha256:test_key_hash".to_string());
 
         let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
-        let caller = ResilientCaller::new(providers, breakers, limiters);
+        let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
         let chain = vec![target("a"), target("b")];
         let result = caller
             .complete(

@@ -50,6 +50,16 @@ pub enum ResilienceError {
         dimension: RateLimitDimension,
         retry_after_secs: u32,
     },
+
+    /// Plan 06 P04 T4: cost filter emptied the entire chain — every
+    /// candidate upstream was skipped on at least one of the
+    /// tier/latency/cap axes. The `filtered` list carries one
+    /// [`crate::cost_filter::Skip`] per rejected upstream so the
+    /// frontend can shape a 503 envelope per spec §6.3.
+    #[error("no eligible upstream after cost filter: {filtered:?}")]
+    NoEligibleUpstream {
+        filtered: Vec<crate::cost_filter::Skip>,
+    },
 }
 
 /// Which bucket dimension rejected the request.

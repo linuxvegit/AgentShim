@@ -30,6 +30,12 @@ pub const TOKENS_OUTPUT_TOTAL: &str = "agent_shim_tokens_output_total";
 // --- Reload (used by Plan 04) ---
 pub const CONFIG_RELOADS_TOTAL: &str = "agent_shim_config_reloads_total";
 
+// --- Cost-aware routing (Phase 6 P04) ---
+/// Plan 06 P04 T4: per-axis cost-filter skip/note counter.
+/// Labels: reason ∈ {tier, latency, cap, latency_unknown, tiktoken_fallback},
+///         upstream, route.
+pub const COST_FILTERED_TOTAL: &str = "agent_shim_cost_filtered_total";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +59,7 @@ mod tests {
             TOKENS_INPUT_TOTAL,
             TOKENS_OUTPUT_TOTAL,
             CONFIG_RELOADS_TOTAL,
+            COST_FILTERED_TOTAL,
         ];
         let set: std::collections::HashSet<&str> = all.iter().copied().collect();
         assert_eq!(set.len(), all.len(), "duplicate metric name");
@@ -76,6 +83,7 @@ mod tests {
             TOKENS_INPUT_TOTAL,
             TOKENS_OUTPUT_TOTAL,
             CONFIG_RELOADS_TOTAL,
+            COST_FILTERED_TOTAL,
         ];
         for name in all {
             assert!(name.starts_with("agent_shim_"), "{name} missing prefix");

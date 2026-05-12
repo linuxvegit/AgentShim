@@ -28,8 +28,8 @@ use agent_shim_core::{
 };
 use agent_shim_providers::{BackendProvider, ProviderCapabilities, ProviderError};
 use agent_shim_router::{
-    AgentIdentity, BreakerPolicy, BreakerRegistry, LimiterRegistry, ProviderLookup,
-    ResilientCaller, RetryPolicy,
+    AgentIdentity, BreakerPolicy, BreakerRegistry, DisabledLatencyProbe, LatencyProbe,
+    LimiterRegistry, ProviderLookup, ResilientCaller, RetryPolicy,
 };
 use async_trait::async_trait;
 use futures::stream;
@@ -150,6 +150,10 @@ fn disabled_limiter() -> Arc<arc_swap::ArcSwap<LimiterRegistry>> {
     Arc::new(arc_swap::ArcSwap::from_pointee(LimiterRegistry::disabled()))
 }
 
+fn disabled_probe() -> Arc<dyn LatencyProbe> {
+    Arc::new(DisabledLatencyProbe)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -174,7 +178,7 @@ async fn retry_attempt_event_has_standard_fields() {
         )]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter());
+    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
     let result = caller
         .complete(
             vec![target("openai")],
@@ -228,7 +232,7 @@ async fn fallback_transition_event_has_standard_fields() {
         ]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter());
+    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
     let result = caller
         .complete(
             vec![target("openai"), target("copilot")],
@@ -290,7 +294,7 @@ async fn breaker_state_change_event_emits_on_trip() {
     // required for the event — the event was already emitted on the 5th
     // record() call — but exercising the real path makes the test reflect
     // production behavior).
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter());
+    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
     let _ = caller
         .complete(
             vec![target("openai")],
@@ -350,7 +354,7 @@ async fn rate_limit_rejected_event_has_standard_fields() {
         )]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, limiters);
+    let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
     let result = caller
         .complete(
             vec![target("openai")],
@@ -380,7 +384,7 @@ async fn request_completed_event_emits_on_success() {
         )]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter());
+    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
     let result = caller
         .complete(
             vec![target("openai")],

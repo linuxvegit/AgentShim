@@ -71,6 +71,16 @@ pub enum HandlerError {
         dimension: RateLimitDimension,
         retry_after_secs: u32,
     },
+    /// Plan 06 P04 T4: cost filter rejected every upstream candidate.
+    /// HTTP 503. `filtered_count` is carried (rather than the full
+    /// `Skip` vec) because the envelope mapping today is operator-text
+    /// only; the structured `filtered:[{upstream, reason}]` JSON shape
+    /// in spec §6.3 is deferred to T6 integration tests.
+    #[error("no eligible upstream after cost filter ({filtered_count} candidates rejected)")]
+    NoEligibleUpstream {
+        kind: FrontendKind,
+        filtered_count: usize,
+    },
     /// `auth.required = true` and the inbound request had either no key
     /// at all or a key whose hash is not in `auth.keys`. HTTP 401. Plan
     /// 04 P04 T4 produces this; the `IntoResponse` impl shapes a
@@ -112,6 +122,10 @@ impl HandlerError {
                 dimension,
                 retry_after_secs,
             },
+            ResilienceError::NoEligibleUpstream { filtered } => HandlerError::NoEligibleUpstream {
+                kind,
+                filtered_count: filtered.len(),
+            },
         }
     }
 }
@@ -148,6 +162,15 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
                 "code": "all_breakers_open",
             }
         }),
+        HandlerError::NoEligibleUpstream { filtered_count, .. } => json!({
+            "error": {
+                "message": format!(
+                    "No eligible upstream after cost filter ({filtered_count} candidates rejected)"
+                ),
+                "type": "service_unavailable_error",
+                "code": "no_eligible_upstream",
+            }
+        }),
         HandlerError::RateLimited {
             dimension,
             retry_after_secs,
@@ -175,7 +198,7 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
         // tells the operator what happened.
         _ => unreachable!(
             "openai_envelope_body called only for NoUpstreamSucceeded / \
-             AllBreakersOpen / RateLimited"
+             AllBreakersOpen / NoEligibleUpstream / RateLimited"
         ),
     }
 }
@@ -193,7 +216,9 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
 fn anthropic_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
     use serde_json::json;
     match handler_error {
-        HandlerError::NoUpstreamSucceeded { .. } | HandlerError::AllBreakersOpen { .. } => json!({
+        HandlerError::NoUpstreamSucceeded { .. }
+        | HandlerError::AllBreakersOpen { .. }
+        | HandlerError::NoEligibleUpstream { .. } => json!({
             "type": "error",
             "error": {
                 "type": "overloaded_error",
@@ -209,7 +234,7 @@ fn anthropic_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
         }),
         _ => unreachable!(
             "anthropic_envelope_body called only for NoUpstreamSucceeded / \
-             AllBreakersOpen / RateLimited"
+             AllBreakersOpen / NoEligibleUpstream / RateLimited"
         ),
     }
 }
@@ -283,12 +308,14 @@ impl IntoResponse for HandlerError {
         match &self {
             HandlerError::NoUpstreamSucceeded { kind, .. }
             | HandlerError::AllBreakersOpen { kind, .. }
+            | HandlerError::NoEligibleUpstream { kind, .. }
             | HandlerError::RateLimited { kind, .. } => {
                 let status = match &self {
                     HandlerError::NoUpstreamSucceeded { .. }
-                    | HandlerError::AllBreakersOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                    | HandlerError::AllBreakersOpen { .. }
+                    | HandlerError::NoEligibleUpstream { .. } => StatusCode::SERVICE_UNAVAILABLE,
                     HandlerError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
-                    _ => unreachable!("outer arm guarantees one of the three"),
+                    _ => unreachable!("outer arm guarantees one of the four"),
                 };
                 let body = match kind {
                     FrontendKind::AnthropicMessages => anthropic_envelope_body(&self),
@@ -346,6 +373,7 @@ impl IntoResponse for HandlerError {
             HandlerError::Unauthorized { .. } => unreachable!("handled above"),
             HandlerError::NoUpstreamSucceeded { .. }
             | HandlerError::AllBreakersOpen { .. }
+            | HandlerError::NoEligibleUpstream { .. }
             | HandlerError::RateLimited { .. } => unreachable!("handled above"),
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

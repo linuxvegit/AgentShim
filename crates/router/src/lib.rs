@@ -24,6 +24,8 @@ pub(crate) mod metric_names {
     pub const FALLBACK_TRANSITIONS_TOTAL: &str = "agent_shim_fallback_transitions_total";
     pub const BREAKER_STATE_CHANGES_TOTAL: &str = "agent_shim_breaker_state_changes_total";
     pub const RATE_LIMIT_REJECTED_TOTAL: &str = "agent_shim_rate_limit_rejected_total";
+    /// Plan 06 P04 T4: per-axis cost-filter skip/note counter.
+    pub const COST_FILTERED_TOTAL: &str = "agent_shim_cost_filtered_total";
 }
 
 use thiserror::Error;
@@ -89,7 +91,7 @@ pub use fallback::{
 };
 pub use latency_probe::{DisabledLatencyProbe, LatencyProbe, MockLatencyProbe};
 pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry};
-pub use resilient_caller::{ProviderLookup, ResilientCaller};
+pub use resilient_caller::{CostFilterInputs, ProviderLookup, ResilientCaller};
 pub use resolver::ModelResolver;
 pub use retry::{compute_backoff, retry_with_policy, RetryOutcome, RetryPolicy};
 pub use static_routes::StaticRouter;

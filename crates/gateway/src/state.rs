@@ -295,6 +295,10 @@ impl AppState {
             provider_lookup,
             Arc::clone(&breaker_registry),
             Arc::clone(&limiter_registry),
+            // Plan 06 P04 T4: pass a probe; T5 replaces this with a
+            // Prometheus-backed one wired to the metrics handle.
+            Arc::new(agent_shim_router::DisabledLatencyProbe)
+                as Arc<dyn agent_shim_router::LatencyProbe>,
         ));
 
         // Plan 04 P04 T4: pre-compute the auth fields so per-request
