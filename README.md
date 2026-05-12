@@ -34,7 +34,7 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 
 **Cross-protocol translation works.** An Anthropic-speaking agent can talk to an OpenAI-compatible backend and vice versa, including streaming tool-call argument deltas.
 
-## Capability matrix (v0.5)
+## Capability matrix (v0.6)
 
 | Frontend → Provider | OAI-compat | Copilot | Anthropic | DeepSeek | Gemini |
 |---|---|---|---|---|---|
@@ -43,6 +43,7 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 | OpenAI Responses | text · tools · vision | text · tools · vision | text · tools · vision · reasoning (canonical path) | gate (text-only provider) | text · tools · vision · thinking · safety |
 | Resilience (v0.4) | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit |
 | Observability (v0.5) | metrics · spans · reload | metrics · spans · reload | metrics · spans · reload | metrics · spans · reload | metrics · spans · reload |
+| Cost-aware (v0.6) | tier · cost · latency · cap | tier · cost · latency · cap | tier · cost · latency · cap | tier · cost · latency · cap | tier · cost · latency · cap |
 
 The Resilience row applies to every provider equally — the v0.4
 resilience layer wraps `BackendProvider::complete` for all backends.
@@ -54,6 +55,14 @@ The Observability row applies to every provider equally — the v0.5
 observability layer wraps every backend with the same metrics, spans,
 and reload semantics. See [`docs/observability.md`](docs/observability.md)
 for the operator guide.
+
+The Cost-aware row applies to every provider equally — the v0.6 cost
+filter operates on the chain produced by the v0.4 router (not on
+provider-specific wire shapes), so all four axes (tier label, per-token
+cost, p95 latency budget, per-route cost cap) work uniformly across
+OAI-compatible, Copilot, Anthropic, DeepSeek, and Gemini upstreams. See
+[`docs/observability.md#cost-aware-routing-v06`](docs/observability.md#cost-aware-routing-v06)
+and [ADR-0006](docs/adr/0006-cost-aware-routing.md).
 
 Vision support gates at the gateway boundary: when an inbound request contains an image block but the routed provider's `capabilities.vision == false` (today: DeepSeek), the request is rejected with HTTP 400 and a frontend-shaped error envelope before any upstream call. See [docs/architecture.md](docs/architecture.md#capability-gate).
 
@@ -367,40 +376,51 @@ crates/
   protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.5
+## What's NOT in v0.6
 
-Phase 5 ships observability + ops (Prometheus metrics, OpenTelemetry
-traces, hot-reload of routing & policy config). It does **not** ship:
+Phase 6 ships cost-aware routing (tier filter, per-token cost, p95
+latency budget, per-route cost cap) plus closes the two v0.5 deferrals
+(outbound `traceparent` propagation, rate-limit policy reload). It
+does **not** ship:
 
-- **Outbound `traceparent` propagation** — inbound continues; outbound
-  to upstream HTTP calls is a v0.6 candidate.
-- **Rate-limit policy effect on reload** — `LimiterRegistry` lives on
-  the immutable `AppCore`, so a v0.5 reload that changes `rate_limit.*`
-  is inert until the process restarts. v0.6 candidate. See
-  [`docs/observability.md`](docs/observability.md).
+- **Learned realised-cost tracking (rolling EWMA).** The cost filter
+  uses an upper-bound estimate today; observed token counts don't
+  feed back into the filter. v0.7+ candidate.
+- **Distributed cost-filter state.** Each gateway instance applies
+  the filter independently; multi-instance deployments don't share
+  filter counts. v0.7+ candidate.
+- **Agent-driven routing hints** (e.g. `agent-shim-budget: low`
+  headers) — explicitly out of scope. The policy decision belongs to
+  the operator, not the agent. Rationale in
+  [ADR-0006](docs/adr/0006-cost-aware-routing.md).
 - **Distributed / shared state** — breaker and rate-limit state still
   live in process memory.
 - **k8s manifests / Helm chart** — operators write their own.
-- **Redacted request/response capture** — too disk-heavy for a v0.5
-  default; v0.6+.
-- **Cost / latency-aware routing** — Phase 6+.
+- **Redacted request/response capture** — too disk-heavy for a default;
+  v0.7+.
 - **New providers, new frontends, new model alias features** — out of
-  scope for v0.5.
-- **Audio / file content end-to-end** — Phase 7+ if at all.
+  scope for v0.6.
+- **Audio / file content end-to-end** — v0.7+ if at all.
 
 Phase 4's `ResilientCaller` orchestrator + Phase 5's observability
-layer together are the foundation that distributed state and cost-
-aware routing will plug into in v0.6+.
+layer + Phase 6's cost filter are the foundation that distributed
+state and realised-cost tracking will plug into in v0.7+.
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
 
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.5.0** — Phase 5: observable & operable gateway — Prometheus
-metrics on a separate admin port, OpenTelemetry tracing with first-
-class spans, hot-reload of routing & policy config via SIGHUP /
-POST /admin/reload
+**v0.6.0** — Phase 6: cost-aware gateway — outbound `traceparent`
+propagation, hot-reloadable rate-limit policy, four-axis cost filter
+(tier · per-token cost · p95 latency budget · per-route cost cap),
+HTTP 503 `NoEligibleUpstream` envelope
+([ADR-0006](docs/adr/0006-cost-aware-routing.md)).
+
+Previous: **v0.5.0** — Phase 5: observable & operable gateway —
+Prometheus metrics on a separate admin port, OpenTelemetry tracing
+with first-class spans, hot-reload of routing & policy config via
+SIGHUP / POST /admin/reload
 ([ADR-0005](docs/adr/0005-hot-reload-snapshot-model.md)).
 
 Previous: **v0.4.0** — Phase 4: resilient gateway — fallback chains, per-route
