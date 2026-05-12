@@ -535,6 +535,20 @@ This is the subtlest part:
   and create a new one with full burst available. Documented as a
   known limitation: a reload that loosens limits effectively gives
   every key/upstream a fresh burst.
+
+  **v0.5.0 implementation gap (deferred to v0.6):** the reload-applying
+  task in `commands::serve::handle_reload` swaps `AppSnapshot` only;
+  `LimiterRegistry` lives on the immutable `AppCore` and is therefore
+  NOT rebuilt on policy change. In v0.5.0 a reload that changes any
+  `rate_limit.*` field has no effect on the running registry — the
+  existing buckets persist with their original quotas. This trades a
+  spec-correct rate-limit reset against the larger refactor of moving
+  `LimiterRegistry` behind an `ArcSwap` (or adding a `replace_policy`
+  hook on the frozen-router side). Spec compliance review for Plan 04
+  flagged this; the fix is tracked as a v0.6 follow-up. Operators who
+  need a rate-limit policy change to take effect immediately must
+  restart the process. The breaker side of §5.4 is fully implemented
+  (test: `crates/gateway/tests/reload_in_flight.rs::breaker_state_survives_reload`).
 - **Auth key set change** (add or remove keys): instant on next request.
 - **`auth.required: false` → `true`**: instant. In-flight anonymous
   requests already hold their old snapshot, finish unblocked. New

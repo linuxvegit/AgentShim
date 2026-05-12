@@ -32,7 +32,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         let state_for_task = state.clone();
         tokio::spawn(async move {
             while let Some(req) = reload_rx.recv().await {
-                let outcome = handle_reload_for_test(&state_for_task, req.source).await;
+                let outcome = handle_reload(&state_for_task, req.source).await;
                 let _ = req.respond_to.send(outcome);
             }
         });
@@ -95,20 +95,30 @@ pub async fn run(config_path: &Path) -> Result<()> {
 /// from the original startup config — so a future, looser policy on
 /// reload-time validation only has to update the baseline construction
 /// here, never the AppCore plumbing.
-pub async fn handle_reload_for_test(
+///
+/// Public so the integration tests in `crates/gateway/tests/reload_*`
+/// can drive a reload-applying task in-process without spawning the
+/// full server. P04 T9 review followup: renamed from
+/// `handle_reload_for_test` (the original name suggested the function
+/// existed only for tests, which was misleading since production calls
+/// it from `run`'s spawned task).
+pub async fn handle_reload(
     state: &crate::state::AppState,
     source: crate::reload_trigger::ReloadSource,
 ) -> crate::reload_trigger::ReloadOutcome {
     use crate::reload_trigger::{ReloadOutcome, ReloadSource};
 
+    // P04 T9 review HIGH-1: read YAML via `tokio::fs` so the
+    // reload-applying task doesn't block the tokio worker thread on a
+    // slow/networked filesystem.
     let yaml: String = match source {
-        ReloadSource::Path(p) => match std::fs::read_to_string(&p) {
+        ReloadSource::Path(p) => match tokio::fs::read_to_string(&p).await {
             Ok(s) => s,
             Err(e) => return ReloadOutcome::Io(e.to_string()),
         },
         ReloadSource::Yaml(s) => s,
         ReloadSource::Sighup => match state.core.config_path.as_ref() {
-            Some(p) => match std::fs::read_to_string(p) {
+            Some(p) => match tokio::fs::read_to_string(p).await {
                 Ok(s) => s,
                 Err(e) => return ReloadOutcome::Io(e.to_string()),
             },
