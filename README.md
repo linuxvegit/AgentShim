@@ -34,7 +34,7 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 
 **Cross-protocol translation works.** An Anthropic-speaking agent can talk to an OpenAI-compatible backend and vice versa, including streaming tool-call argument deltas.
 
-## Capability matrix (v0.4)
+## Capability matrix (v0.5)
 
 | Frontend → Provider | OAI-compat | Copilot | Anthropic | DeepSeek | Gemini |
 |---|---|---|---|---|---|
@@ -42,12 +42,18 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 | OpenAI Chat | text · tools · vision | text · tools · vision | text · tools · vision (canonical path) | text · tools · reasoning | text · tools · vision · thinking |
 | OpenAI Responses | text · tools · vision | text · tools · vision | text · tools · vision · reasoning (canonical path) | gate (text-only provider) | text · tools · vision · thinking · safety |
 | Resilience (v0.4) | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit | fallback · retry · breaker · rate-limit |
+| Observability (v0.5) | metrics · spans · reload | metrics · spans · reload | metrics · spans · reload | metrics · spans · reload | metrics · spans · reload |
 
 The Resilience row applies to every provider equally — the v0.4
 resilience layer wraps `BackendProvider::complete` for all backends.
 See [`docs/resilience.md`](docs/resilience.md) for the operator guide
 and per-provider fallback-eligibility notes in
 [`docs/providers/`](docs/providers/).
+
+The Observability row applies to every provider equally — the v0.5
+observability layer wraps every backend with the same metrics, spans,
+and reload semantics. See [`docs/observability.md`](docs/observability.md)
+for the operator guide.
 
 Vision support gates at the gateway boundary: when an inbound request contains an image block but the routed provider's `capabilities.vision == false` (today: DeepSeek), the request is rejected with HTTP 400 and a frontend-shaped error envelope before any upstream call. See [docs/architecture.md](docs/architecture.md#capability-gate).
 
@@ -361,34 +367,43 @@ crates/
   protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.4
+## What's NOT in v0.5
 
-Phase 4 ships the resilient gateway (fallback chains, retries,
-circuit breakers, rate limiting, API-key auth, structured tracing).
-It does **not** ship:
+Phase 5 ships observability + ops (Prometheus metrics, OpenTelemetry
+traces, hot-reload of routing & policy config). It does **not** ship:
 
-- **Distributed / shared state** — breaker and rate-limit state lives
-  in process memory; multi-instance deployments behind a load balancer
-  lose strict enforcement until breakers actually trip at the
-  upstream. Distributed-state (Redis backend) is a Phase 5 candidate.
-- **Cost / latency-aware routing** — Phase 5+.
-- **Per-key per-day budget caps** — Phase 5.
-- **Prometheus metrics, OpenTelemetry, hot-reload config** — Phase 5.
-- **Audio / file content end-to-end** — Phase 6+ if at all.
-- **Multi-account Copilot** — Phase 6.
-- **OAuth Anthropic** — Phase 6.
-- **Embeddings, moderation, admin UI, end-user identity, billing** —
-  permanently out of scope.
+- **Outbound `traceparent` propagation** — inbound continues; outbound
+  to upstream HTTP calls is a v0.6 candidate.
+- **Rate-limit policy effect on reload** — `LimiterRegistry` lives on
+  the immutable `AppCore`, so a v0.5 reload that changes `rate_limit.*`
+  is inert until the process restarts. v0.6 candidate. See
+  [`docs/observability.md`](docs/observability.md).
+- **Distributed / shared state** — breaker and rate-limit state still
+  live in process memory.
+- **k8s manifests / Helm chart** — operators write their own.
+- **Redacted request/response capture** — too disk-heavy for a v0.5
+  default; v0.6+.
+- **Cost / latency-aware routing** — Phase 6+.
+- **New providers, new frontends, new model alias features** — out of
+  scope for v0.5.
+- **Audio / file content end-to-end** — Phase 7+ if at all.
 
-Phase 4's `ResilientCaller` orchestrator is the foundation that
-distributed state and cost-aware routing will plug into in v0.5+.
+Phase 4's `ResilientCaller` orchestrator + Phase 5's observability
+layer together are the foundation that distributed state and cost-
+aware routing will plug into in v0.6+.
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
 
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.4.0** — Phase 4: resilient gateway — fallback chains, per-route
+**v0.5.0** — Phase 5: observable & operable gateway — Prometheus
+metrics on a separate admin port, OpenTelemetry tracing with first-
+class spans, hot-reload of routing & policy config via SIGHUP /
+POST /admin/reload
+([ADR-0005](docs/adr/0005-hot-reload-snapshot-model.md)).
+
+Previous: **v0.4.0** — Phase 4: resilient gateway — fallback chains, per-route
 retries, per-(upstream, model) circuit breakers, four-dimensional
 rate limiting, API-key auth, structured resilience tracing
 ([ADR-0004](docs/adr/0004-resilient-caller.md)).
