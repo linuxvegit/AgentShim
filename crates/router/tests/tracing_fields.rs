@@ -146,8 +146,8 @@ fn disabled_breaker(n: usize) -> Vec<BreakerPolicy> {
         .collect()
 }
 
-fn disabled_limiter() -> Arc<LimiterRegistry> {
-    Arc::new(LimiterRegistry::disabled())
+fn disabled_limiter() -> Arc<arc_swap::ArcSwap<LimiterRegistry>> {
+    Arc::new(arc_swap::ArcSwap::from_pointee(LimiterRegistry::disabled()))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,13 +334,14 @@ async fn rate_limit_rejected_event_has_standard_fields() {
             burst: 5,
         },
     };
-    let limiters = Arc::new(LimiterRegistry::from_config(&cfg));
+    let inner = LimiterRegistry::from_config(&cfg);
     // Burn the anonymous bucket (burst=2 → 2 allowed) before the test call.
     for _ in 0..2 {
-        assert!(limiters
+        assert!(inner
             .check_pre_chain(&AgentIdentity::Anonymous, "openai_chat/gpt-4o", "127.0.0.1")
             .is_ok());
     }
+    let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
 
     let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
         map: HashMap::from([(

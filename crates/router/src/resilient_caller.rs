@@ -56,14 +56,14 @@ pub trait ProviderLookup: Send + Sync {
 pub struct ResilientCaller {
     providers: Arc<dyn ProviderLookup>,
     breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
-    limiters: Arc<crate::rate_limit::LimiterRegistry>,
+    limiters: Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>>,
 }
 
 impl ResilientCaller {
     pub fn new(
         providers: Arc<dyn ProviderLookup>,
         breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
-        limiters: Arc<crate::rate_limit::LimiterRegistry>,
+        limiters: Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>>,
     ) -> Self {
         Self {
             providers,
@@ -225,6 +225,7 @@ impl ResilientCaller {
         let pre_chain_result = {
             let _rl_span = tracing::info_span!("rate_limit.check").entered();
             self.limiters
+                .load_full()
                 .check_pre_chain(identity, frontend_model, client_ip)
         };
         if let Err((dim, retry_after_secs)) = pre_chain_result {
@@ -314,7 +315,8 @@ impl ResilientCaller {
             // immediately — we do NOT fall back to the next chain element
             // (the upstream is intentionally back-pressured; trying the
             // fallback would defeat the bucket).
-            if let Err((dim, retry_after_secs)) = self.limiters.check_per_upstream(&target.provider)
+            if let Err((dim, retry_after_secs)) =
+                self.limiters.load_full().check_per_upstream(&target.provider)
             {
                 tracing::warn!(
                     target: "agent_shim::resilience",
@@ -494,8 +496,10 @@ mod tests {
     /// Build a disabled `LimiterRegistry` so the rate-limit gates are
     /// no-ops in tests that exercise unrelated paths (retry/fallback,
     /// breaker semantics, etc).
-    fn disabled_limiter() -> Arc<crate::rate_limit::LimiterRegistry> {
-        Arc::new(crate::rate_limit::LimiterRegistry::disabled())
+    fn disabled_limiter() -> Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>> {
+        Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::rate_limit::LimiterRegistry::disabled(),
+        ))
     }
 
     /// Standard test identity — no real key in tests, so use Anonymous.
@@ -894,18 +898,17 @@ mod tests {
             map: HashMap::from([("a".to_string(), MockProvider::new("a", vec![]) as Arc<_>)]),
         });
         let breakers = Arc::new(BreakerRegistry::with_system_clock());
-        let limiters = Arc::new(crate::rate_limit::LimiterRegistry::from_config(
-            &small_rate_limit_cfg(),
-        ));
+        let inner = crate::rate_limit::LimiterRegistry::from_config(&small_rate_limit_cfg());
 
         // Burn the anonymous per-key bucket (burst=2 → two allows then
         // a reject) by directly checking the registry.
         for _ in 0..2 {
-            assert!(limiters
+            assert!(inner
                 .check_pre_chain(&anon(), "openai_chat/gpt-4o", "127.0.0.1")
                 .is_ok());
         }
 
+        let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
         let caller = ResilientCaller::new(providers, breakers, limiters);
         let chain = vec![target("a")];
         let result = caller
@@ -953,13 +956,11 @@ mod tests {
             ]),
         });
         let breakers = Arc::new(BreakerRegistry::with_system_clock());
-        let limiters = Arc::new(crate::rate_limit::LimiterRegistry::from_config(
-            &small_rate_limit_cfg(),
-        ));
+        let inner = crate::rate_limit::LimiterRegistry::from_config(&small_rate_limit_cfg());
 
         // Burn the per-upstream bucket for "a" (burst=2).
         for _ in 0..2 {
-            assert!(limiters.check_per_upstream("a").is_ok());
+            assert!(inner.check_per_upstream("a").is_ok());
         }
 
         // Use a fresh per-request KeyHash identity so the per-key bucket
@@ -969,6 +970,7 @@ mod tests {
         // identity.
         let id = crate::auth::AgentIdentity::KeyHash("sha256:test_key_hash".to_string());
 
+        let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
         let caller = ResilientCaller::new(providers, breakers, limiters);
         let chain = vec![target("a"), target("b")];
         let result = caller
