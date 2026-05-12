@@ -315,8 +315,10 @@ impl ResilientCaller {
             // immediately — we do NOT fall back to the next chain element
             // (the upstream is intentionally back-pressured; trying the
             // fallback would defeat the bucket).
-            if let Err((dim, retry_after_secs)) =
-                self.limiters.load_full().check_per_upstream(&target.provider)
+            if let Err((dim, retry_after_secs)) = self
+                .limiters
+                .load_full()
+                .check_per_upstream(&target.provider)
             {
                 tracing::warn!(
                     target: "agent_shim::resilience",

@@ -179,6 +179,7 @@ dependencies = [
  "agent-shim-core",
  "agent-shim-observability",
  "agent-shim-providers",
+ "arc-swap",
  "async-trait",
  "futures",
  "governor",

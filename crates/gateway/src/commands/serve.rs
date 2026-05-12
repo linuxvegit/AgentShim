@@ -159,6 +159,26 @@ pub async fn handle_reload(
             });
             state.snapshot.store(new_snap);
 
+            // Phase 6 P02 T4: rebuild the rate-limit registry from the
+            // just-committed snapshot. Spec §5.4: governor doesn't
+            // expose retuning, so we replace the whole registry —
+            // buckets reset with new burst capacity. The swap happens
+            // AFTER the AppSnapshot swap (commit point 2 in spec §6.2):
+            // a request racing between the two stores sees a valid
+            // (old or new) snapshot AND a valid (old or new) limiter,
+            // both legal — just from different config versions for a
+            // tiny window. Inherent ArcSwap property; documented.
+            let committed = state.snapshot.load_full();
+            let new_limiter = if committed.config.rate_limit.enabled {
+                agent_shim_router::LimiterRegistry::from_config(&committed.config.rate_limit)
+            } else {
+                agent_shim_router::LimiterRegistry::disabled()
+            };
+            state
+                .core
+                .limiter_registry
+                .store(std::sync::Arc::new(new_limiter));
+
             metrics::counter!(
                 agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
                 "result" => "ok",
