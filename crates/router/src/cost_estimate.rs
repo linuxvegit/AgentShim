@@ -68,9 +68,7 @@ pub fn estimate_request_cost(
 /// process pays for tokenizer construction at most once.
 fn cl100k() -> &'static CoreBPE {
     static CELL: OnceLock<CoreBPE> = OnceLock::new();
-    CELL.get_or_init(|| {
-        tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize")
-    })
+    CELL.get_or_init(|| tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize"))
 }
 
 /// Estimate input tokens using `cl100k_base`. `encode_ordinary` keeps
@@ -165,8 +163,7 @@ mod tests {
             output_per_million_usd: 2.0,
         };
         let r = req("hello world", Some(100));
-        let est = estimate_request_cost(&r, Some(&cost))
-            .expect("cost present, request present");
+        let est = estimate_request_cost(&r, Some(&cost)).expect("cost present, request present");
         // Don't assert exact value (tokenizer-dependent); just that it's
         // a reasonable bound for a short text + tiny output cap.
         assert!(est.cost_usd >= 0.0);

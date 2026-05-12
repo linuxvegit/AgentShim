@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod circuit_breaker;
 pub mod cost_estimate;
+pub mod cost_filter;
 pub mod errors;
 pub mod fallback;
 pub mod latency_probe;
@@ -81,6 +82,7 @@ pub trait Router: Send + Sync {
 pub use auth::{extract_identity_from_headers, hash_key, AgentIdentity};
 pub use circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry, Clock, SystemClock};
 pub use cost_estimate::{estimate_request_cost, CostEstimate};
+pub use cost_filter::{filter_chain, FilterOutcome, FilterReason, Note, Skip};
 pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
     fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility,
