@@ -5,6 +5,184 @@ All notable changes to AgentShim are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-12
+
+Phase 6 release: the gateway becomes **cost-aware**. Three subsystems
+close at once — outbound `traceparent` propagation, hot-reloadable
+rate-limit policy, and four-axis cost-aware routing (tier · per-token
+cost · p95 latency budget · per-route cost cap). The two v0.5 "Known
+limitations" are resolved. Operators upgrading from v0.5 must add a
+single required field per upstream (`tier:`); everything else is
+additive.
+
+### Added
+
+#### Outbound `traceparent` propagation (Plan 01)
+
+- New `agent_shim_providers::ProviderHttpClient` wraps every
+  provider's `reqwest::Client`. Auto-injects W3C `traceparent` (and
+  `tracestate` when present) from the current `Span`'s OTel context
+  on every outgoing request. End-to-end distributed traces through
+  the gateway work without operator action.
+- New `agent_shim_observability::inject_context_into_headers` helper
+  drives the injection from a single point so all five providers share
+  the same propagator config.
+- Mockito-backed integration tests in
+  `crates/gateway/tests/outbound_traceparent.rs` verify the header
+  shape (`^00-[0-9a-f]{32}-[0-9a-f]{16}-(00|01)$`) and that the
+  outbound trace-ID matches the inbound `traceparent` (single trace
+  end-to-end).
+- Closes the v0.5 "Outbound `traceparent` propagation" Known
+  Limitation.
+
+#### Rate-limit reload (Plan 02)
+
+- `AppCore::limiter_registry` moves from `Arc<LimiterRegistry>` to
+  `Arc<ArcSwap<LimiterRegistry>>`. The reload-applying task rebuilds
+  the registry from the new `rate_limit.*` policy and atomically swaps
+  it after the `AppSnapshot` swap.
+- A reload that changes any `rate_limit.*` field takes effect on the
+  very next request — no process restart required.
+- Existing in-flight buckets are **replaced** (not migrated) — the
+  `governor` crate that backs the buckets does not expose retuning,
+  so the operator-visible behaviour is "swap to new policy with a
+  fresh token allowance" rather than "preserve token counts across
+  the swap". Documented in
+  [`docs/observability.md`](docs/observability.md#rate-limit-buckets-across-reload).
+- Covered by `crates/gateway/tests/reload_rate_limit_buckets_reset.rs`.
+- Closes the v0.5 "Rate-limit policy effect on reload" Known
+  Limitation.
+
+#### Cost-aware routing (Plan 03 + Plan 04)
+
+- Four orthogonal routing axes per route:
+  - `tier` filter (`economy` / `standard` / `premium`)
+  - `cost` per token (USD-denominated)
+  - `p95_latency_budget_ms` per upstream
+  - `max_cost_usd` per route
+- New `crates/router/src/cost_filter.rs` runs as a pre-chain-walk
+  pass between the rate-limit gate and the v0.4 `ResilientCaller`
+  chain walk. Pure function over `(chain, route, request, config, probe)`
+  — no I/O, no metrics emission inside the function. Survivors retain
+  original chain order; the operator's "preferred upstream" intent
+  from v0.4 is preserved.
+- New `crates/router/src/cost_estimate.rs` computes an upper-bound
+  per-request USD estimate using `tiktoken-rs`'s `cl100k_base` encoder
+  (lazily initialised via `OnceLock`) and the request's `max_tokens`
+  ceiling (default 4096). Only `ContentBlock::Text` blocks contribute
+  to the input-token estimate today; ToolCall / ToolResult / Image /
+  Reasoning blocks are skipped (deferred to v0.7 per ADR-0006).
+- New `LatencyProbe` trait in `crates/router/src/latency_probe.rs`;
+  Prometheus-backed `PrometheusLatencyProbe` implementation in
+  `crates/gateway/src/latency_probe.rs` reads the
+  `agent_shim_upstream_duration_seconds` histogram via the
+  `metrics-exporter-prometheus` text scrape.
+- When the filter empties the chain, the gateway short-circuits with
+  HTTP 503 `NoEligibleUpstream`. The response body lists each skipped
+  upstream and the per-axis reason, rendered through the inbound
+  frontend's existing error envelope (Anthropic, OpenAI Chat, OpenAI
+  Responses).
+- New metric `agent_shim_cost_filtered_total{reason, upstream, route}`
+  with reasons `tier / latency / cap / latency_unknown / tiktoken_fallback`.
+  `latency_unknown` and `tiktoken_fallback` are **notes**, not skips —
+  the upstream still survives but the operator sees the warm-up /
+  encoder-fallback in the counter.
+- Five new schema fields:
+  - upstream-level: `tier`, `cost.input_per_million_usd`,
+    `cost.output_per_million_usd`, `p95_latency_budget_ms`
+  - route-level: `min_tier`, `max_cost_usd`
+- Validation rules 15-18 added (see
+  [`docs/configuration.md`](docs/configuration.md#validation-rules-15-18)).
+
+### Changed
+
+- **`AppCore::limiter_registry` field type** — `Arc<LimiterRegistry>` →
+  `Arc<ArcSwap<LimiterRegistry>>`. Integration tests that construct
+  `AppCore` directly need to wrap their `LimiterRegistry::disabled()`
+  in `ArcSwap::from_pointee(...)`.
+- **`ResilientCaller::new` signature** — now takes an extra
+  `Arc<dyn LatencyProbe>` argument. Tests that construct it directly
+  should pass `Arc::new(DisabledLatencyProbe)` (when latency-axis
+  evaluation is not desired) or a `MockLatencyProbe::with([...])` for
+  scenario-specific p95 stubs.
+
+### Breaking
+
+⚠ **`tier` is required on every upstream.** Configs without a
+`tier:` line on every upstream will fail to parse at startup.
+
+**Upgrade action:** add one line per upstream in `gateway.yaml`:
+
+```yaml
+upstreams:
+  my_upstream:
+    type: open_ai_compatible
+    # existing fields...
+    tier: standard           # one of: economy | standard | premium
+```
+
+This is the **only** breaking change in v0.6. All other v0.5 config
+shapes continue to parse unchanged.
+
+### Frozen-core invariant changes
+
+The Phase 5 invariant covered `crates/core/`, `crates/frontends/`,
+**and** `crates/providers/src/`. Phase 6 narrows the scope:
+
+- **Phase 6 invariant** — `git diff 44749de -- crates/core/ crates/frontends/`
+  is empty at the v0.6.0 release tag. The core canonical model and
+  every frontend adapter remain untouched, as in every prior phase.
+- **`crates/providers/src/` is unfrozen for Phase 6.** Plan 01 modifies
+  `crates/providers/src/http_client.rs` (promotes `pub(crate)` →
+  `pub`, returns `ProviderHttpClient` instead of bare `reqwest::Client`)
+  and renames the `client: reqwest::Client` field to
+  `client: ProviderHttpClient` on five provider modules (OpenAI
+  compatible, GitHub Copilot, Anthropic, DeepSeek, Gemini). No other
+  diff hunks are introduced; the change is mechanical and bounded.
+- This unfreeze is the v0.6 sibling of v0.3's ADR-0003 one-time
+  exception. See [ADR-0006](docs/adr/0006-cost-aware-routing.md) §2
+  for the discipline rule, the audit instructions, and the v0.6
+  classification of every `providers/src/` hunk.
+
+### Deprecated
+
+None.
+
+### Fixed
+
+None — this release is additive against the v0.5.0 baseline.
+
+### Documentation
+
+- New [`docs/adr/0006-cost-aware-routing.md`](docs/adr/0006-cost-aware-routing.md)
+  records the four-axis decision + rejected alternatives + the v0.6.1 /
+  v0.7 deferred-findings register.
+- [`docs/observability.md`](docs/observability.md) gains a "Cost-aware
+  routing (v0.6)" operator section and a "What's NOT in v0.6" running
+  list; removes the two v0.5 deferrals from Known Limitations.
+- [`docs/configuration.md`](docs/configuration.md) documents the five
+  new schema fields (tier, cost, p95_latency_budget_ms, min_tier,
+  max_cost_usd) and validation rules 15-18.
+- [`docs/architecture.md`](docs/architecture.md) adds a "Cost-aware
+  routing (v0.6)" subsection with the request-flow diagram and the
+  cross-link to ADR-0006.
+
+### Known limitations
+
+- **Estimate is not realised cost.** The cost filter uses an upper
+  bound from `tiktoken-rs` + `max_tokens`. Realised costs are usually
+  lower; the operator-set `max_cost_usd` should be tuned with the
+  semantic "reject if it COULD cost more than $X". Rolling-EWMA
+  realised-cost tracking is a v0.7+ candidate (ADR-0006 Open
+  Questions).
+- **Single-instance state still applies.** Cost-filter counts are
+  per-process; distributed cost-aware behaviour across N gateway
+  replicas remains a v0.7+ candidate.
+- **Tokeniser mismatch.** `tiktoken-rs`'s `cl100k_base` encoder is a
+  frontier-model tokeniser and won't perfectly match every backend.
+  Estimates are "good enough for filtering", not "good enough for
+  billing reconciliation".
+
 ## [0.5.0] — 2026-05-09
 
 Phase 5 release: the gateway becomes **observable and operable**.
