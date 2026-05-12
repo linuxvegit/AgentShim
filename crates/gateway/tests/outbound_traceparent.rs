@@ -24,9 +24,8 @@
 //! decode → resilience layer → `ProviderHttpClient`-wrapped reqwest
 //! POST → mockito.
 //!
-//! NOTE: `upstreams.m.tier` is omitted here — added by P03 T2 once the
-//! schema makes it required. Until then, the field defaults to None
-//! and the test runs against the v0.5 schema shape.
+//! NOTE: `upstreams.m.tier` was previously omitted; P03 T5 added it back
+//! once the schema made it required.
 
 use std::net::SocketAddr;
 use std::sync::Once;
@@ -90,6 +89,7 @@ upstreams:
     type: open_ai_compatible
     base_url: {}
     api_key: dummy
+    tier: standard
 routes:
   - frontend: openai_chat
     model: x

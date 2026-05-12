@@ -88,6 +88,7 @@ upstreams:
     type: open_ai_compatible
     base_url: {}
     api_key: dummy
+    tier: standard
 routes:
   - frontend: openai_chat
     model: x

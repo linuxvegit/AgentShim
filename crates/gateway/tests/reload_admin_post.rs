@@ -66,7 +66,7 @@ const BASE_YAML: &str = r#"
 server: {bind: 127.0.0.1, port: __PUBLIC__}
 admin: {bind: 127.0.0.1, port: __ADMIN__}
 upstreams:
-  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a}
+  m: {type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}
 routes:
   - {frontend: openai_chat, model: x, upstream: m, upstream_model: x}
 "#;

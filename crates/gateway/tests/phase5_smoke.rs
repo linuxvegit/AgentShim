@@ -26,7 +26,7 @@ async fn phase5_pillars_compose() {
 server: {{bind: 127.0.0.1, port: {public}}}
 admin: {{bind: 127.0.0.1, port: {admin}}}
 upstreams:
-  m: {{type: open_ai_compatible, base_url: http://x/v1, api_key: a}}
+  m: {{type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}}
 routes:
   - {{frontend: openai_chat, model: x, upstream: m, upstream_model: x}}
 "#
