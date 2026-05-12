@@ -96,8 +96,11 @@ pub struct AppCore {
     pub breaker_registry: Arc<BreakerRegistry>,
     /// Token-bucket rate limiters. The registry holds buckets across reload;
     /// individual buckets are replaced when policy changes (spec §5.4).
+    /// Phase 6 P02: now hot-swappable via `ArcSwap`. The reload-applying
+    /// task in `commands::serve::handle_reload` rebuilds and stores a fresh
+    /// registry after committing the new snapshot (spec §6.2, atomicity).
     #[allow(dead_code)]
-    pub limiter_registry: Arc<LimiterRegistry>,
+    pub limiter_registry: Arc<arc_swap::ArcSwap<LimiterRegistry>>,
     /// Prometheus metrics handle. Plan 02 P02 T3. Built once at startup;
     /// the /metrics admin handler renders against it.
     pub metrics: Arc<agent_shim_observability::MetricsHandle>,
@@ -277,11 +280,16 @@ impl AppState {
         // block at all, plus explicit opt-out) we use the disabled
         // shortcut so the per-request gate calls become no-ops without
         // even touching the bucket map.
-        let limiter_registry = Arc::new(if config.rate_limit.enabled {
-            LimiterRegistry::from_config(&config.rate_limit)
-        } else {
-            LimiterRegistry::disabled()
-        });
+        //
+        // Phase 6 P02 T2: wrap in `ArcSwap` so `handle_reload` can swap
+        // the entire registry atomically when `rate_limit.*` changes.
+        let limiter_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+            if config.rate_limit.enabled {
+                LimiterRegistry::from_config(&config.rate_limit)
+            } else {
+                LimiterRegistry::disabled()
+            },
+        ));
 
         let resilient_caller = Arc::new(ResilientCaller::new(
             provider_lookup,
@@ -385,7 +393,8 @@ routes:
         let _: &Arc<agent_shim_providers::ProviderRegistry> = &state.core.providers;
         let _: &Arc<agent_shim_router::BreakerRegistry> = &state.core.breaker_registry;
         let _: &Arc<agent_shim_router::ModelResolver> = &state.core.resolver;
-        let _: &Arc<agent_shim_router::LimiterRegistry> = &state.core.limiter_registry;
+        let _: &Arc<arc_swap::ArcSwap<agent_shim_router::LimiterRegistry>> =
+            &state.core.limiter_registry;
         let _: &Arc<agent_shim_router::ResilientCaller> = &state.core.resilient_caller;
         let _: &Option<agent_shim_config::AdminConfig> = &state.core.admin_config;
 
