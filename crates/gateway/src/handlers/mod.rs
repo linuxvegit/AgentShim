@@ -15,7 +15,7 @@ use agent_shim_core::{
 };
 use agent_shim_frontends::{FrontendError, FrontendResponse};
 use agent_shim_providers::ProviderError;
-use agent_shim_router::{RateLimitDimension, ResilienceError, RouteError};
+use agent_shim_router::{cost_filter::Skip, RateLimitDimension, ResilienceError, RouteError};
 
 #[derive(Debug, Error)]
 pub enum HandlerError {
@@ -72,14 +72,18 @@ pub enum HandlerError {
         retry_after_secs: u32,
     },
     /// Plan 06 P04 T4: cost filter rejected every upstream candidate.
-    /// HTTP 503. `filtered_count` is carried (rather than the full
-    /// `Skip` vec) because the envelope mapping today is operator-text
-    /// only; the structured `filtered:[{upstream, reason}]` JSON shape
-    /// in spec §6.3 is deferred to T6 integration tests.
-    #[error("no eligible upstream after cost filter ({filtered_count} candidates rejected)")]
+    /// HTTP 503. `filtered` carries the full per-upstream skip list
+    /// (`{upstream, reason}` pairs) so the dialect-specific envelope
+    /// builders can stamp the `filtered:[...]` array required by spec
+    /// §6.3. The HandlerError's Display string keeps the operator-
+    /// facing summary as `"... (N candidates rejected)"`; the
+    /// structured array is rendered into the JSON body alongside the
+    /// existing `error` envelope shape (non-breaking additive change —
+    /// OpenAI/Anthropic SDKs ignore unknown top-level fields).
+    #[error("no eligible upstream after cost filter ({} candidates rejected)", filtered.len())]
     NoEligibleUpstream {
         kind: FrontendKind,
-        filtered_count: usize,
+        filtered: Vec<Skip>,
     },
     /// `auth.required = true` and the inbound request had either no key
     /// at all or a key whose hash is not in `auth.keys`. HTTP 401. Plan
@@ -122,10 +126,9 @@ impl HandlerError {
                 dimension,
                 retry_after_secs,
             },
-            ResilienceError::NoEligibleUpstream { filtered } => HandlerError::NoEligibleUpstream {
-                kind,
-                filtered_count: filtered.len(),
-            },
+            ResilienceError::NoEligibleUpstream { filtered } => {
+                HandlerError::NoEligibleUpstream { kind, filtered }
+            }
         }
     }
 }
@@ -162,15 +165,27 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
                 "code": "all_breakers_open",
             }
         }),
-        HandlerError::NoEligibleUpstream { filtered_count, .. } => json!({
-            "error": {
-                "message": format!(
-                    "No eligible upstream after cost filter ({filtered_count} candidates rejected)"
-                ),
-                "type": "service_unavailable_error",
-                "code": "no_eligible_upstream",
-            }
-        }),
+        HandlerError::NoEligibleUpstream { filtered, .. } => {
+            // Spec §6.3: surface the structured `filtered:[{upstream,
+            // reason}]` array alongside the OpenAI `error` envelope.
+            // OpenAI SDKs only read `error.*`; the additive top-level
+            // field is agent-shim's contribution for operator tooling.
+            let filtered_array: Vec<serde_json::Value> = filtered
+                .iter()
+                .map(|s| json!({"upstream": s.upstream, "reason": s.reason.as_str()}))
+                .collect();
+            json!({
+                "error": {
+                    "message": format!(
+                        "No eligible upstream after cost filter ({} candidates rejected)",
+                        filtered.len()
+                    ),
+                    "type": "service_unavailable_error",
+                    "code": "no_eligible_upstream",
+                },
+                "filtered": filtered_array,
+            })
+        }
         HandlerError::RateLimited {
             dimension,
             retry_after_secs,
@@ -216,15 +231,32 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
 fn anthropic_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
     use serde_json::json;
     match handler_error {
-        HandlerError::NoUpstreamSucceeded { .. }
-        | HandlerError::AllBreakersOpen { .. }
-        | HandlerError::NoEligibleUpstream { .. } => json!({
+        HandlerError::NoUpstreamSucceeded { .. } | HandlerError::AllBreakersOpen { .. } => json!({
             "type": "error",
             "error": {
                 "type": "overloaded_error",
                 "message": handler_error.to_string(),
             },
         }),
+        HandlerError::NoEligibleUpstream { filtered, .. } => {
+            // Spec §6.3: emit the structured `filtered:[{upstream,
+            // reason}]` array as an additive top-level field. The
+            // Anthropic dialect's `{type:"error", error:{...}}`
+            // envelope is preserved; SDKs ignore unknown sibling
+            // fields.
+            let filtered_array: Vec<serde_json::Value> = filtered
+                .iter()
+                .map(|s| json!({"upstream": s.upstream, "reason": s.reason.as_str()}))
+                .collect();
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": handler_error.to_string(),
+                },
+                "filtered": filtered_array,
+            })
+        }
         HandlerError::RateLimited { .. } => json!({
             "type": "error",
             "error": {
