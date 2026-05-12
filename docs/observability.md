@@ -154,14 +154,19 @@ The gateway honors W3C `traceparent` headers. An agent that opens a
 span before calling AgentShim sees its trace continue through the
 gateway as a parented span.
 
-### Outbound `traceparent` propagation — deferred to v0.6
+### Outbound `traceparent` propagation
 
-The gateway does NOT currently inject `traceparent` onto upstream HTTP
-requests. Spec §4.3 and the spec deferral note both call this out as a
-known v0.5 gap. Tracing continues through the gateway only when both
-your agent AND the upstream support W3C Trace Context independently. A
-provider-side hook the v0.4 frozen surface doesn't expose is required
-to close this; v0.6 will land it.
+Outbound `traceparent` injection is implemented in v0.6 (Plan 01 / see
+[ADR-0006](adr/0006-cost-aware-routing.md) for the wider Phase 6
+context). Every provider's `reqwest::Client` is wrapped in
+`agent_shim_providers::ProviderHttpClient`, which injects W3C
+`traceparent` (and `tracestate` when present) from the current
+`Span`'s OTel context onto every outgoing request. End-to-end
+distributed traces through the gateway work without operator action.
+
+When OTel export is disabled (`otel.endpoint` absent), no
+`traceparent` is injected — the upstream sees the same request bytes
+v0.5 would have produced.
 
 ### Sampling
 
@@ -240,34 +245,108 @@ even if you increased the threshold. This is intentional (ADR-0005 §3):
 the empirical signal is more important than the policy. Covered by the
 integration test in `crates/gateway/tests/reload_in_flight.rs`.
 
-### Rate-limit buckets across reload — deferred to v0.6
+### Rate-limit buckets across reload
 
-The matching half of spec §5.4 is **not yet implemented in v0.5**. The
-reload-applying task only swaps `AppSnapshot`; `LimiterRegistry` lives
-on the immutable `AppCore`. A reload that changes `rate_limit.*` is
-therefore inert against running buckets — existing buckets keep
-enforcing the old policy until the process restarts. Operators needing
-immediate effect today must restart. The plan for v0.6 is either to
-replace `governor` with a custom limiter that supports retuning, or to
-add a token-preservation rebuild path so the reload-applying task can
-drop and recreate affected buckets safely. See ADR-0005 §3 and spec
-§5.4 for the rationale.
+Rate-limit policy reload is implemented in v0.6 (Plan 02). The
+reload-applying task rebuilds `LimiterRegistry` from the new
+`rate_limit.*` policy and atomically swaps the `Arc<ArcSwap<LimiterRegistry>>`
+that `AppCore` now holds. A reload that changes any `rate_limit.*`
+field takes effect on the very next request — no process restart
+required.
 
-## What's NOT in v0.5
+**Caveat:** existing in-flight buckets are **replaced**, not migrated.
+The `governor` crate that backs the buckets does not expose retuning,
+so the operator-visible behaviour is "swap to new policy with a fresh
+token allowance" rather than "preserve token counts across the swap".
+For typical operations (relaxing a limit, tightening a limit) this is
+the expected semantic. See spec §5.4 (Phase 5) and the Phase 6 spec §3
+for the rationale.
 
-- **Outbound `traceparent` propagation** — the gateway honors inbound
-  `traceparent` but does NOT inject one onto upstream HTTP requests.
-  Tracing continues through the gateway only when both your agent AND
-  upstream support W3C Trace Context independently. v0.6 closes this.
-- **Rate-limit bucket effect on reload** — see "Rate-limit buckets
-  across reload" above. v0.6 candidate.
+Covered by `crates/gateway/tests/reload_rate_limit_buckets_reset.rs`.
+
+## Cost-aware routing (v0.6)
+
+Phase 6 adds four orthogonal axes the operator can apply per route:
+
+1. **Tier label** — `tier: economy | standard | premium` on every
+   upstream. Routes can declare `min_tier`. Upstreams below the
+   route's `min_tier` are filtered out.
+2. **Per-token cost** — `cost: {input_per_million_usd, output_per_million_usd}`
+   on an upstream. Combined with the request's input-token count
+   estimate (via `tiktoken-rs`'s `cl100k_base` encoder) and the
+   request's `max_tokens` ceiling (default 4096), this produces a
+   per-request cost estimate.
+3. **Latency budget** — `p95_latency_budget_ms` on an upstream. The
+   cost filter compares the budget against the recent p95 read from
+   `agent_shim_upstream_duration_seconds`.
+4. **Per-route cost cap** — `max_cost_usd` on a route. Upstreams
+   whose estimated cost exceeds this cap are filtered out.
+
+When every upstream in a route's chain is filtered, the gateway
+returns **HTTP 503 `NoEligibleUpstream`** with a JSON body listing
+each skipped upstream and the per-axis reason. The response is
+rendered through the inbound frontend's existing error envelope
+(Anthropic, OpenAI Chat, OpenAI Responses) so agents see the failure
+in their native shape.
+
+The filter pass sits **between** the rate-limit gate and the v0.4
+`ResilientCaller` chain walk. Filtered chains shrink before retry /
+breaker / fallback get to see them; an upstream the cost filter
+rejected never receives a request.
+
+### Metrics
+
+`agent_shim_cost_filtered_total{reason, upstream, route}` — per-axis
+counter.
+
+| reason | meaning | upstream skipped? |
+|---|---|---|
+| `tier` | upstream.tier < route.min_tier | yes |
+| `latency` | recent p95 > upstream.p95_latency_budget_ms | yes |
+| `cap` | estimated cost > route.max_cost_usd | yes |
+| `latency_unknown` | probe has no samples yet for this upstream | **no** (passes through) |
+| `tiktoken_fallback` | reserved for a future stricter encode-failure mode | **no** (passes through) |
+
+The `latency_unknown` reason is a **note**, not a **skip** — operators
+see warm-up periods in the counter without those buckets affecting
+survival decisions. The `tiktoken_fallback` reason is defined for
+metric-label parity with the spec but is not produced by the v0.6
+filter; `cl100k_base` + `encode_ordinary` handle arbitrary user input
+gracefully.
+
+### Tuning
+
+- `tier` is **required** on every upstream. There is no default. A
+  config without `tier:` on every upstream fails to parse at startup.
+- Cost estimates are intentionally pessimistic (upper bound). A
+  filter rate that surprises you is usually a sign the cap is set
+  too tightly for the request shape, not that the gateway is
+  miscalibrated.
+- The latency probe parses the `/metrics` scrape on each query. For
+  sub-millisecond latency-sensitive deployments, watch for the parse
+  overhead in `agent_shim_request_duration_seconds`. The ADR-0006
+  "Negative consequences" section flags this as a v0.6.1 candidate.
+
+See [ADR-0006](adr/0006-cost-aware-routing.md) for the design context
+and rejected alternatives.
+
+## What's NOT in v0.6
+
+- **Realised-cost tracking (rolling EWMA).** The cost filter uses an
+  upper-bound estimate; observed token counts don't feed back into
+  the filter. v0.7+ candidate.
+- **Distributed cost-filter state.** Each gateway instance applies
+  the filter independently; multi-instance deployments don't share
+  filter counts. v0.7+ candidate.
 - **Distributed breaker/rate-limit state** — multi-instance deploys
   behind a load balancer don't share breaker or limiter state.
+  v0.7+ candidate.
+- **Agent-driven routing hints** — the policy decision belongs to the
+  operator, not the agent. Explicitly out of scope; rationale in
+  ADR-0006.
 - **k8s manifests / Helm chart** — operators write their own.
-- **Redacted request/response capture** — too disk-heavy for a v0.5
-  default; v0.6+.
-- **Cost/latency-aware routing** — the resilience layer's `ResilientCaller`
-  is the foundation; v0.6+.
+- **Redacted request/response capture** — too disk-heavy for a default;
+  v0.7+.
 
 ## Frequently asked
 
@@ -285,9 +364,20 @@ Yes — omit the `admin:` block. The metrics-rs facade still installs but
 no listener exposes the data. Internal counters cost a few atomic ops
 per request; this is the lowest-overhead off-state.
 
-### Why doesn't tightening rate limits take effect after reload?
+### How do I know whether a request was rejected by the cost filter?
 
-See "Rate-limit buckets across reload" above — the v0.5 reload-
-applying task swaps `AppSnapshot` only, while `LimiterRegistry` lives
-on the immutable `AppCore`. Restart to apply new rate-limit policy in
-v0.5. v0.6 candidate.
+Two surfaces:
+
+- The HTTP response is **503** with a frontend-shaped error envelope
+  whose body lists each skipped upstream and the per-axis reason
+  (`NoEligibleUpstream`).
+- The `agent_shim_cost_filtered_total{reason, upstream, route}`
+  counter increments per axis. Dashboard with
+  `sum by (reason) (rate(agent_shim_cost_filtered_total[5m]))`.
+
+### Tightening rate limits should take effect immediately — does it?
+
+Yes, as of v0.6. The reload-applying task rebuilds `LimiterRegistry`
+and atomically swaps the `ArcSwap` slot on `AppCore`. Existing in-
+flight buckets are replaced with fresh ones built from the new policy.
+Covered by `crates/gateway/tests/reload_rate_limit_buckets_reset.rs`.
