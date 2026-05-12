@@ -44,6 +44,7 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 uuid.workspace = true
 tracing-opentelemetry.workspace = true
+prometheus-parse.workspace = true
 serde_yaml = "0.9"
 
 [dev-dependencies]
@@ -54,7 +55,6 @@ serde_json.workspace = true
 serde_yaml = "0.9"
 futures.workspace = true
 criterion = { version = "0.5", features = ["html_reports"] }
-prometheus-parse.workspace = true
 tempfile = "3"
 # Plan 01 P01 T4/T5: outbound-traceparent integration tests install a
 # minimal OTel-backed subscriber so root spans carry a valid OTel

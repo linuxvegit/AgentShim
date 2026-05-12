@@ -291,14 +291,26 @@ impl AppState {
             },
         ));
 
+        // Plan 02 P02 T3: install the global metrics recorder. The
+        // exporter handle lives in AppCore so the /metrics admin handler
+        // can render against it.
+        //
+        // Plan 06 P04 T5: install must happen BEFORE `ResilientCaller::new`
+        // so the same handle can back `PrometheusLatencyProbe`.
+        let metrics = agent_shim_observability::install_metrics(&config.metrics);
+
+        // Plan 06 P04 T5: Prometheus-backed latency probe for the
+        // cost filter's latency axis. Renders `metrics` on demand to
+        // pull the recent p95 of `agent_shim_upstream_duration_seconds`.
+        let latency_probe: Arc<dyn agent_shim_router::LatencyProbe> = Arc::new(
+            crate::latency_probe::PrometheusLatencyProbe::new(Arc::clone(&metrics)),
+        );
+
         let resilient_caller = Arc::new(ResilientCaller::new(
             provider_lookup,
             Arc::clone(&breaker_registry),
             Arc::clone(&limiter_registry),
-            // Plan 06 P04 T4: pass a probe; T5 replaces this with a
-            // Prometheus-backed one wired to the metrics handle.
-            Arc::new(agent_shim_router::DisabledLatencyProbe)
-                as Arc<dyn agent_shim_router::LatencyProbe>,
+            Arc::clone(&latency_probe),
         ));
 
         // Plan 04 P04 T4: pre-compute the auth fields so per-request
@@ -311,11 +323,6 @@ impl AppState {
 
         let server_config = config.server.clone();
         let admin_config = config.admin.clone();
-
-        // Plan 02 P02 T3: install the global metrics recorder. The
-        // exporter handle lives in AppCore so the /metrics admin handler
-        // can render against it.
-        let metrics = agent_shim_observability::install_metrics(&config.metrics);
 
         // Plan 04 P04 T2: reload trigger channel. SIGHUP and
         // `/admin/reload` push onto the sender stored in `AppCore`; the

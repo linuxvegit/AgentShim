@@ -2,6 +2,7 @@ mod admin;
 mod cli;
 mod commands;
 mod handlers;
+mod latency_probe;
 mod metrics_layer;
 mod pipeline;
 mod reload_trigger;
