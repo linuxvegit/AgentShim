@@ -167,6 +167,38 @@ follow this pattern:
 The pattern is intentionally light — none of the four Phase 4
 subsystems used all seven steps, but each used at least four.
 
+## How to add a metric (v0.5)
+
+1. Pick a name following Prometheus conventions: `agent_shim_<noun>_total`
+   for counters, `_seconds` for time histograms, `_bytes` for byte
+   histograms.
+2. Add a `pub const` in `crates/observability/src/metrics/names.rs`.
+3. Register a description in `describe_metrics()` in
+   `crates/observability/src/metrics/mod.rs`.
+4. Add a typed wrapper in `recorders.rs` if the call site is
+   gateway/observability; add a `pub(crate) const` in
+   `crates/router/src/lib.rs::metric_names` if the call site is the
+   router crate (which can't depend on observability).
+5. Emit via `metrics::counter!()`/`histogram!()` macros at the
+   instrumentation point. Keep label cardinality bounded — never use
+   `request_id`, `api_key_hash`, or anything user-supplied as a label.
+6. Update the name-parity test in
+   `crates/router/tests/metric_names_match_observability.rs` if you
+   added a router-side const.
+
+## How to add a span attribute (v0.5)
+
+1. Pick a name following OTel semantic conventions where applicable
+   (`http.*`, `agent_shim.*`). Use `agent_shim.*` for AgentShim-
+   specific fields.
+2. Add the field to the relevant `span!` macro invocation. Use
+   `tracing::field::Empty` if the value is set later via `record(...)`.
+3. If the field needs to land on the `gateway.request` root span, the
+   value must be derivable at the top of `pipeline::dispatch` (or
+   recorded after derivation via `root_span.record(field, value)`).
+4. Update the in-memory exporter test in
+   `crates/router/tests/otel_spans.rs` to assert the field's presence.
+
 ## Test Commands
 
 ```bash
