@@ -4,6 +4,7 @@ pub mod auth;
 pub mod circuit_breaker;
 pub mod errors;
 pub mod fallback;
+pub mod latency_probe;
 pub mod model_index;
 pub mod rate_limit;
 pub mod resilient_caller;
@@ -82,6 +83,7 @@ pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
     fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility,
 };
+pub use latency_probe::{DisabledLatencyProbe, LatencyProbe, MockLatencyProbe};
 pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry};
 pub use resilient_caller::{ProviderLookup, ResilientCaller};
 pub use resolver::ModelResolver;
