@@ -5,6 +5,158 @@ All notable changes to AgentShim are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-09
+
+Phase 5 release: the gateway becomes **observable and operable**.
+Three subsystems — Prometheus metrics on a separate admin listener,
+OpenTelemetry tracing with first-class spans (export optional via
+OTLP/gRPC), and hot-reload of routing & policy config via SIGHUP or
+`POST /admin/reload` — compose alongside the v0.4 resilience layer.
+All three are independently configurable and absent → disabled.
+
+### Added
+
+#### Admin listener (Plan 01)
+
+- New top-level `admin:` config block. When present, binds a separate
+  `axum::Router` on the configured address (default
+  `127.0.0.1:9100`). Hosts `/metrics`, `/healthz`, `/readyz`, and
+  `/admin/reload`. When absent, no admin listener is bound — zero
+  observability surface exposed.
+- `/healthz` moved from the public port to the admin port. The public
+  port retains `/` (returns "ok") for basic up/down probes.
+- `/readyz` checks that providers are initialized and the `AppSnapshot`
+  is populated.
+- `AppState` pivoted to `Arc<AppCore> + Arc<ArcSwap<AppSnapshot>>`.
+  Every Phase 4 field migrated unchanged into one of the two halves.
+  `AppCore` is `#[derive(Clone)]` so the reload-applying task can fork
+  a handle alongside the gateway server
+  ([ADR-0005](docs/adr/0005-hot-reload-snapshot-model.md)).
+
+#### Prometheus metrics (Plan 02)
+
+- New `crates/observability/src/metrics/` module. `metrics-rs` facade
+  + `metrics-exporter-prometheus`. Full metric set described at startup
+  so /metrics returns text even for unhit counters.
+- Request-lifecycle metrics: `agent_shim_requests_total`,
+  `agent_shim_request_duration_seconds`,
+  `agent_shim_request_body_bytes`, `agent_shim_in_flight_requests`.
+- Resilience-layer metrics mirroring the v0.4 tracing taxonomy:
+  `agent_shim_retry_attempts_total`,
+  `agent_shim_retry_exhausted_total`,
+  `agent_shim_fallback_transitions_total`,
+  `agent_shim_breaker_state_changes_total`,
+  `agent_shim_rate_limit_rejected_total`.
+- Upstream call metrics:
+  `agent_shim_upstream_duration_seconds`,
+  `agent_shim_upstream_errors_total`.
+- Token accounting: `agent_shim_tokens_input_total`,
+  `agent_shim_tokens_output_total`.
+- Reload metric: `agent_shim_config_reloads_total{result}`.
+- Cardinality budgets enforced at the type level — high-cardinality
+  values like `request_id`, `api_key_hash`, and unrouted model aliases
+  flow through tracing only, never as metric labels.
+
+#### OpenTelemetry tracing (Plan 03)
+
+- `crates/observability/src/otel/` module. `tracing-opentelemetry`
+  bridge attached to the global subscriber. When `otel.endpoint` is
+  configured, exports via OTLP/gRPC; otherwise the OTel layer is `None`
+  and spans flow only to the existing fmt layer.
+- Span tree per request: `gateway.request` → `route.resolve`,
+  `auth.verify`, `rate_limit.check`, `provider.complete` (one per
+  chain element) → `retry.attempt #N` → `stream.encode`.
+- Span attributes follow OTel HTTP semconv (`http.request.method`,
+  `http.route`, `http.response.status_code`) plus `agent_shim.*`
+  custom attrs (`frontend`, `route`, `identity`, `request_id`,
+  `upstream`, `model`, `attempts`, `fallback_position`).
+- **Inbound only** W3C `traceparent` extraction via a small
+  `tower::Layer` — agent traces continue through the gateway as a
+  parented span. **Outbound `traceparent` propagation onto upstream
+  HTTP calls is deferred to v0.6** (see Known limitations).
+- Parent-based sampling with operator-tuned `otel.sample_ratio`.
+
+#### Hot-reload (Plan 04)
+
+- Reload triggers: SIGHUP (Unix) and `POST /admin/reload`
+  (cross-platform). Both feed a single mpsc channel; one task
+  (`commands::serve::handle_reload`) drains it and applies the swap.
+  Idempotent.
+- POST body is optional — without one, the gateway re-reads the file
+  at the original `--config` path; with `Content-Type: application/yaml`,
+  the supplied YAML is validated and applied directly.
+- Validation rules 11-14 (spec §5.5) reject reload-time changes to
+  `upstreams.*` set, `server.*`/`admin.*` fields, or `otel.endpoint`.
+  Returns HTTP 403 with `ImmutableFieldChanged` / `UpstreamSetChanged`.
+- Other validation failures return HTTP 400 with the same JSON shape
+  startup uses.
+- **Breaker state survives reload, breaker policy doesn't.** The
+  empirical signal the breaker has accumulated about an unhealthy
+  upstream is preserved across policy changes. Covered by
+  `crates/gateway/tests/reload_in_flight.rs`.
+- **Rate-limit bucket reset on policy change is deferred to v0.6.**
+  `LimiterRegistry` lives on the immutable `AppCore`; the reload-
+  applying task only swaps `AppSnapshot`. A v0.5 reload that changes
+  `rate_limit.*` therefore has no effect on running buckets until the
+  process restarts. See Known limitations.
+
+### Changed
+
+- **`/healthz` no longer on the public port.** Liveness checks move to
+  either `http://<host>:8787/` (returns "ok" if listener up) or
+  `http://<host>:9100/healthz` (with admin enabled).
+- `AppState::new` returns `(AppState, mpsc::Receiver<ReloadRequest>)`.
+  Tests that called `AppState::new(cfg).await` need to bind both
+  values.
+- New deps in the workspace: `arc-swap`, `metrics`,
+  `metrics-exporter-prometheus`, `opentelemetry`, `opentelemetry_sdk`,
+  `opentelemetry-otlp`, `tracing-opentelemetry`.
+
+### Deprecated
+
+None. Both v0.4 and v0.5 config shapes are supported indefinitely. v0.4
+configs (no `admin:`, no `otel:`) keep behaving exactly as in v0.4.
+
+### Fixed
+
+None — this release is additive against v0.4.1.
+
+### Documentation
+
+- New [`docs/observability.md`](docs/observability.md) operator guide
+  with quick-start, /metrics scrape config, OTel collector setup,
+  hot-reload examples (kubectl, SIGHUP), the metric set, and
+  v0.5 known gaps.
+- New [`docs/adr/0005-hot-reload-snapshot-model.md`](docs/adr/0005-hot-reload-snapshot-model.md)
+  records the snapshot/policy boundary, the rate-limit deferral, and
+  the rejected alternatives.
+- `docs/architecture.md` gains an "Observability layer" section + the
+  perf overhead targets table.
+- `docs/contributing.md` gains "How to add a metric" + "How to add a
+  span attribute" recipes.
+- `docs/configuration.md` documents the new admin/otel blocks and
+  reload-validation rules 11-14.
+
+### Known limitations
+
+- **No outbound `traceparent` propagation.** Inbound continues; the
+  gateway does NOT inject `traceparent` onto upstream HTTP calls.
+  Requires a provider-side hook the v0.4 frozen surface doesn't
+  expose. Documented as a v0.6 candidate.
+- **Rate-limit policy changes are inert until restart in v0.5.**
+  `LimiterRegistry` lives on the immutable `AppCore`; the reload-
+  applying task only swaps `AppSnapshot`. Tracked as a v0.6 follow-up
+  alongside either a `governor` replacement that supports retuning or
+  a token-preservation rebuild path. See ADR-0005 §3 and
+  `docs/observability.md`.
+- **Single-instance state still applies.** Distributed breaker and
+  rate-limit state remains a v0.6+ candidate.
+
+### Frozen-core invariant continues
+
+`git diff v0.4.1..master -- crates/core/ crates/frontends/ crates/providers/src/`
+is empty for the v0.5.0 release tag.
+
 ## [0.4.1] — 2026-05-09
 
 Patch release: fixes a streaming termination bug on the OpenAI Chat
