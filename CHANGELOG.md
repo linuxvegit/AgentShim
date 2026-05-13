@@ -5,6 +5,97 @@ All notable changes to AgentShim are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-05-13
+
+Patch release closing the five Minor items deferred from Phase 6's
+P04 quality review (M-1, M-3, M-6, M-7, M-8). The headline change is
+image-aware cost estimation: the per-request cost-cap filter now
+accounts for image content blocks alongside text, dispatching by
+inbound `FrontendKind` to vendor-specific token math. Other closures
+are mechanical cleanup (`FilterReason::TiktokenFallback` removed,
+`upstream_*` accessors canonicalised), the `#[derive(Metric)]`
+proc-macro for single-site metric registration, and the `PolicyVec<T>`
+length-invariant wrapper. v0.6.1 is the first release to add to
+`crates/core/` since v0.5.0; the addition is governed by the four
+discipline rules in [ADR-0007](docs/adr/0007-frozen-core-lift-discipline.md).
+`crates/frontends/` and `crates/providers/src/` remain at zero diff
+against the v0.6.0 baseline.
+
+### Added
+- **`ImageTokenEstimator` trait + `ImageSizeHint`/`ImageDetail` enums**
+  in `crates/core/src/cost.rs`. Three implementations live in
+  `crates/router/src/image_estimators/`: `AnthropicImageEstimator`,
+  `OpenAiImageEstimator`, `ResponsesImageEstimator`. The gateway
+  selects per inbound `FrontendKind`. Closes M-8.
+- **`#[derive(Metric)]` proc-macro** in the new
+  `crates/observability-derive/` crate. Adding a new Prometheus
+  metric is now a one-site edit in
+  `crates/observability/src/metrics/catalog.rs`. Closes M-6.
+- **`PolicyVec<T>` length-invariant wrapper** in
+  `crates/router/src/policy_vec.rs`. Makes "one policy per chain
+  element" a type-level invariant; removes the runtime
+  `debug_assert_eq!` checks in `resilient_caller.rs`. Closes M-7.
+- **Structural-parity test** for metric registration
+  (`crates/observability/tests/derive_metric_parity.rs`) anchored
+  to the v0.6.0 baseline fixture.
+- **ADR-0007** — disciplined lift of the frozen-core invariant
+  (`docs/adr/0007-frozen-core-lift-discipline.md`).
+
+### Changed
+- **Cost estimation is now image-aware.** `estimate_request_cost`
+  takes an `&dyn ImageTokenEstimator`; the cost-cap filter's
+  per-request estimate accounts for image content blocks alongside
+  text. The estimator dispatches by inbound `FrontendKind` via a
+  small selector in `crates/gateway/src/image_estimator_selector.rs`.
+  Closes M-8.
+- **Frozen-core invariant lifted under discipline.** v0.6.1 is the
+  first release to add to `crates/core/` since v0.5.0. The four
+  discipline rules are documented in
+  [ADR-0007](docs/adr/0007-frozen-core-lift-discipline.md): trait-only
+  additions, category-tag-per-hunk, re-state-in-next-spec,
+  other-crates-stay-frozen. Phase 7 will diff against the v0.6.1
+  baseline, not v0.5.0.
+- **`upstream_cost`/`upstream_tier`/`upstream_latency_budget`**
+  accessors live in a single canonical location
+  (`crates/config/src/upstream_accessors.rs`). Closes M-3.
+- **`FilterReason` enum** lost its `TiktokenFallback` variant + its
+  `"tiktoken_fallback"` label string. Both were `#[allow(dead_code)]`
+  and never produced. Closes M-1.
+
+### Removed
+- **`#[allow(dead_code)] FilterReason::TiktokenFallback`** — the
+  dead variant + its string label in `FilterReason::as_str` (see
+  Changed above).
+- **Duplicated `upstream_*` accessor functions** previously hosted
+  in `crates/config/src/validation.rs` and
+  `crates/router/src/cost_filter.rs`. Both now import from
+  `agent_shim_config::upstream_accessors`.
+- **Runtime `debug_assert_eq!` length checks** on `retry_policies`
+  and `breaker_policies` in `resilient_caller.rs`. Replaced by
+  the `PolicyVec<T>` type-level invariant.
+
+### Internal
+- New crate `agent-shim-observability-derive` (proc-macro). Workspace
+  dependency edge: observability → observability-derive.
+- New module `crates/router/src/image_estimators/` with three impls.
+- New module `crates/gateway/src/image_estimator_selector.rs` with
+  one selector function keyed on `FrontendKind`.
+- New module `crates/router/src/policy_vec.rs` (`pub(crate)` only).
+- New module `crates/config/src/upstream_accessors.rs` (canonical
+  per-axis match-on-variant helpers).
+
+### Known limitations (still v0.7+)
+- Realised-cost feedback loop (rolling EWMA over observed token
+  counts) — see [ADR-0006](docs/adr/0006-cost-aware-routing.md)
+  Open Questions.
+- Distributed cost-filter state across multiple gateway instances.
+- Agent-driven routing preferences (`agent-shim-budget` header).
+- Image dimension extraction from `BinarySource` (estimator always
+  receives `ImageSizeHint::Unknown` in v0.6.1).
+- Audio / file content end-to-end.
+- Redacted request/response capture & replay.
+- k8s manifests / Helm chart.
+
 ## [0.6.0] — 2026-05-12
 
 Phase 6 release: the gateway becomes **cost-aware**. Three subsystems
