@@ -25,7 +25,7 @@ use crate::cost_estimate::estimate_request_cost;
 use crate::latency_probe::LatencyProbe;
 
 /// One axis on which an upstream was rejected (or noted, in the case of
-/// `LatencyUnknown` / `TiktokenFallback`).
+/// `LatencyUnknown`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FilterReason {
     /// Upstream's `tier` is below the route's `min_tier`.
@@ -38,14 +38,6 @@ pub enum FilterReason {
     /// noted so operators see warm-up periods (metric only; never a
     /// survival decision).
     LatencyUnknown,
-    /// Reserved for a future stricter mode in which `tiktoken-rs` fails
-    /// to encode the request and a character-count fallback is used.
-    /// Today the encoder is initialised once at startup via `OnceLock`
-    /// (see `cost_estimate.rs`) and `encode_ordinary` handles arbitrary
-    /// bytes gracefully — so this variant is defined for API stability
-    /// but never produced by `filter_chain`.
-    #[allow(dead_code)]
-    TiktokenFallback,
 }
 
 impl FilterReason {
@@ -57,7 +49,6 @@ impl FilterReason {
             FilterReason::Latency => "latency",
             FilterReason::Cap => "cap",
             FilterReason::LatencyUnknown => "latency_unknown",
-            FilterReason::TiktokenFallback => "tiktoken_fallback",
         }
     }
 }
@@ -78,8 +69,7 @@ pub struct Note {
 
 /// Outcome of filtering a chain. `survivors` retains original order;
 /// `skipped` lists the rejections; `notes` lists the non-skip events
-/// (`LatencyUnknown`, `TiktokenFallback`) so the caller can still emit
-/// counters for them.
+/// (`LatencyUnknown`) so the caller can still emit counters for them.
 #[derive(Debug, Clone)]
 pub struct FilterOutcome {
     pub survivors: Vec<BackendTarget>,

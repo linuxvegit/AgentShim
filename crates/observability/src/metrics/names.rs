@@ -32,7 +32,7 @@ pub const CONFIG_RELOADS_TOTAL: &str = "agent_shim_config_reloads_total";
 
 // --- Cost-aware routing (Phase 6 P04) ---
 /// Plan 06 P04 T4: per-axis cost-filter skip/note counter.
-/// Labels: reason ∈ {tier, latency, cap, latency_unknown, tiktoken_fallback},
+/// Labels: reason ∈ {tier, latency, cap, latency_unknown},
 ///         upstream, route.
 pub const COST_FILTERED_TOTAL: &str = "agent_shim_cost_filtered_total";
 
