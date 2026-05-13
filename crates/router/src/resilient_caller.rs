@@ -44,6 +44,7 @@ use tracing::Instrument;
 
 use crate::errors::{ResilienceError, TriedUpstream};
 use crate::fallback::{fallback_eligibility_with_overrides, FallbackEligibility};
+use crate::policy_vec::PolicyVec;
 use crate::retry::{retry_with_policy, RetryPolicy};
 
 /// Trait abstraction over the provider registry so tests can substitute a
@@ -136,6 +137,11 @@ impl ResilientCaller {
         client_ip: String,
         frontend_model: String,
     ) -> Result<CanonicalStream, ResilienceError> {
+        let chain_len = chain.len();
+        let retry_policies =
+            PolicyVec::new(retry_policies, chain_len).expect("one retry policy per chain element");
+        let breaker_policies = PolicyVec::new(breaker_policies, chain_len)
+            .expect("one breaker policy per chain element");
         self.complete_inner_with_optional_filter(
             chain,
             req,
@@ -166,6 +172,11 @@ impl ResilientCaller {
         frontend_model: String,
         cost_inputs: CostFilterInputs<'_>,
     ) -> Result<CanonicalStream, ResilienceError> {
+        let chain_len = chain.len();
+        let retry_policies =
+            PolicyVec::new(retry_policies, chain_len).expect("one retry policy per chain element");
+        let breaker_policies = PolicyVec::new(breaker_policies, chain_len)
+            .expect("one breaker policy per chain element");
         self.complete_inner_with_optional_filter(
             chain,
             req,
@@ -186,8 +197,8 @@ impl ResilientCaller {
         &self,
         chain: Vec<BackendTarget>,
         req: CanonicalRequest,
-        retry_policies: Vec<RetryPolicy>,
-        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        retry_policies: PolicyVec<RetryPolicy>,
+        breaker_policies: PolicyVec<crate::circuit_breaker::BreakerPolicy>,
         identity: crate::auth::AgentIdentity,
         client_ip: String,
         frontend_model: String,
@@ -233,14 +244,14 @@ impl ResilientCaller {
             // Re-align the per-position retry/breaker policy vectors
             // with the surviving chain. The pipeline builds these as
             // `vec![policy; chain.len()]` (uniform per route), so we
-            // truncate to the new length to keep the
-            // `debug_assert_eq!(chain.len(), retry_policies.len())`
-            // invariant in `complete_inner` holding.
+            // shorten to the new length via `PolicyVec::retain_first`,
+            // which preserves the same-length invariant by construction
+            // (v0.6.1 P03 / M-7).
             let survivor_count = outcome.survivors.len();
             let mut retry_policies = retry_policies;
             let mut breaker_policies = breaker_policies;
-            retry_policies.truncate(survivor_count);
-            breaker_policies.truncate(survivor_count);
+            retry_policies.retain_first(survivor_count);
+            breaker_policies.retain_first(survivor_count);
             (outcome.survivors, retry_policies, breaker_policies)
         } else {
             (chain, retry_policies, breaker_policies)
@@ -268,22 +279,15 @@ impl ResilientCaller {
         &self,
         chain: Vec<BackendTarget>,
         req: CanonicalRequest,
-        retry_policies: Vec<RetryPolicy>,
-        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        retry_policies: PolicyVec<RetryPolicy>,
+        breaker_policies: PolicyVec<crate::circuit_breaker::BreakerPolicy>,
         identity: crate::auth::AgentIdentity,
         client_ip: String,
         frontend_model: String,
     ) -> Result<CanonicalStream, ResilienceError> {
-        debug_assert_eq!(
-            chain.len(),
-            retry_policies.len(),
-            "one retry policy per chain element"
-        );
-        debug_assert_eq!(
-            chain.len(),
-            breaker_policies.len(),
-            "one breaker policy per chain element"
-        );
+        // Length invariant carried by the `PolicyVec<T>` types
+        // (v0.6.1 P03 / M-7). The chain and both PolicyVecs always
+        // have equal length by construction at every entry point.
 
         // KNOWN LIMITATION (Plan 05 P05 T1): generate a fresh UUID per call
         // until middleware-level request-id plumbing lands. See module doc.
@@ -375,8 +379,8 @@ impl ResilientCaller {
         &self,
         chain: Vec<BackendTarget>,
         req: CanonicalRequest,
-        retry_policies: Vec<RetryPolicy>,
-        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
+        retry_policies: PolicyVec<RetryPolicy>,
+        breaker_policies: PolicyVec<crate::circuit_breaker::BreakerPolicy>,
         identity: &crate::auth::AgentIdentity,
         client_ip: &str,
         frontend_model: &str,

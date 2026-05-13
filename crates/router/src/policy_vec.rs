@@ -5,10 +5,6 @@
 //! internal callers in `resilient_caller.rs` use this to thread the
 //! "one policy per chain element" invariant through the type system,
 //! replacing the v0.6.0 `.truncate()` + `debug_assert_eq!` pattern.
-//!
-//! T1 ships the wrapper alone; the `dead_code` allow is removed when
-//! T2-T5 plumb it through `resilient_caller.rs`.
-#![allow(dead_code)]
 
 use thiserror::Error;
 
@@ -41,14 +37,17 @@ impl<T> PolicyVec<T> {
         Ok(PolicyVec { inner: items })
     }
 
+    #[allow(dead_code)] // part of the wrapper's API; exercised by unit tests only
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[allow(dead_code)] // part of the wrapper's API; exercised by unit tests only
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
+    #[allow(dead_code)] // part of the wrapper's API; exercised by unit tests only
     pub(crate) fn as_slice(&self) -> &[T] {
         &self.inner
     }
@@ -63,6 +62,7 @@ impl<T> PolicyVec<T> {
     }
 
     /// Drop the wrapper; return the inner `Vec`.
+    #[allow(dead_code)] // part of the wrapper's API; exercised by unit tests only
     pub(crate) fn into_inner(self) -> Vec<T> {
         self.inner
     }
