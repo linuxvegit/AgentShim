@@ -413,9 +413,9 @@ See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) fo
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.6.1** — Patch / P04 closure — image-aware cost estimation
-(`ImageTokenEstimator` trait), `#[derive(Metric)]` single-site
-metric registration, `PolicyVec<T>` length-invariant wrapper,
+**v0.6.1** — Patch — closes the five Minor items from Phase 6's P04 review:
+image-aware cost estimation (`ImageTokenEstimator` trait), `#[derive(Metric)]`
+single-site metric registration, `PolicyVec<T>` length-invariant wrapper,
 disciplined lift of frozen-core invariant
 ([ADR-0007](docs/adr/0007-frozen-core-lift-discipline.md)).
 

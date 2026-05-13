@@ -31,8 +31,11 @@ all four of the following rules are honoured**:
 The only permitted additions are:
 - New `pub trait` items.
 - New `pub enum` variants on existing `#[non_exhaustive]` enums.
-- New `pub mod` declarations enabling (a) and the test infrastructure
-  to support them.
+- New `pub enum` items that are themselves `#[non_exhaustive]` (companion
+  types for a new trait — e.g. an input-shape enum the trait method
+  takes by value).
+- New `pub mod` declarations whose body contains only items from the
+  permitted list above, plus `#[cfg(test)]` test modules.
 
 The following are explicitly **not** permitted under this discipline:
 - Adding fields to existing `pub struct`s.
