@@ -4,89 +4,71 @@
 //! conventions: `_total` for counters, `_seconds` for time histograms,
 //! `_bytes` for byte histograms.
 //!
-//! Spec §3.1.
+//! Backwards-compatibility module: each `pub const NAME` here delegates
+//! to the corresponding marker struct's `NAME` const in `catalog`. New
+//! metrics should declare a marker struct in `catalog.rs` and either
+//! call sites use `MarkerStruct::NAME` directly, OR a new `pub const`
+//! is added here for symmetry. Plan v0.6.1 P02 (M-6).
+
+use super::catalog::*;
 
 // --- Request lifecycle ---
-pub const REQUESTS_TOTAL: &str = "agent_shim_requests_total";
-pub const REQUEST_DURATION_SECONDS: &str = "agent_shim_request_duration_seconds";
-pub const REQUEST_BODY_BYTES: &str = "agent_shim_request_body_bytes";
-pub const IN_FLIGHT_REQUESTS: &str = "agent_shim_in_flight_requests";
+pub const REQUESTS_TOTAL: &str = RequestsTotal::NAME;
+pub const REQUEST_DURATION_SECONDS: &str = RequestDurationSeconds::NAME;
+pub const REQUEST_BODY_BYTES: &str = RequestBodyBytes::NAME;
+pub const IN_FLIGHT_REQUESTS: &str = InFlightRequests::NAME;
 
 // --- Resilience layer (mirrors v0.4 tracing taxonomy) ---
-pub const RETRY_ATTEMPTS_TOTAL: &str = "agent_shim_retry_attempts_total";
-pub const RETRY_EXHAUSTED_TOTAL: &str = "agent_shim_retry_exhausted_total";
-pub const FALLBACK_TRANSITIONS_TOTAL: &str = "agent_shim_fallback_transitions_total";
-pub const BREAKER_STATE_CHANGES_TOTAL: &str = "agent_shim_breaker_state_changes_total";
-pub const RATE_LIMIT_REJECTED_TOTAL: &str = "agent_shim_rate_limit_rejected_total";
+pub const RETRY_ATTEMPTS_TOTAL: &str = RetryAttemptsTotal::NAME;
+pub const RETRY_EXHAUSTED_TOTAL: &str = RetryExhaustedTotal::NAME;
+pub const FALLBACK_TRANSITIONS_TOTAL: &str = FallbackTransitionsTotal::NAME;
+pub const BREAKER_STATE_CHANGES_TOTAL: &str = BreakerStateChangesTotal::NAME;
+pub const RATE_LIMIT_REJECTED_TOTAL: &str = RateLimitRejectedTotal::NAME;
 
 // --- Upstream call ---
-pub const UPSTREAM_DURATION_SECONDS: &str = "agent_shim_upstream_duration_seconds";
-pub const UPSTREAM_ERRORS_TOTAL: &str = "agent_shim_upstream_errors_total";
+pub const UPSTREAM_DURATION_SECONDS: &str = UpstreamDurationSeconds::NAME;
+pub const UPSTREAM_ERRORS_TOTAL: &str = UpstreamErrorsTotal::NAME;
 
 // --- Token accounting ---
-pub const TOKENS_INPUT_TOTAL: &str = "agent_shim_tokens_input_total";
-pub const TOKENS_OUTPUT_TOTAL: &str = "agent_shim_tokens_output_total";
+pub const TOKENS_INPUT_TOTAL: &str = TokensInputTotal::NAME;
+pub const TOKENS_OUTPUT_TOTAL: &str = TokensOutputTotal::NAME;
 
 // --- Reload (used by Plan 04) ---
-pub const CONFIG_RELOADS_TOTAL: &str = "agent_shim_config_reloads_total";
+pub const CONFIG_RELOADS_TOTAL: &str = ConfigReloadsTotal::NAME;
 
 // --- Cost-aware routing (Phase 6 P04) ---
-/// Plan 06 P04 T4: per-axis cost-filter skip/note counter.
-/// Labels: reason ∈ {tier, latency, cap, latency_unknown},
-///         upstream, route.
-pub const COST_FILTERED_TOTAL: &str = "agent_shim_cost_filtered_total";
+pub const COST_FILTERED_TOTAL: &str = CostFilteredTotal::NAME;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::catalog;
 
-    /// Every constant must hold a distinct value so we can't accidentally
-    /// shadow one metric with another.
+    /// Every catalog entry must have a distinct name. Replaces the v0.6.0
+    /// hand-maintained `all_unique` array — now a single loop over the
+    /// catalog. M-6 closure.
     #[test]
     fn all_unique() {
-        let all = [
-            REQUESTS_TOTAL,
-            REQUEST_DURATION_SECONDS,
-            REQUEST_BODY_BYTES,
-            IN_FLIGHT_REQUESTS,
-            RETRY_ATTEMPTS_TOTAL,
-            RETRY_EXHAUSTED_TOTAL,
-            FALLBACK_TRANSITIONS_TOTAL,
-            BREAKER_STATE_CHANGES_TOTAL,
-            RATE_LIMIT_REJECTED_TOTAL,
-            UPSTREAM_DURATION_SECONDS,
-            UPSTREAM_ERRORS_TOTAL,
-            TOKENS_INPUT_TOTAL,
-            TOKENS_OUTPUT_TOTAL,
-            CONFIG_RELOADS_TOTAL,
-            COST_FILTERED_TOTAL,
-        ];
-        let set: std::collections::HashSet<&str> = all.iter().copied().collect();
-        assert_eq!(set.len(), all.len(), "duplicate metric name");
+        let descriptors = catalog::iter_descriptors();
+        let set: std::collections::HashSet<&str> =
+            descriptors.iter().map(|d| d.name).collect();
+        assert_eq!(
+            set.len(),
+            descriptors.len(),
+            "duplicate metric name detected"
+        );
     }
 
-    /// All names use the agent_shim_ prefix.
+    /// Every catalog entry must use the `agent_shim_` prefix. Replaces
+    /// the v0.6.0 hand-maintained `all_prefixed` array — now a single
+    /// loop over the catalog. M-6 closure.
     #[test]
     fn all_prefixed() {
-        let all = [
-            REQUESTS_TOTAL,
-            REQUEST_DURATION_SECONDS,
-            REQUEST_BODY_BYTES,
-            IN_FLIGHT_REQUESTS,
-            RETRY_ATTEMPTS_TOTAL,
-            RETRY_EXHAUSTED_TOTAL,
-            FALLBACK_TRANSITIONS_TOTAL,
-            BREAKER_STATE_CHANGES_TOTAL,
-            RATE_LIMIT_REJECTED_TOTAL,
-            UPSTREAM_DURATION_SECONDS,
-            UPSTREAM_ERRORS_TOTAL,
-            TOKENS_INPUT_TOTAL,
-            TOKENS_OUTPUT_TOTAL,
-            CONFIG_RELOADS_TOTAL,
-            COST_FILTERED_TOTAL,
-        ];
-        for name in all {
-            assert!(name.starts_with("agent_shim_"), "{name} missing prefix");
+        for d in catalog::iter_descriptors() {
+            assert!(
+                d.name.starts_with("agent_shim_"),
+                "{} missing agent_shim_ prefix",
+                d.name
+            );
         }
     }
 }
