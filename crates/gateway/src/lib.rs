@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod commands;
 pub mod handlers;
+pub mod image_estimator_selector;
 pub mod latency_probe;
 pub mod metrics_layer;
 pub mod pipeline;

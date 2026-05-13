@@ -688,6 +688,11 @@ async fn run_stream(
     let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
     let upstream_stream_result = match route_entry {
         Some(route) => {
+            // Plan v0.6.1 P04 T7 (M-8): pick the per-frontend image-token
+            // estimator so the cost-cap pre-pass charges image blocks at
+            // the same rate the upstream will bill.
+            let image_estimator =
+                crate::image_estimator_selector::select_image_estimator(frontend_kind);
             state
                 .core
                 .resilient_caller
@@ -703,6 +708,7 @@ async fn run_stream(
                         route,
                         config: &snapshot.config,
                         route_label: frontend_model,
+                        image_estimator,
                     },
                 )
                 .await
@@ -834,6 +840,11 @@ async fn run_unary(
     let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
     let stream_result = match route_entry {
         Some(route) => {
+            // Plan v0.6.1 P04 T7 (M-8): per-frontend image-token estimator
+            // selection — see `run_stream` for the matching wiring on the
+            // streaming path.
+            let image_estimator =
+                crate::image_estimator_selector::select_image_estimator(frontend_kind);
             state
                 .core
                 .resilient_caller
@@ -849,6 +860,7 @@ async fn run_unary(
                         route,
                         config: &snapshot.config,
                         route_label: frontend_model,
+                        image_estimator,
                     },
                 )
                 .await

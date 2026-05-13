@@ -117,6 +117,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus-parse",
  "serde",
+ "serde_json",
  "tokio",
  "tower 0.5.3",
  "tower-http",

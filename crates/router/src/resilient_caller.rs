@@ -71,6 +71,12 @@ pub struct CostFilterInputs<'a> {
     /// request share a single string form (typically
     /// `"<frontend>/<model>"`).
     pub route_label: String,
+    /// Per-request image-token estimator. The gateway selects this
+    /// from the inbound `FrontendKind` and stashes a reference here.
+    /// `cost_filter` passes it through to `estimate_request_cost` so
+    /// image blocks contribute to the per-route cost-cap pre-pass.
+    /// Plan v0.6.1 P04 (M-8).
+    pub image_estimator: &'a dyn agent_shim_core::cost::ImageTokenEstimator,
 }
 
 /// The resilience-layer entry point.
@@ -217,6 +223,7 @@ impl ResilientCaller {
                 &req,
                 ci.config,
                 self.probe.as_ref(),
+                ci.image_estimator,
             );
             for skip in &outcome.skipped {
                 metrics::counter!(

@@ -16,17 +16,19 @@
 //! tokenizer is initialised once via a `OnceLock`, matching the pattern
 //! established in `crates/frontends/src/anthropic_messages/count_tokens.rs`.
 //!
-//! Only `ContentBlock::Text` blocks contribute to the input estimate
-//! today — ToolCall/ToolResult/Image blocks are skipped for estimation
-//! simplicity. A generous overestimate isn't needed for those because
-//! the cost cap is itself a coarse guardrail; if multimodal cost
-//! tracking becomes important, extend this module.
+//! Text blocks contribute to the input estimate via the `cl100k_base`
+//! tokenizer. Image blocks are accounted for via the per-frontend
+//! `ImageTokenEstimator` injected by the caller — see
+//! `agent_shim_core::cost::ImageTokenEstimator` (Plan v0.6.1 P04, M-8).
+//! ToolCall/ToolResult blocks remain skipped: their wire form is small
+//! enough that the conservative per-image worst-case dwarfs them.
 
 use std::sync::OnceLock;
 
 use tiktoken_rs::CoreBPE;
 
 use agent_shim_config::UpstreamCost;
+use agent_shim_core::cost::{ImageSizeHint, ImageTokenEstimator};
 use agent_shim_core::{CanonicalRequest, ContentBlock};
 
 /// Conservative default cap for output tokens when the request doesn't
@@ -46,13 +48,21 @@ pub struct CostEstimate {
 /// the given `cost` schedule. When `cost` is `None` (e.g. Copilot
 /// subscription product), this returns `None` — there is no per-request
 /// cost to estimate, so the cap effectively never fires.
+///
+/// `image_estimator` supplies the per-frontend image-token math. Plan
+/// v0.6.1 P04 (M-8): this is dispatched by the gateway from the
+/// inbound `FrontendKind` so the cost cap stays consistent with what
+/// the upstream will actually bill.
 pub fn estimate_request_cost(
     request: &CanonicalRequest,
     cost: Option<&UpstreamCost>,
+    image_estimator: &dyn ImageTokenEstimator,
 ) -> Option<CostEstimate> {
     let cost = cost?;
 
-    let input_tokens = estimate_input_tokens(request);
+    let text_tokens = estimate_text_tokens(request);
+    let image_tokens = estimate_image_tokens(request, image_estimator);
+    let input_tokens = text_tokens.saturating_add(image_tokens);
     let output_tokens = output_token_cap(request);
 
     let cost_usd = (input_tokens as f64 * cost.input_per_million_usd
@@ -70,12 +80,35 @@ fn cl100k() -> &'static CoreBPE {
     CELL.get_or_init(|| tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize"))
 }
 
-/// Estimate input tokens using `cl100k_base`. `encode_ordinary` keeps
-/// `<|...|>` literals in user content from being interpreted as special
-/// tokens.
-fn estimate_input_tokens(request: &CanonicalRequest) -> u32 {
+/// Estimate input text tokens using `cl100k_base`. `encode_ordinary`
+/// keeps `<|...|>` literals in user content from being interpreted as
+/// special tokens.
+fn estimate_text_tokens(request: &CanonicalRequest) -> u32 {
     let text = canonical_request_text(request);
     cl100k().encode_ordinary(&text).len() as u32
+}
+
+/// Estimate input image tokens by walking every message's content
+/// blocks and asking the supplied `ImageTokenEstimator` to price each
+/// `Image` block. The canonical `ImageBlock` (see
+/// `agent_shim_core::content::ImageBlock`) does NOT carry width/height,
+/// so the estimator always receives `ImageSizeHint::Unknown` here and
+/// falls back to a vendor-published worst-case figure. Plan v0.6.1
+/// P04 (M-8).
+fn estimate_image_tokens(
+    request: &CanonicalRequest,
+    image_estimator: &dyn ImageTokenEstimator,
+) -> u32 {
+    let mut tokens: u32 = 0;
+    for msg in &request.messages {
+        for block in &msg.content {
+            if matches!(block, ContentBlock::Image(_)) {
+                tokens =
+                    tokens.saturating_add(image_estimator.tokens_for_image(ImageSizeHint::Unknown));
+            }
+        }
+    }
+    tokens
 }
 
 /// Pull the output cap from the request, falling back to a conservative
@@ -108,12 +141,27 @@ mod tests {
     use super::*;
     use agent_shim_core::{
         content::TextBlock,
+        cost::{ImageSizeHint, ImageTokenEstimator},
         extensions::ExtensionMap,
         ids::RequestId,
         message::{Message, MessageRole},
         request::{CanonicalRequest, GenerationOptions, RequestMetadata},
         target::{FrontendInfo, FrontendKind, FrontendModel},
     };
+
+    /// Test-only image-token estimator that returns zero tokens for every
+    /// image. The pre-existing v0.6.0 unit tests don't include image
+    /// blocks, so this is behaviourally identical to the old 2-arg
+    /// signature for them — keeps the test bodies focused on the text
+    /// path. Image-aware behaviour is covered by the integration tests
+    /// in `crates/router/tests/cost_estimate_image.rs`.
+    struct NoImagesEstimator;
+
+    impl ImageTokenEstimator for NoImagesEstimator {
+        fn tokens_for_image(&self, _hint: ImageSizeHint) -> u32 {
+            0
+        }
+    }
 
     fn req(text: &str, max_tokens: Option<u32>) -> CanonicalRequest {
         let model = FrontendModel("m".into());
@@ -152,7 +200,7 @@ mod tests {
     #[test]
     fn cost_none_returns_none() {
         let r = req("hello", None);
-        assert!(estimate_request_cost(&r, None).is_none());
+        assert!(estimate_request_cost(&r, None, &NoImagesEstimator).is_none());
     }
 
     #[test]
@@ -162,7 +210,8 @@ mod tests {
             output_per_million_usd: 2.0,
         };
         let r = req("hello world", Some(100));
-        let est = estimate_request_cost(&r, Some(&cost)).expect("cost present, request present");
+        let est = estimate_request_cost(&r, Some(&cost), &NoImagesEstimator)
+            .expect("cost present, request present");
         // Don't assert exact value (tokenizer-dependent); just that it's
         // a reasonable bound for a short text + tiny output cap.
         assert!(est.cost_usd >= 0.0);

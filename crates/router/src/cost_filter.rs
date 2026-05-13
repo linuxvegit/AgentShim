@@ -19,6 +19,7 @@
 use agent_shim_config::{
     upstream_cost, upstream_latency_budget, upstream_tier, GatewayConfig, RouteEntry,
 };
+use agent_shim_core::cost::ImageTokenEstimator;
 use agent_shim_core::{BackendTarget, CanonicalRequest};
 
 use crate::cost_estimate::estimate_request_cost;
@@ -84,12 +85,18 @@ pub struct FilterOutcome {
 /// upstream is the one recorded; subsequent axes are not evaluated for
 /// that upstream. This matches the spec's "first reason wins" semantics
 /// for the per-upstream skip envelope.
+///
+/// `image_estimator` supplies the per-frontend image-token math used by
+/// the cost-cap axis. Plan v0.6.1 P04 (M-8): the gateway selects the
+/// concrete impl from the inbound `FrontendKind` and threads it here
+/// via `CostFilterInputs::image_estimator`.
 pub fn filter_chain(
     chain: Vec<BackendTarget>,
     route: &RouteEntry,
     request: &CanonicalRequest,
     config: &GatewayConfig,
     probe: &dyn LatencyProbe,
+    image_estimator: &dyn ImageTokenEstimator,
 ) -> FilterOutcome {
     let mut survivors = Vec::with_capacity(chain.len());
     let mut skipped = Vec::new();
@@ -146,7 +153,7 @@ pub fn filter_chain(
         // Axis 3: cost cap
         if let Some(cap) = route.max_cost_usd {
             let upstream_cost = upstream_cost(upstream_cfg);
-            if let Some(est) = estimate_request_cost(request, upstream_cost) {
+            if let Some(est) = estimate_request_cost(request, upstream_cost, image_estimator) {
                 if est.cost_usd > cap {
                     skipped.push(Skip {
                         upstream: upstream_name,
@@ -187,6 +194,7 @@ mod tests {
         BackendTarget, ContentBlock,
     };
 
+    use crate::image_estimators::AnthropicImageEstimator;
     use crate::latency_probe::{DisabledLatencyProbe, MockLatencyProbe};
 
     // ---- fixture helpers ----
@@ -312,6 +320,7 @@ mod tests {
             &req,
             &cfg,
             &DisabledLatencyProbe,
+            &AnthropicImageEstimator,
         );
 
         assert_eq!(outcome.survivors.len(), 1);
@@ -342,6 +351,7 @@ mod tests {
             &req,
             &cfg,
             &probe,
+            &AnthropicImageEstimator,
         );
 
         assert_eq!(outcome.survivors.len(), 1);
@@ -382,6 +392,7 @@ mod tests {
             &req,
             &cfg,
             &DisabledLatencyProbe,
+            &AnthropicImageEstimator,
         );
 
         assert!(outcome.survivors.is_empty());
@@ -406,6 +417,7 @@ mod tests {
             &req,
             &cfg,
             &DisabledLatencyProbe,
+            &AnthropicImageEstimator,
         );
 
         assert!(outcome.survivors.is_empty());
@@ -441,6 +453,7 @@ mod tests {
             &req,
             &cfg,
             &DisabledLatencyProbe,
+            &AnthropicImageEstimator,
         );
 
         let survivor_names: Vec<&str> = outcome
