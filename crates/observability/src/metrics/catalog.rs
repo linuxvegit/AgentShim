@@ -27,6 +27,7 @@
 //!    exactly the boilerplate this catalog module is designed to delete.
 #![allow(unsafe_code)]
 
+use agent_shim_observability_derive::Metric;
 use linkme::distributed_slice;
 
 /// Kind of a Prometheus metric. Determines which `metrics::describe_*!`
@@ -59,8 +60,11 @@ pub fn iter_descriptors() -> Vec<&'static MetricDescriptor> {
 }
 
 // --- Marker structs: one per emitted metric ---------------------------
+//
+// Order mirrors `describe_metrics()` in `mod.rs` for easy parity review.
+// Sub-section dividers below group by domain.
 
-use agent_shim_observability_derive::Metric;
+// --- Request lifecycle ---
 
 #[derive(Metric)]
 #[metric(
@@ -93,6 +97,8 @@ pub struct RequestBodyBytes;
     help = "Currently-in-flight requests"
 )]
 pub struct InFlightRequests;
+
+// --- Resilience layer (mirrors v0.4 tracing taxonomy) ---
 
 #[derive(Metric)]
 #[metric(
@@ -134,6 +140,8 @@ pub struct BreakerStateChangesTotal;
 )]
 pub struct RateLimitRejectedTotal;
 
+// --- Upstream call ---
+
 #[derive(Metric)]
 #[metric(
     name = "agent_shim_upstream_duration_seconds",
@@ -149,6 +157,8 @@ pub struct UpstreamDurationSeconds;
     help = "Upstream errors by class"
 )]
 pub struct UpstreamErrorsTotal;
+
+// --- Token accounting ---
 
 #[derive(Metric)]
 #[metric(
@@ -166,6 +176,8 @@ pub struct TokensInputTotal;
 )]
 pub struct TokensOutputTotal;
 
+// --- Reload (used by Plan 04) ---
+
 #[derive(Metric)]
 #[metric(
     name = "agent_shim_config_reloads_total",
@@ -173,6 +185,8 @@ pub struct TokensOutputTotal;
     help = "Config reload attempts by result"
 )]
 pub struct ConfigReloadsTotal;
+
+// --- Cost-aware routing (Phase 6 P04) ---
 
 #[derive(Metric)]
 #[metric(
