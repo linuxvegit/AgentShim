@@ -21,6 +21,9 @@ const OPENAI_LOW_DETAIL_TOKENS: u32 = 85;
 const OPENAI_HIGH_BASE_TOKENS: u32 = 85;
 const OPENAI_HIGH_PER_TILE_TOKENS: u32 = 170;
 const OPENAI_TILE_PIXELS: u32 = 512;
+/// Single-image worst-case after OpenAI's documented 2048→768 rescale,
+/// in high-detail mode. Used as the Unknown-dimension fallback. Source:
+/// OpenAI Vision pricing docs (single-image cap).
 const OPENAI_UNKNOWN_TOKENS: u32 = 1105;
 
 /// Compute high-detail tile-math cost for given dimensions. Used by both

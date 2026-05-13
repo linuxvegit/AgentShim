@@ -4,21 +4,23 @@
 //! image is approximated as `tokens = ceil((width * height) / 750)` per
 //! Anthropic's published guidance (the divisor varies by model family;
 //! 750 is the documented worst-case for sonnet/haiku as of v0.6.1
-//! release). Unknown-dimension fallback is 1600 tokens — the cost of
-//! a 1024x1024 image at the documented divisor, rounded up.
+//! release). The Unknown-dimension fallback is set conservatively above
+//! the cost of a 1024×1024 image (≈1399 at the v0.6.1 divisor) so
+//! Unknown remains a strict upper bound on Known(1024²).
 
 use agent_shim_core::cost::{ImageSizeHint, ImageTokenEstimator};
 
 /// Stateless dispatcher to Anthropic's image-token math.
 pub struct AnthropicImageEstimator;
 
-/// Anthropic's documented worst-case token cost for an image of unknown
-/// dimensions. Equal to the cost of a 1024x1024 image at the v0.6.1
-/// divisor.
+/// Anthropic's worst-case token cost for an image of unknown dimensions.
+/// Set above the cost of a 1024×1024 image (≈1399 at the v0.6.1 divisor)
+/// so Unknown remains a strict upper bound on Known(1024²) — the cost-cap
+/// filter is intentionally conservative.
 const ANTHROPIC_UNKNOWN_TOKENS: u32 = 1600;
 
-/// Anthropic's documented divisor: tokens ≈ (w × h) / DIVISOR.
-const ANTHROPIC_TOKENS_DIVISOR: u32 = 750;
+/// Anthropic's documented divisor: tokens ≈ (w × h) / PIXELS_PER_TOKEN.
+const ANTHROPIC_PIXELS_PER_TOKEN: u32 = 750;
 
 impl ImageTokenEstimator for AnthropicImageEstimator {
     fn tokens_for_image(&self, hint: ImageSizeHint) -> u32 {
@@ -29,10 +31,12 @@ impl ImageTokenEstimator for AnthropicImageEstimator {
                 height,
                 detail: _,
             } => {
-                // Anthropic doesn't expose a "low/high" detail axis the
-                // way OpenAI does — `detail` is ignored on this path.
+                // Anthropic doesn't currently expose a "low/high" detail
+                // axis the way OpenAI does — `detail` is intentionally
+                // ignored. If Anthropic later publishes detail-tier
+                // pricing, branch on `detail` here.
                 let pixels = (width as u64) * (height as u64);
-                pixels.div_ceil(ANTHROPIC_TOKENS_DIVISOR as u64) as u32
+                pixels.div_ceil(ANTHROPIC_PIXELS_PER_TOKEN as u64) as u32
             }
             // Forward-compat: future ImageSizeHint variants conservatively
             // map to the Unknown-fallback worst case. `ImageSizeHint` is
