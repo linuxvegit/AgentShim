@@ -1,0 +1,7 @@
+error: #[derive(Metric)] requires `#[metric(name = "...")]`
+ --> tests/ui/derive_fail_missing_name.rs:3:10
+  |
+3 | #[derive(Metric)]
+  |          ^^^^^^
+  |
+  = note: this error originates in the derive macro `Metric` (in Nightly builds, run with -Z macro-backtrace for more info)
