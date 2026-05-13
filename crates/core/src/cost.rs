@@ -29,7 +29,13 @@ pub trait ImageTokenEstimator: Send + Sync {
 /// The canonical `ImageBlock` does NOT record width/height (only the
 /// `BinarySource`), so the estimator may receive `Unknown` and is
 /// required to fall back to a vendor-published worst-case figure.
+///
+/// Marked `#[non_exhaustive]` so that future additions (e.g. a
+/// `PartiallyKnown { content_type }` variant) don't break every
+/// match arm in the workspace. Implementations must include a
+/// wildcard arm that conservatively maps to `Unknown` semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImageSizeHint {
     /// Dimensions and detail level are both known (e.g. a future frontend
     /// adapter cached them at decode time and stashed in `extensions`).
@@ -47,10 +53,25 @@ pub enum ImageSizeHint {
 /// and to Anthropic's documented low-/high-detail breakpoints. `Auto`
 /// means the impl chooses (typically by treating it as `High` for
 /// upper-bound estimation).
+///
+/// Marked `#[non_exhaustive]` so that future vendor pricing tiers
+/// (e.g. an `Ultra` mode) can be added without breaking every match
+/// arm in the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ImageDetail {
+    /// Vendor's lowest-cost detail mode. For OpenAI: a flat 85 tokens
+    /// regardless of dimensions. For Anthropic: not separately priced;
+    /// impls may treat as equivalent to `High` since the divisor is
+    /// the same.
     Low,
+    /// Vendor's full-detail / tile-math mode. For OpenAI: 85 base +
+    /// 170 per 512×512 tile after rescaling. For Anthropic: the
+    /// documented `(width × height) / divisor` math.
     High,
+    /// Vendor chooses based on size. Estimators conservatively treat
+    /// `Auto` as `High` for upper-bound cost-cap purposes; the live
+    /// model may opt for `Low` at request time.
     Auto,
 }
 
