@@ -332,6 +332,36 @@ skipped upstream and the per-axis reason. The 503 is rendered through
 the inbound frontend's existing error envelope (Anthropic, OpenAI
 Chat, OpenAI Responses).
 
+### Image-aware cost estimation (v0.6.1+)
+
+As of v0.6.1, image content blocks contribute to the per-request
+input-token estimate that `max_cost_usd` is evaluated against. The
+estimator dispatches by inbound `FrontendKind`:
+
+- **Anthropic Messages frontend** → uses Anthropic's documented
+  token-per-pixel divisor, falling back to a 1600-token worst-case
+  for images of unknown dimensions.
+- **OpenAI Chat frontend** → uses OpenAI's documented tile math
+  (85 + 170 × ⌈w/512⌉ × ⌈h/512⌉ for high-detail), falling back to
+  1105 tokens for unknown dimensions.
+- **OpenAI Responses frontend** → mirrors OpenAI's math.
+
+The canonical request type doesn't record image dimensions today —
+the gateway always passes `ImageSizeHint::Unknown` to the estimator,
+which means image cost contribution is always the vendor's published
+worst-case figure. This makes the cap **conservative** (rejects more
+requests than the realised cost will actually be), which matches the
+v0.6.0 design intent for `max_cost_usd` ("reject if it COULD cost
+more than $X").
+
+Accuracy bar: each estimator's output is within ±5% of the
+vendor-published token figures for fixture inputs verified in
+[the impl's `#[cfg(test)]` tests](../crates/router/src/image_estimators/).
+
+Realised-cost feedback (rolling EWMA over observed token usage) is
+still v0.7+ scope — see [ADR-0006](adr/0006-cost-aware-routing.md)'s
+Open Questions section.
+
 ### Validation rules 15-18
 
 The v0.6 schema adds four new validation rules on top of the v0.5
