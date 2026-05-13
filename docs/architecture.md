@@ -126,6 +126,28 @@ ADR-0003 was a bounded one-time exception in Phase 3. All five Phase 4
 plan files declared `core changes: NONE`, and `git diff v0.3.0..v0.4.0
 -- crates/core/` is empty for the v0.4.0 release tag.
 
+### Disciplined lift of the frozen-core invariant (v0.6.1)
+
+The strict frozen-core invariant from v0.2 ("empty diff against the
+v0.2 release baseline for `crates/core/`") was lifted in v0.6.1 to
+admit one new trait module (`crates/core/src/cost.rs`, hosting the
+`ImageTokenEstimator` trait that the cost-aware filter consumes
+from the router crate). The lift is bound by four discipline rules
+documented in [ADR-0007](adr/0007-frozen-core-lift-discipline.md):
+
+1. **Trait-only additions** — no field changes, no signature
+   changes on existing items.
+2. **Category tag per hunk** — every `crates/core/` diff entry is
+   classified in the release notes.
+3. **Re-state in the next phase spec** — Phase 7's design will
+   diff against the v0.6.1 baseline, not the v0.5.0 baseline.
+4. **Other frozen crates stay frozen** — `crates/frontends/` and
+   `crates/providers/src/` remain at zero diff against the v0.6.0
+   baseline in v0.6.1.
+
+ADR-0007 lays out a worked example for how v0.7+ phases may navigate
+similar additions.
+
 ## Observability layer (v0.5)
 
 Three subsystems, all running concurrently with each request, all
