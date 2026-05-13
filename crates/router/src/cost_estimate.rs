@@ -35,9 +35,8 @@ use agent_shim_core::{CanonicalRequest, ContentBlock};
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 /// Outcome of a single estimation. Today this is just the USD cost —
-/// see module docs for the formula. A future stricter mode may add a
-/// `used_fallback_encoder: bool` here; for now the encoder is infallible
-/// in practice and the cost filter never needs that signal at runtime.
+/// see module docs for the formula. The encoder (`cl100k_base` via
+/// `OnceLock`) is infallible in practice; no fallback flag is needed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
     pub cost_usd: f64,
