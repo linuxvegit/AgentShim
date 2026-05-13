@@ -49,8 +49,7 @@ mod tests {
     #[test]
     fn all_unique() {
         let descriptors = catalog::iter_descriptors();
-        let set: std::collections::HashSet<&str> =
-            descriptors.iter().map(|d| d.name).collect();
+        let set: std::collections::HashSet<&str> = descriptors.iter().map(|d| d.name).collect();
         assert_eq!(
             set.len(),
             descriptors.len(),
