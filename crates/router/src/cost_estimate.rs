@@ -141,7 +141,6 @@ mod tests {
     use super::*;
     use agent_shim_core::{
         content::TextBlock,
-        cost::{ImageSizeHint, ImageTokenEstimator},
         extensions::ExtensionMap,
         ids::RequestId,
         message::{Message, MessageRole},
