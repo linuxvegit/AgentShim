@@ -16,7 +16,9 @@
 //! responsible for translating `Skip`s and `Note`s into
 //! `agent_shim_cost_filtered_total` counter increments.
 
-use agent_shim_config::{GatewayConfig, RouteEntry, Tier, UpstreamConfig, UpstreamCost};
+use agent_shim_config::{
+    upstream_cost, upstream_latency_budget, upstream_tier, GatewayConfig, RouteEntry,
+};
 use agent_shim_core::{BackendTarget, CanonicalRequest};
 
 use crate::cost_estimate::estimate_request_cost;
@@ -119,7 +121,7 @@ pub fn filter_chain(
 
         // Axis 1: tier
         if let Some(min_tier) = route.min_tier {
-            let upstream_tier = upstream_config_tier(upstream_cfg);
+            let upstream_tier = upstream_tier(upstream_cfg);
             if upstream_tier < min_tier {
                 skipped.push(Skip {
                     upstream: upstream_name,
@@ -130,7 +132,7 @@ pub fn filter_chain(
         }
 
         // Axis 2: latency
-        let p95_budget = upstream_config_latency_budget(upstream_cfg);
+        let p95_budget = upstream_latency_budget(upstream_cfg);
         if let Some(budget) = p95_budget {
             match probe.recent_p95_ms(&upstream_name) {
                 Some(measured) if measured > budget => {
@@ -153,7 +155,7 @@ pub fn filter_chain(
 
         // Axis 3: cost cap
         if let Some(cap) = route.max_cost_usd {
-            let upstream_cost = upstream_config_cost(upstream_cfg);
+            let upstream_cost = upstream_cost(upstream_cfg);
             if let Some(est) = estimate_request_cost(request, upstream_cost) {
                 if est.cost_usd > cap {
                     skipped.push(Skip {
@@ -175,43 +177,6 @@ pub fn filter_chain(
         survivors,
         skipped,
         notes,
-    }
-}
-
-// ---- helpers (per-variant config accessors) ----
-//
-// These mirror the equivalent shape in `crates/config/src/validation.rs`
-// rules 15-17 (Plan 06 P03). If the duplication becomes annoying, a
-// shared trait or extension impl on `UpstreamConfig` is the right
-// refactor — but keep that out of T3.
-
-fn upstream_config_tier(u: &UpstreamConfig) -> Tier {
-    match u {
-        UpstreamConfig::OpenAiCompatible(c) => c.tier,
-        UpstreamConfig::GithubCopilot(c) => c.tier,
-        UpstreamConfig::Anthropic(c) => c.tier,
-        UpstreamConfig::Deepseek(c) => c.tier,
-        UpstreamConfig::Gemini(c) => c.tier,
-    }
-}
-
-fn upstream_config_cost(u: &UpstreamConfig) -> Option<&UpstreamCost> {
-    match u {
-        UpstreamConfig::OpenAiCompatible(c) => c.cost.as_ref(),
-        UpstreamConfig::GithubCopilot(c) => c.cost.as_ref(),
-        UpstreamConfig::Anthropic(c) => c.cost.as_ref(),
-        UpstreamConfig::Deepseek(c) => c.cost.as_ref(),
-        UpstreamConfig::Gemini(c) => c.cost.as_ref(),
-    }
-}
-
-fn upstream_config_latency_budget(u: &UpstreamConfig) -> Option<u64> {
-    match u {
-        UpstreamConfig::OpenAiCompatible(c) => c.p95_latency_budget_ms,
-        UpstreamConfig::GithubCopilot(c) => c.p95_latency_budget_ms,
-        UpstreamConfig::Anthropic(c) => c.p95_latency_budget_ms,
-        UpstreamConfig::Deepseek(c) => c.p95_latency_budget_ms,
-        UpstreamConfig::Gemini(c) => c.p95_latency_budget_ms,
     }
 }
 
