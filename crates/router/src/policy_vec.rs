@@ -31,7 +31,7 @@ pub(crate) struct PolicyVec<T> {
 impl<T> PolicyVec<T> {
     /// Construct, enforcing `items.len() == expected_len`. Returns
     /// [`PolicyVecLenError`] otherwise.
-    pub fn new(items: Vec<T>, expected_len: usize) -> Result<Self, PolicyVecLenError> {
+    pub(crate) fn new(items: Vec<T>, expected_len: usize) -> Result<Self, PolicyVecLenError> {
         if items.len() != expected_len {
             return Err(PolicyVecLenError {
                 actual: items.len(),
@@ -41,28 +41,29 @@ impl<T> PolicyVec<T> {
         Ok(PolicyVec { inner: items })
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
 
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    pub fn as_slice(&self) -> &[T] {
+    pub(crate) fn as_slice(&self) -> &[T] {
         &self.inner
     }
 
-    /// Shorten the inner vector to its first `n` elements, preserving the
-    /// length-paired invariant when the caller is also shortening the
-    /// paired chain to the same `n`.
-    pub fn retain_first(&mut self, n: usize) {
+    /// Shorten the inner vector to its first `n` elements. Post-condition:
+    /// the length-paired invariant becomes the caller's responsibility —
+    /// the wrapper does not reach back to the chain it was constructed
+    /// against. Callers must shorten that chain to the same `n` in lock
+    /// step (which `resilient_caller.rs` does).
+    pub(crate) fn retain_first(&mut self, n: usize) {
         self.inner.truncate(n);
     }
 
     /// Drop the wrapper; return the inner `Vec`.
-    pub fn into_inner(self) -> Vec<T> {
+    pub(crate) fn into_inner(self) -> Vec<T> {
         self.inner
     }
 }
@@ -88,12 +89,9 @@ mod tests {
     #[test]
     fn new_rejects_mismatched_length() {
         let err = PolicyVec::new(vec![1u8, 2, 3], 4).expect_err("len mismatch");
-        match err {
-            PolicyVecLenError { actual, expected } => {
-                assert_eq!(actual, 3);
-                assert_eq!(expected, 4);
-            }
-        }
+        let PolicyVecLenError { actual, expected } = err;
+        assert_eq!(actual, 3);
+        assert_eq!(expected, 4);
     }
 
     #[test]
