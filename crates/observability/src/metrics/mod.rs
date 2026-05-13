@@ -91,62 +91,21 @@ pub fn install(cfg: &MetricsConfig) -> Arc<MetricsHandle> {
 /// Register descriptions for every metric so /metrics returns text even
 /// when no observation has been made. Without this, freshly-started
 /// gateways serve an empty body and operators wonder if scrape works.
+///
+/// Iterates every descriptor in `catalog::iter_descriptors()` and emits
+/// a `describe_*!` for each. Adding a new metric is a one-site edit in
+/// `catalog.rs` (struct with `#[derive(Metric)]`). Plan v0.6.1 P02 (M-6).
 fn describe_metrics() {
+    use catalog::MetricKind;
     use metrics::{describe_counter, describe_gauge, describe_histogram};
-    use names::*;
 
-    describe_counter!(
-        REQUESTS_TOTAL,
-        "Total HTTP requests by frontend, route, status_class"
-    );
-    describe_histogram!(
-        REQUEST_DURATION_SECONDS,
-        metrics::Unit::Seconds,
-        "End-to-end request duration"
-    );
-    describe_histogram!(
-        REQUEST_BODY_BYTES,
-        metrics::Unit::Bytes,
-        "Inbound request body size"
-    );
-    describe_gauge!(IN_FLIGHT_REQUESTS, "Currently-in-flight requests");
-
-    describe_counter!(
-        RETRY_ATTEMPTS_TOTAL,
-        "Retry attempts by route, upstream, attempt number"
-    );
-    describe_counter!(
-        RETRY_EXHAUSTED_TOTAL,
-        "Routes that exhausted all retry attempts"
-    );
-    describe_counter!(
-        FALLBACK_TRANSITIONS_TOTAL,
-        "Fallback chain element transitions"
-    );
-    describe_counter!(
-        BREAKER_STATE_CHANGES_TOTAL,
-        "Circuit breaker state transitions"
-    );
-    describe_counter!(
-        RATE_LIMIT_REJECTED_TOTAL,
-        "Rate-limit rejections by dimension"
-    );
-
-    describe_histogram!(
-        UPSTREAM_DURATION_SECONDS,
-        metrics::Unit::Seconds,
-        "Upstream call duration"
-    );
-    describe_counter!(UPSTREAM_ERRORS_TOTAL, "Upstream errors by class");
-
-    describe_counter!(TOKENS_INPUT_TOTAL, "Input tokens consumed");
-    describe_counter!(TOKENS_OUTPUT_TOTAL, "Output tokens produced");
-
-    describe_counter!(CONFIG_RELOADS_TOTAL, "Config reload attempts by result");
-    describe_counter!(
-        COST_FILTERED_TOTAL,
-        "Cost-filter skip/note counts by reason, upstream, route (Plan 06 P04)"
-    );
+    for d in catalog::iter_descriptors() {
+        match d.kind {
+            MetricKind::Counter => describe_counter!(d.name, d.help),
+            MetricKind::Histogram => describe_histogram!(d.name, d.help),
+            MetricKind::Gauge => describe_gauge!(d.name, d.help),
+        }
+    }
 }
 
 #[cfg(test)]
