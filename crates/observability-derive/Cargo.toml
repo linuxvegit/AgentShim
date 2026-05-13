@@ -1,0 +1,18 @@
+[package]
+name = "agent-shim-observability-derive"
+version = "0.6.1-dev"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Internal proc-macro crate for the agent-shim observability layer."
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+trybuild = "1"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/config", "crates/observability", "crates/gateway", "crates/frontends", "crates/protocol-tests", "crates/providers", "crates/router"]
+members = ["crates/core", "crates/config", "crates/observability", "crates/observability-derive", "crates/gateway", "crates/frontends", "crates/protocol-tests", "crates/providers", "crates/router"]
 
 [workspace.package]
 version = "0.6.0"
