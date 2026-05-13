@@ -32,3 +32,4 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 prometheus-parse.workspace = true
 axum = { workspace = true, features = ["macros"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }
+serde_json = "1"
