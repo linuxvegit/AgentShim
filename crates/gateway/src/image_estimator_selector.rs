@@ -20,9 +20,7 @@
 
 use agent_shim_core::cost::ImageTokenEstimator;
 use agent_shim_core::target::FrontendKind;
-use agent_shim_router::{
-    AnthropicImageEstimator, OpenAiImageEstimator, ResponsesImageEstimator,
-};
+use agent_shim_router::{AnthropicImageEstimator, OpenAiImageEstimator, ResponsesImageEstimator};
 
 /// Unit-struct singletons live as `&'static` constants so the selector
 /// can return `&'static dyn ImageTokenEstimator` without leaking
