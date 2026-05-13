@@ -53,3 +53,38 @@ pub enum ImageDetail {
     High,
     Auto,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal in-crate impl used to confirm the trait shape.
+    /// Production impls live in `agent_shim_router::image_estimators`.
+    struct DummyEstimator;
+
+    impl ImageTokenEstimator for DummyEstimator {
+        fn tokens_for_image(&self, hint: ImageSizeHint) -> u32 {
+            match hint {
+                ImageSizeHint::Known { width, height, .. } => (width * height) / 1000,
+                ImageSizeHint::Unknown => 1024, // sentinel worst-case
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_hint_uses_fallback() {
+        let est = DummyEstimator;
+        assert_eq!(est.tokens_for_image(ImageSizeHint::Unknown), 1024);
+    }
+
+    #[test]
+    fn known_hint_uses_dimensions() {
+        let est = DummyEstimator;
+        let n = est.tokens_for_image(ImageSizeHint::Known {
+            width: 1024,
+            height: 1024,
+            detail: ImageDetail::High,
+        });
+        assert_eq!(n, 1048); // (1024 * 1024) / 1000 = 1048
+    }
+}
