@@ -198,7 +198,7 @@ implementers see the deferrals and can pick them up:
   arbitrary bytes gracefully. If a future stricter mode wants to
   surface encoder fallbacks, the variant is already in place; for v0.6
   it just earns the `dead_code` allow.
-  *Tracked for v0.7.*
+  *Closed in v0.6.1 (commit `dbd9bb3`).*
 
 - **M-3 — Helper duplication between `crates/router/src/cost_filter.rs`
   and `crates/config/src/validation.rs`.** Both modules carry near-
@@ -207,7 +207,7 @@ implementers see the deferrals and can pick them up:
   cost_filter). If the duplication becomes annoying, a shared trait or
   extension impl on `UpstreamConfig` is the right refactor — but
   keeping it out of P04 was a conscious scope cut.
-  *Tracked for v0.6.1.*
+  *Closed in v0.6.1 (commit `a2cecbb`).*
 
 - **M-6 — `metric-name-match` hand-maintenance.** The
   `crates/observability/src/metrics/names.rs` `all_unique` /
@@ -215,7 +215,7 @@ implementers see the deferrals and can pick them up:
   constant. The `COST_FILTERED_TOTAL` addition required appending to
   the array in two places; future metrics will too. Worth a derive
   macro / module-level introspection for v0.7.
-  *Tracked for v0.7.*
+  *Closed in v0.6.1 (commit `cfc8f22`).*
 
 - **M-7 — Per-position policy-vec uniformity assumption.** The
   `ResilientCaller` chain walk re-aligns retry/breaker policy vectors
@@ -225,7 +225,7 @@ implementers see the deferrals and can pick them up:
   ("policy is uniform per route") is correct today but tightens the
   contract; if v0.7 introduces per-position policy overrides this
   alignment logic needs revisiting.
-  *Tracked for v0.7.*
+  *Closed in v0.6.1 (commit `e6864ef`).*
 
 - **M-8 — Non-text content blocks ignored for cost estimation.**
   `cost_estimate.rs::canonical_request_text` only considers
@@ -235,11 +235,13 @@ implementers see the deferrals and can pick them up:
   under-counts input tokens. If multimodal cost tracking becomes
   important, extend `canonical_request_text` (and probably move
   toward `tiktoken-rs`-aware estimation for tool schemas).
-  *Tracked for v0.7.*
+  *Closed in v0.6.1 (commit `9fc5aa5`).*
 
-These items are individually small. None of them blocks v0.6 from
-shipping; together they form the natural agenda for a v0.6.1 follow-up
-plus a v0.7 deeper refactor.
+These items were individually small. None of them blocked v0.6 from
+shipping; together they formed the agenda for v0.6.1, where all five
+landed (P01 closed M-1 + M-3; P02 closed M-6; P03 closed M-7; P04
+closed M-8). The v0.7 candidates listed in the "Open questions"
+section below remain v0.7+ scope; they were never P04-deferred.
 
 ## Open questions
 
