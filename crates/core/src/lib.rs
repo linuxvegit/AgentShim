@@ -2,6 +2,7 @@
 
 pub mod capabilities;
 pub mod content;
+pub mod cost;
 pub mod error;
 pub mod extensions;
 pub mod ids;
