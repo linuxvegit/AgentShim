@@ -8,6 +8,7 @@ pub mod errors;
 pub mod fallback;
 pub mod latency_probe;
 pub mod model_index;
+mod policy_vec;
 pub mod rate_limit;
 pub mod resilient_caller;
 pub mod resolver;
