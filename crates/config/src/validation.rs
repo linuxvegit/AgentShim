@@ -1,4 +1,5 @@
-use crate::schema::{BucketConfigYaml, GatewayConfig, Tier, UpstreamConfig, UpstreamCost};
+use crate::schema::{BucketConfigYaml, GatewayConfig, Tier, UpstreamConfig};
+use crate::upstream_accessors::{upstream_cost, upstream_tier};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -140,30 +141,8 @@ fn upstream_is_configured(cfg: &GatewayConfig, name: &str) -> bool {
 //
 // Phase 6 cost-aware routing needs to read the new `tier` and `cost` fields
 // without exhaustively matching every variant at every call site. The
-// helpers below centralise that pattern. Add new arms here when a new
-// upstream variant is introduced.
-
-/// Returns the `cost` field for any upstream variant.
-fn upstream_cost(u: &UpstreamConfig) -> Option<&UpstreamCost> {
-    match u {
-        UpstreamConfig::OpenAiCompatible(c) => c.cost.as_ref(),
-        UpstreamConfig::GithubCopilot(c) => c.cost.as_ref(),
-        UpstreamConfig::Anthropic(c) => c.cost.as_ref(),
-        UpstreamConfig::Deepseek(c) => c.cost.as_ref(),
-        UpstreamConfig::Gemini(c) => c.cost.as_ref(),
-    }
-}
-
-/// Returns the `tier` field for any upstream variant.
-fn upstream_tier(u: &UpstreamConfig) -> Tier {
-    match u {
-        UpstreamConfig::OpenAiCompatible(c) => c.tier,
-        UpstreamConfig::GithubCopilot(c) => c.tier,
-        UpstreamConfig::Anthropic(c) => c.tier,
-        UpstreamConfig::Deepseek(c) => c.tier,
-        UpstreamConfig::Gemini(c) => c.tier,
-    }
-}
+// canonical helpers live in `crate::upstream_accessors` (re-exported from
+// the crate root) and are imported at the top of this module.
 
 pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
     if cfg.server.port == 0 {
