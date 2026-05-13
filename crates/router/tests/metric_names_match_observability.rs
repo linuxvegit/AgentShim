@@ -26,6 +26,7 @@ fn router_metric_names_match_observability() {
             "agent_shim_rate_limit_rejected_total",
             obs::RATE_LIMIT_REJECTED_TOTAL,
         ),
+        ("agent_shim_cost_filtered_total", obs::COST_FILTERED_TOTAL),
     ];
     for (router, obs) in pairs {
         assert_eq!(

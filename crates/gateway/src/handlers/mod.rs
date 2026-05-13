@@ -15,7 +15,7 @@ use agent_shim_core::{
 };
 use agent_shim_frontends::{FrontendError, FrontendResponse};
 use agent_shim_providers::ProviderError;
-use agent_shim_router::{RateLimitDimension, ResilienceError, RouteError};
+use agent_shim_router::{cost_filter::Skip, RateLimitDimension, ResilienceError, RouteError};
 
 #[derive(Debug, Error)]
 pub enum HandlerError {
@@ -71,6 +71,20 @@ pub enum HandlerError {
         dimension: RateLimitDimension,
         retry_after_secs: u32,
     },
+    /// Plan 06 P04 T4: cost filter rejected every upstream candidate.
+    /// HTTP 503. `filtered` carries the full per-upstream skip list
+    /// (`{upstream, reason}` pairs) so the dialect-specific envelope
+    /// builders can stamp the `filtered:[...]` array required by spec
+    /// §6.3. The HandlerError's Display string keeps the operator-
+    /// facing summary as `"... (N candidates rejected)"`; the
+    /// structured array is rendered into the JSON body alongside the
+    /// existing `error` envelope shape (non-breaking additive change —
+    /// OpenAI/Anthropic SDKs ignore unknown top-level fields).
+    #[error("no eligible upstream after cost filter ({} candidates rejected)", filtered.len())]
+    NoEligibleUpstream {
+        kind: FrontendKind,
+        filtered: Vec<Skip>,
+    },
     /// `auth.required = true` and the inbound request had either no key
     /// at all or a key whose hash is not in `auth.keys`. HTTP 401. Plan
     /// 04 P04 T4 produces this; the `IntoResponse` impl shapes a
@@ -112,6 +126,9 @@ impl HandlerError {
                 dimension,
                 retry_after_secs,
             },
+            ResilienceError::NoEligibleUpstream { filtered } => {
+                HandlerError::NoEligibleUpstream { kind, filtered }
+            }
         }
     }
 }
@@ -148,6 +165,27 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
                 "code": "all_breakers_open",
             }
         }),
+        HandlerError::NoEligibleUpstream { filtered, .. } => {
+            // Spec §6.3: surface the structured `filtered:[{upstream,
+            // reason}]` array alongside the OpenAI `error` envelope.
+            // OpenAI SDKs only read `error.*`; the additive top-level
+            // field is agent-shim's contribution for operator tooling.
+            let filtered_array: Vec<serde_json::Value> = filtered
+                .iter()
+                .map(|s| json!({"upstream": s.upstream, "reason": s.reason.as_str()}))
+                .collect();
+            json!({
+                "error": {
+                    "message": format!(
+                        "No eligible upstream after cost filter ({} candidates rejected)",
+                        filtered.len()
+                    ),
+                    "type": "service_unavailable_error",
+                    "code": "no_eligible_upstream",
+                },
+                "filtered": filtered_array,
+            })
+        }
         HandlerError::RateLimited {
             dimension,
             retry_after_secs,
@@ -175,7 +213,7 @@ fn openai_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
         // tells the operator what happened.
         _ => unreachable!(
             "openai_envelope_body called only for NoUpstreamSucceeded / \
-             AllBreakersOpen / RateLimited"
+             AllBreakersOpen / NoEligibleUpstream / RateLimited"
         ),
     }
 }
@@ -200,6 +238,25 @@ fn anthropic_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
                 "message": handler_error.to_string(),
             },
         }),
+        HandlerError::NoEligibleUpstream { filtered, .. } => {
+            // Spec §6.3: emit the structured `filtered:[{upstream,
+            // reason}]` array as an additive top-level field. The
+            // Anthropic dialect's `{type:"error", error:{...}}`
+            // envelope is preserved; SDKs ignore unknown sibling
+            // fields.
+            let filtered_array: Vec<serde_json::Value> = filtered
+                .iter()
+                .map(|s| json!({"upstream": s.upstream, "reason": s.reason.as_str()}))
+                .collect();
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "overloaded_error",
+                    "message": handler_error.to_string(),
+                },
+                "filtered": filtered_array,
+            })
+        }
         HandlerError::RateLimited { .. } => json!({
             "type": "error",
             "error": {
@@ -209,7 +266,7 @@ fn anthropic_envelope_body(handler_error: &HandlerError) -> serde_json::Value {
         }),
         _ => unreachable!(
             "anthropic_envelope_body called only for NoUpstreamSucceeded / \
-             AllBreakersOpen / RateLimited"
+             AllBreakersOpen / NoEligibleUpstream / RateLimited"
         ),
     }
 }
@@ -283,12 +340,14 @@ impl IntoResponse for HandlerError {
         match &self {
             HandlerError::NoUpstreamSucceeded { kind, .. }
             | HandlerError::AllBreakersOpen { kind, .. }
+            | HandlerError::NoEligibleUpstream { kind, .. }
             | HandlerError::RateLimited { kind, .. } => {
                 let status = match &self {
                     HandlerError::NoUpstreamSucceeded { .. }
-                    | HandlerError::AllBreakersOpen { .. } => StatusCode::SERVICE_UNAVAILABLE,
+                    | HandlerError::AllBreakersOpen { .. }
+                    | HandlerError::NoEligibleUpstream { .. } => StatusCode::SERVICE_UNAVAILABLE,
                     HandlerError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
-                    _ => unreachable!("outer arm guarantees one of the three"),
+                    _ => unreachable!("outer arm guarantees one of the four"),
                 };
                 let body = match kind {
                     FrontendKind::AnthropicMessages => anthropic_envelope_body(&self),
@@ -346,6 +405,7 @@ impl IntoResponse for HandlerError {
             HandlerError::Unauthorized { .. } => unreachable!("handled above"),
             HandlerError::NoUpstreamSucceeded { .. }
             | HandlerError::AllBreakersOpen { .. }
+            | HandlerError::NoEligibleUpstream { .. }
             | HandlerError::RateLimited { .. } => unreachable!("handled above"),
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

@@ -52,7 +52,7 @@ pub struct GeminiProvider {
     auth: AiStudioAuth,
     default_headers: HeaderMap,
     _timeout: Duration,
-    client: reqwest::Client,
+    client: crate::ProviderHttpClient,
     capabilities: ProviderCapabilities,
 }
 
@@ -761,12 +761,15 @@ mod tests {
 
     #[test]
     fn from_config_constructs_provider_from_upstream_block() {
-        use agent_shim_config::{GeminiUpstream, Secret};
+        use agent_shim_config::{GeminiUpstream, Secret, Tier};
         let cfg = GeminiUpstream {
             base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
             api_key: Secret::new("test-key"),
             default_headers: BTreeMap::new(),
             request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
         };
         let provider = from_config("my-gemini", &cfg).expect("from_config ok");
         assert_eq!(provider.name(), "my-gemini");

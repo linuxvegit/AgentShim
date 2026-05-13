@@ -40,6 +40,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use agent_shim_observability::inject_context_into_headers;
+
 use crate::ProviderError;
 
 /// Connect timeout for upstream provider HTTP calls. Fixed at 10s — if a
@@ -47,6 +49,77 @@ use crate::ProviderError;
 /// genuinely broken on the network path. Not configurable because no caller
 /// has a legitimate reason to wait longer just to *establish* a connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wrapper around `reqwest::Client` that auto-injects W3C `traceparent`
+/// (and `tracestate`) into every outgoing request based on the current
+/// `tracing::Span`'s OTel context.
+///
+/// All upstream providers hold this instead of a raw `reqwest::Client`
+/// so distributed tracing continues across the gateway → upstream hop.
+/// When no parent context is active, injection is a no-op — the wrapper
+/// adds no observable overhead beyond a single HeaderMap probe.
+///
+/// Plan 06 P01 T2. The wrapper exposes `post`, `get`, `delete` so
+/// existing provider call sites work unchanged.
+#[derive(Clone, Debug)]
+pub struct ProviderHttpClient {
+    inner: reqwest::Client,
+}
+
+impl ProviderHttpClient {
+    /// Wrap an existing `reqwest::Client`. Internal — external callers
+    /// should go through [`build`].
+    fn from_inner(inner: reqwest::Client) -> Self {
+        Self { inner }
+    }
+
+    /// Start a POST request to `url` with `traceparent` auto-injected.
+    ///
+    /// **Merge semantics:** the wrapper seeds the request with a `HeaderMap`
+    /// (`.headers(...)`) holding `traceparent`/`tracestate`. Subsequent
+    /// `.header(name, val)` calls by providers *append* (reqwest's
+    /// `HeaderMap::append`), they do NOT replace by name. Do not pass
+    /// `traceparent`/`tracestate` to `.header(...)` afterwards — that would
+    /// produce duplicate headers, not a replacement.
+    pub fn post<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        let mut headers = reqwest::header::HeaderMap::new();
+        inject_context_into_headers(&mut headers);
+        self.inner.post(url).headers(headers)
+    }
+
+    /// Start a GET request to `url` with `traceparent` auto-injected.
+    ///
+    /// See [`post`](Self::post) for header merge semantics.
+    pub fn get<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        let mut headers = reqwest::header::HeaderMap::new();
+        inject_context_into_headers(&mut headers);
+        self.inner.get(url).headers(headers)
+    }
+
+    /// Start a DELETE request with `traceparent` auto-injected.
+    /// Included for symmetry — none of the v0.6 providers use DELETE today.
+    ///
+    /// See [`post`](Self::post) for header merge semantics.
+    #[allow(dead_code)]
+    pub fn delete<U: reqwest::IntoUrl>(&self, url: U) -> reqwest::RequestBuilder {
+        let mut headers = reqwest::header::HeaderMap::new();
+        inject_context_into_headers(&mut headers);
+        self.inner.delete(url).headers(headers)
+    }
+
+    /// Escape hatch: return the inner `reqwest::Client` for code paths
+    /// that build their own `RequestBuilder` shape (e.g. `multipart`) or
+    /// for crates that hold an owned `reqwest::Client` (e.g. the Copilot
+    /// `CopilotTokenManager` and `models::list_models` — see spec D8
+    /// "auth/discovery carve-out"). Outbound `traceparent` will NOT be
+    /// auto-injected on requests constructed this way.
+    ///
+    /// Scoped to the providers crate so no external crate can accidentally
+    /// bypass trace injection on a primary request path.
+    pub(crate) fn inner(&self) -> &reqwest::Client {
+        &self.inner
+    }
+}
 
 /// Build the shared HTTP client used by all upstream providers.
 ///
@@ -67,7 +140,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// When `SSLKEYLOGFILE` is set, the returned client logs TLS session keys
 /// for offline decryption — see the module docs.
-pub(crate) fn build(read_timeout: Duration) -> Result<reqwest::Client, ProviderError> {
+pub fn build(read_timeout: Duration) -> Result<ProviderHttpClient, ProviderError> {
     build_with_keylog(read_timeout, std::env::var_os("SSLKEYLOGFILE").is_some())
 }
 
@@ -77,7 +150,7 @@ pub(crate) fn build(read_timeout: Duration) -> Result<reqwest::Client, ProviderE
 fn build_with_keylog(
     read_timeout: Duration,
     keylog: bool,
-) -> Result<reqwest::Client, ProviderError> {
+) -> Result<ProviderHttpClient, ProviderError> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(read_timeout);
@@ -103,9 +176,10 @@ fn build_with_keylog(
         }
     }
 
-    builder
+    let client = builder
         .build()
-        .map_err(|e| ProviderError::Network(e.to_string()))
+        .map_err(|e| ProviderError::Network(e.to_string()))?;
+    Ok(ProviderHttpClient::from_inner(client))
 }
 
 /// Build a `rustls::ClientConfig` whose `key_log` writes `CLIENT_RANDOM`

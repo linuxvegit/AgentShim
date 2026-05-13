@@ -348,6 +348,8 @@ mod tests {
                 anthropic_beta: None,
                 retry: RetryConfig::default(),
                 breaker: BreakerConfig::default(),
+                min_tier: None,
+                max_cost_usd: None,
             }],
             auth: Default::default(),
             rate_limit: Default::default(),

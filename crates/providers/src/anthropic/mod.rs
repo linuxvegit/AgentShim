@@ -37,7 +37,7 @@ pub struct AnthropicProvider {
     api_key: String,
     anthropic_version: String,
     default_headers: HeaderMap,
-    client: reqwest::Client,
+    client: crate::ProviderHttpClient,
     capabilities: ProviderCapabilities,
 }
 

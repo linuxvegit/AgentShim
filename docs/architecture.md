@@ -156,6 +156,61 @@ tractable. See ADR-0005.
 | ArcSwap snapshot read | < 100ns | (same) |
 | Reload validation (50-route config) | n/a | < 100ms |
 
+### Cost-aware routing (v0.6)
+
+The Phase 6 cost filter sits **between** the rate-limit gate and the
+v0.4 `ResilientCaller` chain walk. It's a pure pass over the
+operator-defined fallback chain:
+
+```
+Client → FrontendProtocol::decode → Router::resolve → Vec<BackendTarget>
+              │
+              ▼
+        Rate-limit gate (per-key, per-route, per-upstream, per-IP)
+              │
+              ▼
+        CostFilter::filter_chain
+          ├─ axis 1: tier        (upstream.tier ≥ route.min_tier?)
+          ├─ axis 2: latency     (probe.recent_p95_ms ≤ budget?)
+          └─ axis 3: cost cap    (estimate ≤ route.max_cost_usd?)
+              │
+              ▼
+        Survivors (original chain order preserved)
+              │
+              ▼
+        ResilientCaller (retry · breaker · fallback chain walk)
+              │
+              ▼
+        Provider::complete → CanonicalStream → FrontendProtocol::encode
+```
+
+The filter applies four independent axes (tier / latency / cap /
+estimated cost) as constraints, not as a re-sorter. Survivors keep
+their original chain order — the operator's "preferred upstream"
+intent from v0.4 is preserved.
+
+Latency data is sourced from a `LatencyProbe` trait, with the
+Prometheus-backed implementation in
+`crates/gateway/src/latency_probe.rs` reading the
+`agent_shim_upstream_duration_seconds` histogram via the
+`metrics-exporter-prometheus` text scrape. The trait lives in the
+router crate; the impl lives in the gateway crate, keeping the router
+free of an observability-crate dependency.
+
+Cost estimates are produced by `crates/router/src/cost_estimate.rs`
+using `tiktoken-rs`'s `cl100k_base` encoder (initialised lazily via
+`OnceLock`, matching `count_tokens.rs`). The estimate is the
+upper-bound `(input_tokens × input_price + max_tokens × output_price) / 1M`.
+
+When the filter empties the chain, the gateway short-circuits with
+HTTP 503 `NoEligibleUpstream` before any provider is contacted. The
+response body lists each skipped upstream and the per-axis reason via
+the inbound frontend's existing error envelope.
+
+See [ADR-0006](adr/0006-cost-aware-routing.md) for the design
+context, the rejected alternatives, and the v0.6.1 / v0.7 deferred
+items.
+
 ## Capability gate
 
 Plan 04 added a capability gate at the gateway boundary. It runs after route

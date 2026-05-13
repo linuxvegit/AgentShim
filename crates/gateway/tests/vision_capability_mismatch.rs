@@ -171,11 +171,15 @@ fn make_app_state() -> AppState {
     }
     let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(Lookup(Arc::clone(&providers)));
     let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
-    let limiter_registry = Arc::new(agent_shim_router::LimiterRegistry::disabled());
+    let limiter_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+        agent_shim_router::LimiterRegistry::disabled(),
+    ));
     let resilient_caller = Arc::new(ResilientCaller::new(
         provider_lookup,
         Arc::clone(&breaker_registry),
         Arc::clone(&limiter_registry),
+        Arc::new(agent_shim_router::DisabledLatencyProbe)
+            as Arc<dyn agent_shim_router::LatencyProbe>,
     ));
 
     AppState {

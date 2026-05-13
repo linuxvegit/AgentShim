@@ -183,12 +183,41 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Service tier label on an upstream. Used by Phase 6 cost-aware
+/// routing: routes can specify `min_tier`, and upstreams below that
+/// tier are filtered out of the chain before the resilience layer runs.
+///
+/// Derived ordering is the operator-intuitive one:
+///   economy < standard < premium
+///
+/// Plan 06 P03 T1.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub enum Tier {
+    Economy,
+    Standard,
+    Premium,
+}
+
+/// Per-upstream USD cost per million tokens. Used by Phase 6
+/// cost-aware routing to estimate request cost and reject upstreams
+/// whose estimate exceeds a route's `max_cost_usd`.
+///
+/// Both fields must be present and non-negative; partial declarations
+/// fail validation (rule 15). Plan 06 P03 T1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamCost {
+    pub input_per_million_usd: f64,
+    pub output_per_million_usd: f64,
+}
+
 /// Tagged upstream enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UpstreamConfig {
     OpenAiCompatible(OpenAiCompatibleUpstream),
-    GithubCopilot,
+    GithubCopilot(GithubCopilotUpstream),
     Anthropic(AnthropicUpstream),
     Deepseek(DeepseekUpstream),
     Gemini(GeminiUpstream),
@@ -203,6 +232,42 @@ pub struct OpenAiCompatibleUpstream {
     pub default_headers: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// Tier label. Plan 06 P03 — required.
+    pub tier: Tier,
+    /// Per-token cost in USD. Plan 06 P03 — optional.
+    /// If present, used by cost-aware routing to estimate per-request
+    /// cost and apply `route.max_cost_usd` caps.
+    #[serde(default)]
+    pub cost: Option<UpstreamCost>,
+    /// p95 latency budget in milliseconds. Plan 06 P03 — optional.
+    /// If present, the cost filter compares against the recent p95
+    /// from the metrics histogram. Upstreams over budget are skipped.
+    #[serde(default)]
+    pub p95_latency_budget_ms: Option<u64>,
+}
+
+/// GitHub Copilot upstream. Subscription product — no per-token cost,
+/// so `cost` is typically `None`. `tier` is still required for schema
+/// uniformity (Plan 06 P03).
+///
+/// Note: there is intentionally no `Default` impl. The `tier` field is
+/// required per spec §5.4; defaulting it would silently violate the
+/// breaking-change contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubCopilotUpstream {
+    /// Tier label. Plan 06 P03 — required.
+    pub tier: Tier,
+    /// Per-token cost in USD. Plan 06 P03 — optional.
+    /// If present, used by cost-aware routing to estimate per-request
+    /// cost and apply `route.max_cost_usd` caps.
+    #[serde(default)]
+    pub cost: Option<UpstreamCost>,
+    /// p95 latency budget in milliseconds. Plan 06 P03 — optional.
+    /// If present, the cost filter compares against the recent p95
+    /// from the metrics histogram. Upstreams over budget are skipped.
+    #[serde(default)]
+    pub p95_latency_budget_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +282,18 @@ pub struct AnthropicUpstream {
     pub default_headers: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// Tier label. Plan 06 P03 — required.
+    pub tier: Tier,
+    /// Per-token cost in USD. Plan 06 P03 — optional.
+    /// If present, used by cost-aware routing to estimate per-request
+    /// cost and apply `route.max_cost_usd` caps.
+    #[serde(default)]
+    pub cost: Option<UpstreamCost>,
+    /// p95 latency budget in milliseconds. Plan 06 P03 — optional.
+    /// If present, the cost filter compares against the recent p95
+    /// from the metrics histogram. Upstreams over budget are skipped.
+    #[serde(default)]
+    pub p95_latency_budget_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +306,18 @@ pub struct DeepseekUpstream {
     pub default_headers: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// Tier label. Plan 06 P03 — required.
+    pub tier: Tier,
+    /// Per-token cost in USD. Plan 06 P03 — optional.
+    /// If present, used by cost-aware routing to estimate per-request
+    /// cost and apply `route.max_cost_usd` caps.
+    #[serde(default)]
+    pub cost: Option<UpstreamCost>,
+    /// p95 latency budget in milliseconds. Plan 06 P03 — optional.
+    /// If present, the cost filter compares against the recent p95
+    /// from the metrics histogram. Upstreams over budget are skipped.
+    #[serde(default)]
+    pub p95_latency_budget_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +330,18 @@ pub struct GeminiUpstream {
     pub default_headers: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// Tier label. Plan 06 P03 — required.
+    pub tier: Tier,
+    /// Per-token cost in USD. Plan 06 P03 — optional.
+    /// If present, used by cost-aware routing to estimate per-request
+    /// cost and apply `route.max_cost_usd` caps.
+    #[serde(default)]
+    pub cost: Option<UpstreamCost>,
+    /// p95 latency budget in milliseconds. Plan 06 P03 — optional.
+    /// If present, the cost filter compares against the recent p95
+    /// from the metrics histogram. Upstreams over budget are skipped.
+    #[serde(default)]
+    pub p95_latency_budget_ms: Option<u64>,
 }
 
 fn default_timeout() -> u64 {
@@ -309,6 +410,20 @@ pub struct RouteEntry {
     pub retry: RetryConfig,
     #[serde(default)]
     pub breaker: BreakerConfig,
+
+    // ── Per-route cost-aware routing knobs (Phase 6 P03) ───────────────────
+    /// Minimum tier required for an upstream in this route's chain to
+    /// be considered. Upstreams with `tier < min_tier` are filtered
+    /// out before the resilience layer runs. Plan 06 P03 — optional.
+    /// When None, no tier filtering applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tier: Option<Tier>,
+    /// Per-request cost cap in USD. The cost filter estimates the cost
+    /// (using `tiktoken-rs` for input tokens + `request.max_tokens` for
+    /// output) and rejects upstreams whose estimate exceeds this cap.
+    /// Plan 06 P03 — optional. When None, no cap applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
 }
 
 impl RouteEntry {
@@ -333,6 +448,8 @@ impl RouteEntry {
             anthropic_beta: None,
             retry: RetryConfig::default(),
             breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
         }
     }
 }
@@ -566,7 +683,7 @@ mod tests {
     #[test]
     fn anthropic_upstream_yaml_round_trip_with_defaults() {
         // Minimal Anthropic upstream config; only api_key required.
-        let yaml = "type: anthropic\napi_key: sk-ant-test\n";
+        let yaml = "type: anthropic\napi_key: sk-ant-test\ntier: standard\n";
         let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
         let UpstreamConfig::Anthropic(a) = cfg else {
             panic!("expected Anthropic variant");
@@ -586,6 +703,7 @@ api_key: sk-ant-test
 base_url: https://custom.example.com
 anthropic_version: 2024-01-01
 request_timeout_secs: 60
+tier: standard
 default_headers:
   x-custom: value
 ";
@@ -604,7 +722,7 @@ default_headers:
 
     #[test]
     fn anthropic_upstream_unknown_field_rejected() {
-        let yaml = "type: anthropic\napi_key: sk-ant-test\nbogus: 1\n";
+        let yaml = "type: anthropic\napi_key: sk-ant-test\ntier: standard\nbogus: 1\n";
         let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
     }
@@ -612,7 +730,7 @@ default_headers:
     #[test]
     fn deepseek_upstream_yaml_round_trip_with_defaults() {
         // Minimal DeepSeek upstream config; only api_key required.
-        let yaml = "type: deepseek\napi_key: sk-deepseek-test\n";
+        let yaml = "type: deepseek\napi_key: sk-deepseek-test\ntier: standard\n";
         let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
         let UpstreamConfig::Deepseek(d) = cfg else {
             panic!("expected Deepseek variant");
@@ -630,6 +748,7 @@ type: deepseek
 api_key: sk-deepseek-test
 base_url: https://custom.deepseek.example.com/v1
 request_timeout_secs: 60
+tier: standard
 default_headers:
   x-custom: value
 ";
@@ -648,7 +767,7 @@ default_headers:
 
     #[test]
     fn deepseek_upstream_unknown_field_rejected() {
-        let yaml = "type: deepseek\napi_key: sk-deepseek-test\nbogus: 1\n";
+        let yaml = "type: deepseek\napi_key: sk-deepseek-test\ntier: standard\nbogus: 1\n";
         let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
     }
@@ -656,7 +775,7 @@ default_headers:
     #[test]
     fn gemini_upstream_yaml_round_trip_with_defaults() {
         // Minimal Gemini upstream config; only api_key required.
-        let yaml = "type: gemini\napi_key: ai-studio-test\n";
+        let yaml = "type: gemini\napi_key: ai-studio-test\ntier: standard\n";
         let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
         let UpstreamConfig::Gemini(g) = cfg else {
             panic!("expected Gemini variant");
@@ -677,6 +796,7 @@ type: gemini
 api_key: ai-studio-test
 base_url: https://custom.gemini.example.com/v1beta
 request_timeout_secs: 60
+tier: standard
 default_headers:
   x-custom: value
 ";
@@ -695,7 +815,7 @@ default_headers:
 
     #[test]
     fn gemini_upstream_unknown_field_rejected() {
-        let yaml = "type: gemini\napi_key: ai-studio-test\nbogus: 1\n";
+        let yaml = "type: gemini\napi_key: ai-studio-test\ntier: standard\nbogus: 1\n";
         let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
     }

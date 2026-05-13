@@ -14,6 +14,7 @@ upstreams:
   deepseek:
     type: deepseek
     api_key: "sk-your-deepseek-api-key-here"
+    tier: standard
     # Optional overrides (defaults shown):
     # base_url: https://api.deepseek.com/v1
     # request_timeout_secs: 30
@@ -22,6 +23,7 @@ upstreams:
   # anthropic:
   #   type: anthropic
   #   api_key: "sk-ant-your-key-here"
+  #   tier: standard
   #   # Optional overrides:
   #   # base_url: https://api.anthropic.com
   #   # anthropic_version: "2023-06-01"
@@ -35,6 +37,7 @@ upstreams:
   # gemini:
   #   type: gemini
   #   api_key: "AIzaSy-your-ai-studio-api-key-here"
+  #   tier: standard
   #   # Optional overrides (defaults shown):
   #   # base_url: https://generativelanguage.googleapis.com/v1beta
   #   # request_timeout_secs: 30

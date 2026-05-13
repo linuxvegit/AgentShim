@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 agent-shim-core = { path = "../core" }
 agent-shim-config = { path = "../config" }
+agent-shim-observability = { path = "../observability" }
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

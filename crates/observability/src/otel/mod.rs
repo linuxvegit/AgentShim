@@ -6,7 +6,7 @@
 //! entirely — spans still exist for the fmt layer.
 
 pub mod extract;
-pub use extract::extract_context_from_headers;
+pub use extract::{extract_context_from_headers, inject_context_into_headers};
 
 use agent_shim_config::schema::OtelConfig;
 use opentelemetry::trace::TracerProvider as _;

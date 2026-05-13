@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-shim"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -32,6 +32,8 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mockito",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "prometheus-parse",
  "reqwest",
@@ -46,12 +48,13 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "agent-shim-config"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-core",
  "figment",
@@ -64,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -79,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-frontends"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-core",
  "async-trait",
@@ -99,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-observability"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-config",
  "anyhow",
@@ -122,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-protocol-tests"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-core",
  "agent-shim-frontends",
@@ -141,10 +144,11 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-providers"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
+ "agent-shim-observability",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -169,12 +173,13 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-router"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
  "agent-shim-observability",
  "agent-shim-providers",
+ "arc-swap",
  "async-trait",
  "futures",
  "governor",
@@ -187,6 +192,7 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 1.0.69",
+ "tiktoken-rs",
  "tokio",
  "tracing",
  "tracing-opentelemetry",

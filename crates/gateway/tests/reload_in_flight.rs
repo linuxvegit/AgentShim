@@ -17,7 +17,7 @@ async fn breaker_state_survives_reload() {
 server: {{bind: 127.0.0.1, port: {public}}}
 admin: {{bind: 127.0.0.1, port: {admin}}}
 upstreams:
-  m: {{type: open_ai_compatible, base_url: http://x/v1, api_key: a}}
+  m: {{type: open_ai_compatible, base_url: http://x/v1, api_key: a, tier: standard}}
 routes:
   - frontend: openai_chat
     model: x

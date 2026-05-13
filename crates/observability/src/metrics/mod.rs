@@ -142,6 +142,10 @@ fn describe_metrics() {
     describe_counter!(TOKENS_OUTPUT_TOTAL, "Output tokens produced");
 
     describe_counter!(CONFIG_RELOADS_TOTAL, "Config reload attempts by result");
+    describe_counter!(
+        COST_FILTERED_TOTAL,
+        "Cost-filter skip/note counts by reason, upstream, route (Plan 06 P04)"
+    );
 }
 
 #[cfg(test)]

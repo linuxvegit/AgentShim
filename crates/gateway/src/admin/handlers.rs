@@ -47,6 +47,7 @@ upstreams:
     type: open_ai_compatible
     base_url: http://localhost:9999/v1
     api_key: dummy
+    tier: standard
 "#
     }
 
@@ -58,6 +59,7 @@ upstreams:
     type: open_ai_compatible
     base_url: http://localhost:9999/v1
     api_key: dummy
+    tier: standard
 routes:
   - frontend: openai_chat
     model: x

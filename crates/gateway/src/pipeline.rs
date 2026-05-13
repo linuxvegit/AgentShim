@@ -28,7 +28,7 @@ use agent_shim_core::{
 };
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
 use agent_shim_providers::{ProviderCapabilities, ProviderError};
-use agent_shim_router::{AgentIdentity, BreakerPolicy, RetryPolicy};
+use agent_shim_router::{AgentIdentity, BreakerPolicy, CostFilterInputs, RetryPolicy};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -184,7 +184,9 @@ fn handler_error_status_hint(e: &HandlerError) -> u16 {
         HandlerError::Frontend(_) => 400,
         HandlerError::Provider(ProviderError::Upstream { status, .. }) => *status,
         HandlerError::Provider(_) => 502,
-        HandlerError::NoUpstreamSucceeded { .. } | HandlerError::AllBreakersOpen { .. } => 503,
+        HandlerError::NoUpstreamSucceeded { .. }
+        | HandlerError::AllBreakersOpen { .. }
+        | HandlerError::NoEligibleUpstream { .. } => 503,
         HandlerError::RateLimited { .. } => 429,
         HandlerError::TerminalUpstream {
             error: ProviderError::Upstream { status, .. },
@@ -587,6 +589,16 @@ async fn dispatch_inner(
     // short-circuit. All resilience-shaped errors flow through the
     // `from_resilience_error` bridge so the response envelope is shaped
     // by the inbound frontend dialect.
+    //
+    // Plan 06 P04 T4: the cost-filter pre-pass runs INSIDE
+    // `complete_with_cost_filter`. We pass the matching route entry +
+    // gateway config so the filter can read `min_tier` /
+    // `max_cost_usd` / per-upstream `tier` / `cost` /
+    // `p95_latency_budget_ms`. The route lookup walks
+    // `snapshot.config.routes` once; if no entry matches the route
+    // (wildcard-only routes have model `*` so the linear scan
+    // intentionally falls through to wildcard semantics) we pass
+    // `None` and the filter step is skipped.
     let frontend_kind = spec.frontend.kind();
     if is_stream {
         run_stream(
@@ -599,6 +611,7 @@ async fn dispatch_inner(
             identity,
             client_ip,
             frontend_model,
+            snapshot.clone(),
             RunContext {
                 model_alias,
                 upstream_model,
@@ -618,6 +631,7 @@ async fn dispatch_inner(
             identity,
             client_ip,
             frontend_model,
+            snapshot.clone(),
             RunContext {
                 model_alias,
                 upstream_model,
@@ -655,6 +669,7 @@ async fn run_stream(
     identity: AgentIdentity,
     client_ip: String,
     frontend_model: String,
+    snapshot: Arc<crate::state::AppSnapshot>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let label = spec.endpoint_label;
@@ -665,26 +680,56 @@ async fn run_stream(
         frontend_kind,
     } = ctx;
 
+    // Plan 06 P04 T4: dispatch through the cost-filter-aware entry
+    // point when we can locate the matching `RouteEntry`. Wildcard
+    // routes and routes without `min_tier` / `max_cost_usd` /
+    // per-upstream budgets pay the filter cost but skip every axis
+    // — the filter degenerates to the identity function.
+    let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
+    let upstream_stream_result = match route_entry {
+        Some(route) => {
+            state
+                .core
+                .resilient_caller
+                .complete_with_cost_filter(
+                    chain,
+                    canonical,
+                    policies,
+                    breaker_policies,
+                    identity,
+                    client_ip,
+                    frontend_model.clone(),
+                    CostFilterInputs {
+                        route,
+                        config: &snapshot.config,
+                        route_label: frontend_model,
+                    },
+                )
+                .await
+        }
+        None => {
+            state
+                .core
+                .resilient_caller
+                .complete(
+                    chain,
+                    canonical,
+                    policies,
+                    breaker_policies,
+                    identity,
+                    client_ip,
+                    frontend_model,
+                )
+                .await
+        }
+    };
     // Walk the chain. `ResilientCaller::complete` returns a single
     // `CanonicalStream` from whichever upstream succeeded; downstream
     // encoding is unchanged from the pre-T6 single-upstream world.
-    let upstream_stream = state
-        .core
-        .resilient_caller
-        .complete(
-            chain,
-            canonical,
-            policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "resilient call failed");
-            HandlerError::from_resilience_error(e, frontend_kind)
-        })?;
+    let upstream_stream = upstream_stream_result.map_err(|e| {
+        tracing::error!(error = %e, "resilient call failed");
+        HandlerError::from_resilience_error(e, frontend_kind)
+    })?;
 
     if spec.log_streaming_usage_on_drop {
         // Anthropic-style: log final usage when the SSE stream is dropped.
@@ -774,6 +819,7 @@ async fn run_unary(
     identity: AgentIdentity,
     client_ip: String,
     frontend_model: String,
+    snapshot: Arc<crate::state::AppSnapshot>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
     let RunContext {
@@ -783,23 +829,50 @@ async fn run_unary(
         frontend_kind,
     } = ctx;
 
-    let stream = state
-        .core
-        .resilient_caller
-        .complete(
-            chain,
-            canonical,
-            policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "resilient call failed");
-            HandlerError::from_resilience_error(e, frontend_kind)
-        })?;
+    // Plan 06 P04 T4: see `run_stream` — cost filter pre-pass via
+    // `complete_with_cost_filter` when a route entry is locatable.
+    let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
+    let stream_result = match route_entry {
+        Some(route) => {
+            state
+                .core
+                .resilient_caller
+                .complete_with_cost_filter(
+                    chain,
+                    canonical,
+                    policies,
+                    breaker_policies,
+                    identity,
+                    client_ip,
+                    frontend_model.clone(),
+                    CostFilterInputs {
+                        route,
+                        config: &snapshot.config,
+                        route_label: frontend_model,
+                    },
+                )
+                .await
+        }
+        None => {
+            state
+                .core
+                .resilient_caller
+                .complete(
+                    chain,
+                    canonical,
+                    policies,
+                    breaker_policies,
+                    identity,
+                    client_ip,
+                    frontend_model,
+                )
+                .await
+        }
+    };
+    let stream = stream_result.map_err(|e| {
+        tracing::error!(error = %e, "resilient call failed");
+        HandlerError::from_resilience_error(e, frontend_kind)
+    })?;
     let response = collect_stream(stream).await?;
     let (input, output) = match &response.usage {
         Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
@@ -822,6 +895,44 @@ async fn run_unary(
 }
 
 // ── internals ─────────────────────────────────────────────────────────────
+
+/// Plan 06 P04 T4: locate the `RouteEntry` matching `(frontend, model)`
+/// in the snapshot config. Returns `None` when no entry matches — in
+/// that case the caller falls back to `complete()` (no cost filter).
+///
+/// The lookup mirrors `StaticRouter::from_config` resolution order:
+/// a specific `(frontend, model)` route wins over a `(frontend, "*")`
+/// wildcard. We don't cache this; routes count is small (typical
+/// configs: 5-30 entries) and the lookup runs once per request.
+fn find_route_entry<'a>(
+    config: &'a agent_shim_config::GatewayConfig,
+    frontend: agent_shim_core::FrontendKind,
+    model: &str,
+) -> Option<&'a agent_shim_config::RouteEntry> {
+    let frontend_str = match frontend {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
+        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
+    };
+    let alt = match frontend {
+        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic",
+        agent_shim_core::FrontendKind::OpenAiChat => "openai",
+        agent_shim_core::FrontendKind::OpenAiResponses => "responses",
+    };
+    // Specific match first.
+    let specific = config
+        .routes
+        .iter()
+        .find(|r| (r.frontend == frontend_str || r.frontend == alt) && r.model == model);
+    if specific.is_some() {
+        return specific;
+    }
+    // Wildcard fallback.
+    config
+        .routes
+        .iter()
+        .find(|r| (r.frontend == frontend_str || r.frontend == alt) && r.model == "*")
+}
 
 /// Pull every `anthropic-*` header off the inbound request, dropping the two
 /// credential headers that are upstream-owned. Returns name/value pairs in

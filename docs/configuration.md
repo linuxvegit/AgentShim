@@ -19,6 +19,7 @@ logging:
 upstreams:
   <name>:
     type: <kind>               # see "Upstream types" below
+    tier: <economy|standard|premium>  # required, v0.6+
     # …kind-specific fields…
 
 routes:
@@ -43,6 +44,7 @@ upstreams:
     type: open_ai_compatible
     base_url: "https://api.example.com/v1"
     api_key: "sk-..."
+    tier: standard                     # required, v0.6+
     request_timeout_secs: 120          # default 30
     default_headers: {}                # operator-level overrides
 ```
@@ -56,7 +58,8 @@ GitHub Copilot via OAuth device flow. Requires running
 upstreams:
   copilot:
     type: github_copilot
-    # No fields — credentials come from the path below.
+    tier: standard                     # required, v0.6+
+    # No other fields — credentials come from the path below.
 
 copilot:
   credential_path: "~/.config/agent-shim/copilot.json"  # optional, this is the default
@@ -74,6 +77,7 @@ upstreams:
     api_key: "sk-ant-..."
     base_url: "https://api.anthropic.com"   # default
     anthropic_version: "2023-06-01"         # default
+    tier: premium                           # required, v0.6+
     request_timeout_secs: 60                # default 30
     default_headers: {}
 ```
@@ -91,6 +95,7 @@ upstreams:
     type: deepseek
     api_key: "sk-..."
     base_url: "https://api.deepseek.com/v1"  # default
+    tier: economy                             # required, v0.6+
     request_timeout_secs: 30                  # default
     default_headers: {}
 ```
@@ -108,6 +113,7 @@ upstreams:
     type: gemini
     api_key: "AIzaSy-..."
     base_url: "https://generativelanguage.googleapis.com/v1beta"  # default
+    tier: standard                                                 # required, v0.6+
     request_timeout_secs: 30                                       # default
     default_headers: {}
 ```
@@ -226,9 +232,12 @@ flow through the existing fmt subscriber so `RUST_LOG` enter/exit
 events keep working in development. Inbound W3C `traceparent` headers
 are honored regardless of whether export is configured.
 
-**Outbound `traceparent` propagation onto upstream HTTP calls is
-deferred to v0.6.** See `docs/observability.md` "What's NOT in v0.5"
-and spec §4.3 for context.
+**Outbound `traceparent` propagation** is implemented in v0.6. Every
+provider's HTTP client is wrapped in
+`agent_shim_providers::ProviderHttpClient`, which injects the current
+span's W3C context onto every upstream request. See
+[`docs/observability.md`](observability.md#outbound-traceparent-propagation)
+and [ADR-0006](adr/0006-cost-aware-routing.md).
 
 ## Reload-validation rules (v0.5+)
 
@@ -253,8 +262,92 @@ violations return HTTP 400. See ADR-0005 for the layering rationale and
 - **Breaker state is preserved across reload** — only policy
   (thresholds, windows, cooldowns) updates. Empirical signal about
   unhealthy upstreams survives.
-- **Rate-limit bucket changes are inert in v0.5.** `LimiterRegistry`
-  lives on the immutable `AppCore`; a reload that changes
-  `rate_limit.*` has no effect on running buckets until the process
-  restarts. v0.6 candidate. See ADR-0005 §3 and
-  `docs/observability.md` for details.
+- **Rate-limit policy is reloadable in v0.6.** `LimiterRegistry` now
+  lives behind `Arc<ArcSwap<LimiterRegistry>>` on `AppCore`. The
+  reload-applying task rebuilds the registry from the new policy and
+  atomically swaps it; the change takes effect on the next request.
+  Existing in-flight buckets are replaced (not migrated) — see
+  [`docs/observability.md`](observability.md#rate-limit-buckets-across-reload)
+  and ADR-0005 §3 for the caveat.
+
+## Cost-aware routing fields (v0.6)
+
+Five new schema fields land in v0.6 across upstreams and routes. They
+compose declaratively to filter the v0.4 fallback chain — see
+[ADR-0006](adr/0006-cost-aware-routing.md) and
+[`docs/observability.md`](observability.md#cost-aware-routing-v06).
+
+### Upstream-level
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `tier` | `economy \| standard \| premium` | **yes** | Service tier label. Routes can require `min_tier`. No default; absent → startup error. |
+| `cost.input_per_million_usd` | `f64` (≥ 0) | no | USD per million input tokens. Combined with the request's `tiktoken-rs` count to drive the cap axis. |
+| `cost.output_per_million_usd` | `f64` (≥ 0) | no | USD per million output tokens. Combined with the request's `max_tokens` ceiling (default 4096) to drive the cap axis. |
+| `p95_latency_budget_ms` | `u64` | no | Maximum allowed recent p95 latency, in milliseconds. Compared against `agent_shim_upstream_duration_seconds`. |
+
+Example:
+
+```yaml
+upstreams:
+  premium_anthropic:
+    type: anthropic
+    api_key: sk-ant-...
+    tier: premium
+    cost:
+      input_per_million_usd: 15.0
+      output_per_million_usd: 75.0
+    p95_latency_budget_ms: 2000
+```
+
+When `cost` is absent (e.g. Copilot subscription product), the cap
+axis is effectively no-op for that upstream — there is no per-request
+cost to compare against `max_cost_usd`. The same applies to
+`p95_latency_budget_ms`: absent → that upstream is not gated on
+latency.
+
+### Route-level
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `min_tier` | `economy \| standard \| premium` | no | Minimum upstream tier accepted by this route. Upstreams with `tier < min_tier` are filtered out. |
+| `max_cost_usd` | `f64` (≥ 0) | no | Per-request cost cap. Estimated cost > cap → upstream filtered out. |
+
+Example:
+
+```yaml
+routes:
+  - frontend: openai_chat
+    model: gpt-4o
+    upstreams:
+      - {name: premium_anthropic, model: claude-opus-4-7}
+      - {name: copilot, model: gpt-4o}
+    min_tier: standard
+    max_cost_usd: 0.05
+```
+
+When every upstream in a route's chain is filtered, the gateway
+returns **HTTP 503 `NoEligibleUpstream`** with a body listing each
+skipped upstream and the per-axis reason. The 503 is rendered through
+the inbound frontend's existing error envelope (Anthropic, OpenAI
+Chat, OpenAI Responses).
+
+### Validation rules 15-18
+
+The v0.6 schema adds four new validation rules on top of the v0.5
+reload set (rules 11-14):
+
+| Rule | Description | Failure HTTP code (reload) |
+| --- | --- | --- |
+| 15 | `cost.input_per_million_usd` and `cost.output_per_million_usd` must be non-negative when present. | 400 |
+| 16 | `tier` must be one of `economy`, `standard`, `premium`. Unknown values fail with the enum-list message. | 400 |
+| 17 | Every route declaring `min_tier` must have at least one upstream in its chain that meets `min_tier`. Checked at startup AND on reload. | 400 |
+| 18 | `tier`, `cost.*`, `p95_latency_budget_ms`, `min_tier`, `max_cost_usd` are all reloadable. Changing any of them via `/admin/reload` takes effect on the next request — no restart required. | n/a (positive rule) |
+
+Rule 17 has an important corollary: removing the last `min_tier`-
+satisfying upstream from a route's chain via reload is rejected.
+Operators relaxing tier requirements should lower `min_tier` first,
+then trim the chain in a second reload.
+
+See [ADR-0006](adr/0006-cost-aware-routing.md) §2 for the design
+decision behind keeping the four axes as filters (not re-sorters).

@@ -14,12 +14,14 @@ agent-shim-config = { path = "../config" }
 agent-shim-providers = { path = "../providers" }
 governor = "0.6"
 nonzero_ext = "0.3"
+arc-swap.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
 sha2 = "0.10"
+tiktoken-rs.workspace = true
 uuid = { workspace = true }
 metrics.workspace = true
 
