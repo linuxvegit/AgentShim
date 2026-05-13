@@ -376,11 +376,13 @@ crates/
   protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.6
+## What's NOT in v0.6.1
 
 Phase 6 ships cost-aware routing (tier filter, per-token cost, p95
 latency budget, per-route cost cap) plus closes the two v0.5 deferrals
-(outbound `traceparent` propagation, rate-limit policy reload). It
+(outbound `traceparent` propagation, rate-limit policy reload). v0.6.1
+adds image-aware cost estimation (`ImageTokenEstimator` trait — see
+[ADR-0007](docs/adr/0007-frozen-core-lift-discipline.md)). v0.6.1 still
 does **not** ship:
 
 - **Learned realised-cost tracking (rolling EWMA).** The cost filter
@@ -411,7 +413,13 @@ See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) fo
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.6.0** — Phase 6: cost-aware gateway — outbound `traceparent`
+**v0.6.1** — Patch / P04 closure — image-aware cost estimation
+(`ImageTokenEstimator` trait), `#[derive(Metric)]` single-site
+metric registration, `PolicyVec<T>` length-invariant wrapper,
+disciplined lift of frozen-core invariant
+([ADR-0007](docs/adr/0007-frozen-core-lift-discipline.md)).
+
+Previous: **v0.6.0** — Phase 6: cost-aware gateway — outbound `traceparent`
 propagation, hot-reloadable rate-limit policy, four-axis cost filter
 (tier · per-token cost · p95 latency budget · per-route cost cap),
 HTTP 503 `NoEligibleUpstream` envelope
