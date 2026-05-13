@@ -12,6 +12,20 @@
 //! `describe_metrics()` (to register Prometheus HELP/TYPE lines on
 //! startup) and by the structural-parity test.
 //!
+//! # Unit annotations
+//!
+//! v0.6.0's hand-written `describe_metrics()` passed `metrics::Unit::Seconds`
+//! to time histograms (`*_duration_seconds`) and `metrics::Unit::Bytes` to
+//! `request_body_bytes`. The catalog drops those annotations: `MetricKind`
+//! has no unit field, so `describe_metrics()` calls the 2-arg `(name, help)`
+//! form for every metric. Unit semantics are conveyed by the standard
+//! Prometheus name-suffix convention (`_seconds`, `_bytes`, `_total`) which
+//! every metric in the catalog already follows; /metrics scrape output is
+//! unchanged because the metrics-rs facade does not surface units in the
+//! text format. If a future metric needs explicit `Unit` metadata at
+//! registration time, extend `MetricDescriptor` + the derive's
+//! `#[metric(unit = "...")]` attribute and update this note.
+//!
 //! # Safety / `unsafe_code`
 //!
 //! `linkme`'s `#[distributed_slice]` macro expands into `#[link_section]`
