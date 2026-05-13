@@ -104,6 +104,39 @@ The metric namespace deliberately avoids high-cardinality labels:
 `model_alias_requested_by_client` is replaced by the *resolved* `route`
 label in metrics.
 
+### Adding a new metric (v0.6.1+)
+
+Every metric is declared once in `crates/observability/src/metrics/catalog.rs`
+as a zero-sized marker struct with `#[derive(Metric)]`. Adding a new
+metric is a one-site edit:
+
+```rust
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_my_new_total",
+    kind = "counter",
+    help = "Per-route count of my-new-thing"
+)]
+pub struct MyNewTotal;
+```
+
+The derive emits `MyNewTotal::NAME`, registers a Prometheus description
+via `linkme`-collected slice, and surfaces the metric in the
+[structural-parity test](../crates/observability/tests/derive_metric_parity.rs)
+on the next release.
+
+The legacy `pub const NAME: &str = "..."` constants in
+`crates/observability/src/metrics/names.rs` are preserved for source-
+backward compatibility; new code should reference the marker struct
+directly (`catalog::MyNewTotal::NAME`).
+
+If a metric needs a `recorders.rs` helper (typed wrappers around
+`metrics::counter!` / `metrics::histogram!` macros for label-set
+enforcement), add it alongside the existing helpers in
+`crates/observability/src/metrics/recorders.rs`. Recorders are
+intentionally not auto-generated — they encode per-metric label
+semantics that the catalog can't.
+
 ### Example Grafana dashboard panels
 
 Useful starting panels (PromQL):
