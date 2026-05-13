@@ -1,3 +1,8 @@
+//! A well-formed counter: name + kind + help all supplied via the
+//! `#[metric(...)]` attribute. Must compile without error AND register
+//! a MetricDescriptor in the catalog's distributed_slice.
+
+use agent_shim_observability::metrics::catalog::MetricKind;
 use agent_shim_observability_derive::Metric;
 
 #[derive(Metric)]
@@ -5,9 +10,7 @@ use agent_shim_observability_derive::Metric;
 pub struct TestCounter;
 
 fn main() {
-    let _name: &'static str = TestCounter::NAME;
-    let _help: &'static str = TestCounter::HELP;
-    // KIND is an enum value defined by the host crate; not testable in
-    // T3 (the host crate's catalog::MetricKind doesn't exist yet).
-    // Wired up in T4.
+    assert_eq!(TestCounter::NAME, "agent_shim_test_counter");
+    assert_eq!(TestCounter::KIND, MetricKind::Counter);
+    assert_eq!(TestCounter::HELP, "Test counter");
 }

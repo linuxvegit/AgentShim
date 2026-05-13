@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 use agent_shim_config::MetricsConfig;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
+pub mod catalog;
 pub mod names;
 pub mod recorders;
 

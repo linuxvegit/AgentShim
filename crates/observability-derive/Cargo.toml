@@ -16,3 +16,4 @@ proc-macro2 = "1"
 
 [dev-dependencies]
 trybuild = "1"
+agent-shim-observability = { path = "../observability" }
