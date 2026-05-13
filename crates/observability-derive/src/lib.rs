@@ -42,9 +42,24 @@ pub fn derive_metric(input: TokenStream) -> TokenStream {
                 _ => return Err(nested.error("expected string literal")),
             };
             match ident.as_str() {
-                "name" => name = Some(lit),
-                "kind" => kind = Some(lit),
-                "help" => help = Some(lit),
+                "name" => {
+                    if name.is_some() {
+                        return Err(nested.error("duplicate `name` attribute"));
+                    }
+                    name = Some(lit);
+                }
+                "kind" => {
+                    if kind.is_some() {
+                        return Err(nested.error("duplicate `kind` attribute"));
+                    }
+                    kind = Some(lit);
+                }
+                "help" => {
+                    if help.is_some() {
+                        return Err(nested.error("duplicate `help` attribute"));
+                    }
+                    help = Some(lit);
+                }
                 other => {
                     return Err(nested.error(format!("unknown metric attribute: {other}")));
                 }

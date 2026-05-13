@@ -10,4 +10,6 @@ fn ui() {
     t.pass("tests/ui/derive_pass_counter.rs");
     t.compile_fail("tests/ui/derive_fail_missing_name.rs");
     t.compile_fail("tests/ui/derive_fail_missing_kind.rs");
+    t.compile_fail("tests/ui/derive_fail_duplicate_name.rs");
+    t.compile_fail("tests/ui/derive_fail_non_string_value.rs");
 }

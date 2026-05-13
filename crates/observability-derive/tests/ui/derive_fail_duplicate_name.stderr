@@ -1,0 +1,5 @@
+error: duplicate `name` attribute
+ --> tests/ui/derive_fail_duplicate_name.rs:4:36
+  |
+4 | #[metric(name = "agent_shim_test", name = "agent_shim_test_dup", kind = "counter", help = "Test")]
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

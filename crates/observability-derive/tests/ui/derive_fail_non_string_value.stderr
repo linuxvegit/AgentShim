@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/ui/derive_fail_non_string_value.rs:4:36
+  |
+4 | #[metric(name = "agent_shim_test", kind = 42, help = "Test")]
+  |                                    ^^^^^^^^^
