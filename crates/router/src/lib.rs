@@ -6,6 +6,7 @@ pub mod cost_estimate;
 pub mod cost_filter;
 pub mod errors;
 pub mod fallback;
+pub mod image_estimators;
 pub mod latency_probe;
 pub mod model_index;
 mod policy_vec;
@@ -89,6 +90,9 @@ pub use cost_filter::{filter_chain, FilterOutcome, FilterReason, Note, Skip};
 pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
 pub use fallback::{
     fallback_eligibility, fallback_eligibility_with_overrides, FallbackEligibility,
+};
+pub use image_estimators::{
+    AnthropicImageEstimator, OpenAiImageEstimator, ResponsesImageEstimator,
 };
 pub use latency_probe::{DisabledLatencyProbe, LatencyProbe, MockLatencyProbe};
 pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry};
