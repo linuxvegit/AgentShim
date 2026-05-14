@@ -28,5 +28,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::copilot_models::run(credential_path).await
             }
         },
+        #[cfg(windows)]
+        Commands::Service { .. } => anyhow::bail!("service dispatch lands in next commit"),
     }
 }
