@@ -9,6 +9,7 @@
 
 pub mod elevation;
 pub mod install;
+pub mod log_fallback;
 pub mod names;
 pub mod status;
 
