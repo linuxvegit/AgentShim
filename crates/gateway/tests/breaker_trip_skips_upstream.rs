@@ -136,6 +136,7 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
             min_tier: None,
             max_cost_usd: None,
         }],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

@@ -120,6 +120,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             // inside the gap.
             max_cost_usd: Some(0.001),
         }],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

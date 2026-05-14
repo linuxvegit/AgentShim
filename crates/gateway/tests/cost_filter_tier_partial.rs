@@ -104,6 +104,7 @@ fn make_config(eco_url: &str, std_url: &str) -> GatewayConfig {
             min_tier: Some(Tier::Standard),
             max_cost_usd: None,
         }],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

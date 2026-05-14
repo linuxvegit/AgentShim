@@ -14,6 +14,11 @@ pub struct GatewayConfig {
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
+    /// Top-level plugin declarations. Each entry is a named plugin
+    /// instance keyed by `<plugin_name>`. Routes reference these by
+    /// name. Plan 07 P03.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, crate::plugins::PluginEntry>,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]

@@ -711,6 +711,7 @@ mod tests {
             logging: LoggingConfig::default(),
             upstreams: BTreeMap::new(),
             routes: vec![],
+            plugins: BTreeMap::new(),
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             copilot: None,

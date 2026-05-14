@@ -73,6 +73,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             "test-anthropic",
             "claude-opus-4-7",
         )],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

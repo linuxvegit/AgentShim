@@ -126,6 +126,7 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
             min_tier: None,
             max_cost_usd: None,
         }],
+        plugins: ::std::collections::BTreeMap::new(),
         auth,
         rate_limit: RateLimitConfig::default(),
         copilot: None,

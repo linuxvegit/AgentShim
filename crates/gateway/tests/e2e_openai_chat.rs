@@ -36,6 +36,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             "test-openai",
             "gpt-4o-2024-11-20",
         )],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,
