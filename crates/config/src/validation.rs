@@ -2103,4 +2103,89 @@ routes:
             other => panic!("expected ZeroTimeoutMs, got {other:?}"),
         }
     }
+
+    /// Independent regression test that EACH of the 5 PerHook slots is
+    /// checked by `validate_plugins`. If a future refactor drops a slot
+    /// from the inner array literal, the per-slot test above might still
+    /// pass while the other 4 slots silently leak zero timeouts. This
+    /// table-driven test brackets the array.
+    #[test]
+    fn validate_plugins_checks_every_per_hook_slot() {
+        let slots: [(&str, crate::plugins::TimeoutMs); 5] = [
+            (
+                "default",
+                crate::plugins::TimeoutMs::PerHook {
+                    default: Some(0),
+                    on_decoded_request: None,
+                    on_resolved: None,
+                    on_stream_event: None,
+                    on_response_complete: None,
+                },
+            ),
+            (
+                "on_decoded_request",
+                crate::plugins::TimeoutMs::PerHook {
+                    default: None,
+                    on_decoded_request: Some(0),
+                    on_resolved: None,
+                    on_stream_event: None,
+                    on_response_complete: None,
+                },
+            ),
+            (
+                "on_resolved",
+                crate::plugins::TimeoutMs::PerHook {
+                    default: None,
+                    on_decoded_request: None,
+                    on_resolved: Some(0),
+                    on_stream_event: None,
+                    on_response_complete: None,
+                },
+            ),
+            (
+                "on_stream_event",
+                crate::plugins::TimeoutMs::PerHook {
+                    default: None,
+                    on_decoded_request: None,
+                    on_resolved: None,
+                    on_stream_event: Some(0),
+                    on_response_complete: None,
+                },
+            ),
+            (
+                "on_response_complete",
+                crate::plugins::TimeoutMs::PerHook {
+                    default: None,
+                    on_decoded_request: None,
+                    on_resolved: None,
+                    on_stream_event: None,
+                    on_response_complete: Some(0),
+                },
+            ),
+        ];
+        for (expected_slot, timeout) in slots {
+            let mut cfg = mk_cfg_with_routes(vec![]);
+            cfg.plugins.insert(
+                "p".to_string(),
+                crate::plugins::PluginEntry {
+                    kind: "prompt_compressor".to_string(),
+                    config: serde_json::json!({}),
+                    on_error: crate::plugins::OnErrorYaml::Skip,
+                    timeout_ms: Some(timeout),
+                    enabled: true,
+                },
+            );
+            let err = crate::validation::validate_plugins(&cfg).unwrap_err();
+            match err {
+                ValidationError::ZeroTimeoutMs { plugin, slot } => {
+                    assert_eq!(plugin, "p");
+                    assert_eq!(
+                        slot, expected_slot,
+                        "wrong slot reported for {expected_slot} zero timeout"
+                    );
+                }
+                other => panic!("expected ZeroTimeoutMs for slot {expected_slot}, got {other:?}"),
+            }
+        }
+    }
 }

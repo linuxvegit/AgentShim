@@ -12,6 +12,6 @@ pub use schema::*;
 pub use secrets::Secret;
 pub use upstream_accessors::{upstream_cost, upstream_latency_budget, upstream_tier};
 pub use validation::{
-    validate, validate_for_reload, validate_routes, ReloadBaseline, ReloadDiff,
+    validate, validate_for_reload, validate_plugins, validate_routes, ReloadBaseline, ReloadDiff,
     ReloadValidationError, ValidationError,
 };
