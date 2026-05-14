@@ -18,6 +18,7 @@ dependencies = [
  "agent-shim-observability",
  "agent-shim-providers",
  "agent-shim-router",
+ "agent-shim-tokens",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -85,6 +86,7 @@ name = "agent-shim-frontends"
 version = "0.6.1"
 dependencies = [
  "agent-shim-core",
+ "agent-shim-tokens",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -95,7 +97,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiktoken-rs",
  "tokio",
  "tokio-stream",
 ]
@@ -194,6 +195,7 @@ dependencies = [
  "agent-shim-core",
  "agent-shim-observability",
  "agent-shim-providers",
+ "agent-shim-tokens",
  "arc-swap",
  "async-trait",
  "futures",
@@ -207,13 +209,19 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 1.0.69",
- "tiktoken-rs",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "tracing-test",
  "uuid",
+]
+
+[[package]]
+name = "agent-shim-tokens"
+version = "0.6.1"
+dependencies = [
+ "tiktoken-rs",
 ]
 
 [[package]]
