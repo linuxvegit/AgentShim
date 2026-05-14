@@ -11,7 +11,7 @@
 //!      c. Boots a tokio multi_thread runtime and drives `run_core`.
 //!      d. `run_core`'s `on_listening` callback reports `Running`.
 //!      e. On `Stop`/`Shutdown`, the control handler triggers the watch
-//!         channel, which `run_core`'s shutdown future awaits.
+//!      channel, which `run_core`'s shutdown future awaits.
 //!      f. Once `run_core` returns, report `Stopped(exit_code)`.
 //!
 //! Spec sections 4.4, 4.5, 4.6.
@@ -24,8 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows_service::define_windows_service;
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-    ServiceType,
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -142,11 +141,10 @@ fn run_service(config_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
-    // Clone the status handle so both the on_listening callback (which
-    // moves it) and the post-serve "Stopped" report (still in this
-    // scope) have access. The handle type is Clone-able — under the
-    // hood it's a thin wrapper around a Win32 handle.
-    let status_for_listening = status_handle.clone();
+    // `ServiceStatusHandle` is `Copy` (thin wrapper around a Win32 handle),
+    // so we can hand a copy to the `on_listening` callback while keeping the
+    // original for the post-serve "Stopped" report.
+    let status_for_listening = status_handle;
     let on_listening = move |_addr: std::net::SocketAddr| {
         let _ = status_for_listening.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,

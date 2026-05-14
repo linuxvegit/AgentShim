@@ -42,7 +42,10 @@ fn apply_fallback_injects_when_file_is_none() {
     let mut cfg = empty_config();
     assert!(cfg.logging.file.is_none());
     apply_service_log_fallback(&mut cfg);
-    let file = cfg.logging.file.expect("fallback must populate logging.file");
+    let file = cfg
+        .logging
+        .file
+        .expect("fallback must populate logging.file");
     assert_eq!(file.format, LogFormat::Json);
     assert_eq!(file.rotation, RotationPolicy::Daily);
     assert_eq!(file.max_files, 7);
