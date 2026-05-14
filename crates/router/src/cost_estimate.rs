@@ -23,10 +23,6 @@
 //! ToolCall/ToolResult blocks remain skipped: their wire form is small
 //! enough that the conservative per-image worst-case dwarfs them.
 
-use std::sync::OnceLock;
-
-use tiktoken_rs::CoreBPE;
-
 use agent_shim_config::UpstreamCost;
 use agent_shim_core::cost::{ImageSizeHint, ImageTokenEstimator};
 use agent_shim_core::{CanonicalRequest, ContentBlock};
@@ -72,12 +68,12 @@ pub fn estimate_request_cost(
     Some(CostEstimate { cost_usd })
 }
 
-/// Lazily-initialised cl100k_base tokenizer. Matches the pattern in
-/// `crates/frontends/src/anthropic_messages/count_tokens.rs` so the
-/// process pays for tokenizer construction at most once.
-fn cl100k() -> &'static CoreBPE {
-    static CELL: OnceLock<CoreBPE> = OnceLock::new();
-    CELL.get_or_init(|| tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize"))
+/// Returns the cl100k_base encoder. Delegates to
+/// `agent_shim_tokens::cl100k_encoder` — single workspace-wide source
+/// of truth, matching the pattern in
+/// `crates/frontends/src/anthropic_messages/count_tokens.rs`. (P01 T4.)
+fn cl100k() -> &'static tiktoken_rs::CoreBPE {
+    agent_shim_tokens::cl100k_encoder()
 }
 
 /// Estimate input text tokens using `cl100k_base`. `encode_ordinary`
