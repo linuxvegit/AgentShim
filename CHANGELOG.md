@@ -5,6 +5,14 @@ All notable changes to AgentShim are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Windows Service support.** New `agent-shim service install|uninstall|start|stop|restart|status` subcommands on Windows. Run agent-shim as a long-lived background service with SCM state visibility (port-bind-then-Running semantics) and graceful shutdown via the existing axum drain path. See `docs/deployment.md`.
+- **Cross-platform file logging.** New optional `logging.file` config block (path, format, rotation, max_files). Backed by `tracing-appender` with daily/hourly rotation and async writes. See `docs/observability.md#file-logging`.
+- **Linux systemd example** at `deploy/agent-shim.service`. Reuses the existing SIGHUP reload handler for `systemctl reload`.
+
 ## [0.6.1] — 2026-05-13
 
 Patch release closing the five Minor items deferred from Phase 6's
