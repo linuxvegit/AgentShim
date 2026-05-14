@@ -214,6 +214,53 @@ is configured. The pretty/JSON fmt layer renders span structure
 natively. Set `RUST_LOG=info,agent_shim=debug` to see span enter/exit
 events for every request.
 
+## Logging
+
+### File logging
+
+Set `logging.file` in the gateway config to write log events to a rolling file in addition to stdout:
+
+```yaml
+logging:
+  format: pretty           # stdout format; unchanged
+  filter: info
+  file:                    # NEW: optional
+    path: /var/log/agent-shim/agent-shim.log
+    format: json           # file format; independent of stdout
+    rotation: daily        # daily | hourly | never
+    max_files: 7           # 0 = unlimited
+```
+
+#### Fields
+
+| Field          | Type     | Default | Notes                                                                            |
+|----------------|----------|---------|----------------------------------------------------------------------------------|
+| `path`         | path     | —       | Required when `file:` is set. Use an **absolute path** on Windows (under a service the cwd is `C:\Windows\System32`). |
+| `format`       | enum     | `json`  | `json` for structured ingestion, `pretty` for human-readable.                    |
+| `rotation`     | enum     | `daily` | `daily` produces `agent-shim.log.YYYY-MM-DD`; `hourly` adds the hour; `never` keeps a single file. |
+| `max_files`    | integer  | `7`     | Retention: oldest rolled files are deleted once this many exist. `0` disables retention. |
+
+#### Behavior
+
+- **Async writes.** File writes happen on a background thread via `tracing_appender::non_blocking`. HTTP handlers never block on disk I/O — important for streaming responses.
+- **Buffering.** The non-blocking writer buffers events in a bounded channel. On a graceful shutdown (Ctrl+C, SIGTERM, or SCM Stop), the worker guard drops and flushes pending events.
+- **SIGKILL caveat.** If the process is `SIGKILL`-ed (or the OS terminates it ungracefully), buffered events are lost. This is the trade-off for async writes. Critical state should be persisted elsewhere.
+- **Stdout still writes.** The file layer is additive. To suppress stdout in service mode, simply ignore it — service-spawned processes have no console attached.
+
+#### Service-mode default
+
+When agent-shim is started by the Windows Service Control Manager (via `agent-shim service run`, invoked by SCM), it injects a default `logging.file` block if the loaded config does not have one:
+
+```yaml
+file:
+  path: C:\ProgramData\agent-shim\logs\agent-shim.log
+  format: json
+  rotation: daily
+  max_files: 7
+```
+
+The user's explicit `logging.file` always takes precedence. The fallback is purely a "give the operator somewhere to look" safety net.
+
 ## Hot-reload
 
 Two trigger surfaces, identical effect:
