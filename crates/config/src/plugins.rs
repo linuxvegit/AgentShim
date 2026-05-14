@@ -143,10 +143,7 @@ impl RoutePluginsBlock {
             .on_decoded_request
             .iter()
             .map(|n| ("on_decoded_request", n.as_str()));
-        let h3 = self
-            .on_resolved
-            .iter()
-            .map(|n| ("on_resolved", n.as_str()));
+        let h3 = self.on_resolved.iter().map(|n| ("on_resolved", n.as_str()));
         let h5 = self
             .on_stream_event
             .iter()
@@ -232,7 +229,10 @@ enabled: false
         // `deny_unknown_fields` must catch typos.
         let yaml = "type: foo\nbogus_field: 1";
         let r: Result<PluginEntry, _> = serde_yaml::from_str(yaml);
-        assert!(r.is_err(), "deny_unknown_fields should reject `bogus_field`");
+        assert!(
+            r.is_err(),
+            "deny_unknown_fields should reject `bogus_field`"
+        );
     }
 
     #[test]
@@ -267,6 +267,9 @@ enabled: false
         // `deny_unknown_fields` must reject typo-hooks.
         let yaml = "on_stream_evnt: [foo]"; // typo: evnt
         let r: Result<RoutePluginsBlock, _> = serde_yaml::from_str(yaml);
-        assert!(r.is_err(), "deny_unknown_fields should reject `on_stream_evnt`");
+        assert!(
+            r.is_err(),
+            "deny_unknown_fields should reject `on_stream_evnt`"
+        );
     }
 }
