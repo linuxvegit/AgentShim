@@ -103,6 +103,7 @@ fn make_config(eco_url: &str, std_url: &str) -> GatewayConfig {
             // axis before the resilience layer's chain walk runs.
             min_tier: Some(Tier::Standard),
             max_cost_usd: None,
+            plugins: None,
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),

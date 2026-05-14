@@ -749,6 +749,7 @@ mod tests {
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -783,6 +784,7 @@ mod tests {
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         });
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
@@ -796,6 +798,7 @@ mod tests {
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -830,6 +833,7 @@ mod tests {
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         });
         assert!(matches!(
             validate(&cfg),
@@ -1666,6 +1670,7 @@ routes:
             anthropic_beta: None,
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         });
         let diff = validate_for_reload(&candidate, &baseline).expect("ok");
         assert_eq!(diff.routes_total, 2);
@@ -1827,6 +1832,7 @@ routes:
             breaker: BreakerConfig::default(),
             min_tier: Some(Tier::Standard),
             max_cost_usd: None,
+            plugins: None,
         });
         validate(&cfg).expect("chain has std which meets min_tier=standard");
     }

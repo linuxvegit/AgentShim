@@ -351,6 +351,7 @@ mod tests {
                 breaker: BreakerConfig::default(),
                 min_tier: None,
                 max_cost_usd: None,
+                plugins: None,
             }],
             plugins: ::std::collections::BTreeMap::new(),
             auth: Default::default(),

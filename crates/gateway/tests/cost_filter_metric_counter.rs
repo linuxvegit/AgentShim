@@ -105,6 +105,7 @@ fn make_config(a_url: &str, b_url: &str, public_port: u16, admin_port: u16) -> G
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: Some(0.0001),
+            plugins: None,
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),

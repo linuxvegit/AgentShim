@@ -125,6 +125,7 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth,

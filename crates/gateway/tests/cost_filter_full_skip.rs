@@ -99,6 +99,7 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
             // Cap any non-trivial request out: even an empty prompt
             // estimates a few input tokens × $1M/M, well over $0.0001.
             max_cost_usd: Some(0.0001),
+            plugins: None,
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
