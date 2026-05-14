@@ -80,3 +80,60 @@ async fn run_core_invokes_on_listening_and_respects_custom_shutdown() {
 
     result.expect("run_core returned an error");
 }
+
+// Plan windows-service P02 T6: end-to-end proof that `run_core` keeps the
+// `WorkerGuard` returned from `agent_shim_observability::init` alive for
+// the lifetime of the server. If the guard were dropped early the
+// non-blocking writer would silently swallow events emitted by the
+// gateway during startup, and no file would be produced.
+#[tokio::test]
+async fn run_core_writes_log_file_when_configured() {
+    use agent_shim_config::schema::{FileLoggingConfig, LogFormat, RotationPolicy};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let log_path = tmp.path().join("agent-shim.log");
+
+    let mut cfg = ephemeral_config();
+    cfg.logging.file = Some(FileLoggingConfig {
+        path: log_path.clone(),
+        format: LogFormat::Json,
+        rotation: RotationPolicy::Daily,
+        max_files: 7,
+    });
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        run_core(
+            cfg,
+            None,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            |_| {},
+        )
+        .await
+    });
+
+    // Wait for the gateway to bind and emit at least one tracing event.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let _ = shutdown_tx.send(());
+    let _ = server_task.await.unwrap();
+
+    // File should exist under the configured directory.
+    let prefix = log_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let entries: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "no log file produced in {:?}",
+        tmp.path()
+    );
+}
