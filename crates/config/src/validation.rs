@@ -340,6 +340,12 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         }
     }
 
+    // Layer A plugin validation (Plan 07 P03). Three rules:
+    //   - undeclared plugin reference on a route hook
+    //   - timeout_ms == 0
+    //   - duplicate plugin names (defensive — YAML usually catches it)
+    validate_plugins(cfg)?;
+
     Ok(())
 }
 
@@ -623,6 +629,86 @@ fn check_sha256_key(key: &str, ctx: &str) -> Result<(), String> {
              followed by 64 lowercase hex characters"
         ));
     }
+    Ok(())
+}
+
+/// Layer A plugin validation (Plan 07 P03, spec §5.3). Three rules:
+///
+/// 1. Every plugin name referenced on a route hook is declared
+///    under top-level `plugins:`.
+/// 2. No `timeout_ms` slot is zero.
+/// 3. (Defensive) No duplicate plugin names. YAML map-key
+///    uniqueness catches this at parse time; this branch only fires
+///    on hand-constructed `GatewayConfig` test fixtures.
+///
+/// Layer B (unknown plugin kind, factory `instantiate` failure, hook
+/// subscription mismatch) lives in the gateway boot path — see P06.
+pub fn validate_plugins(cfg: &GatewayConfig) -> Result<(), ValidationError> {
+    // Rule 3: duplicate name (defensive against hand-constructed
+    // configs that bypass YAML map-key uniqueness). For a `BTreeMap`
+    // this can't actually trigger from YAML; left here so an
+    // intentionally-crafted test fixture can't sneak past.
+    let mut seen = std::collections::HashSet::new();
+    for name in cfg.plugins.keys() {
+        if !seen.insert(name.clone()) {
+            return Err(ValidationError::DuplicatePluginName(name.clone()));
+        }
+    }
+
+    // Rule 2: timeout_ms == 0.
+    for (name, entry) in &cfg.plugins {
+        if let Some(t) = &entry.timeout_ms {
+            match t {
+                crate::plugins::TimeoutMs::Uniform(0) => {
+                    return Err(ValidationError::ZeroTimeoutMs {
+                        plugin: name.clone(),
+                        slot: "uniform",
+                    });
+                }
+                crate::plugins::TimeoutMs::Uniform(_) => {}
+                crate::plugins::TimeoutMs::PerHook {
+                    default,
+                    on_decoded_request,
+                    on_resolved,
+                    on_stream_event,
+                    on_response_complete,
+                } => {
+                    for (slot, value) in [
+                        ("default", default),
+                        ("on_decoded_request", on_decoded_request),
+                        ("on_resolved", on_resolved),
+                        ("on_stream_event", on_stream_event),
+                        ("on_response_complete", on_response_complete),
+                    ] {
+                        if let Some(0) = value {
+                            return Err(ValidationError::ZeroTimeoutMs {
+                                plugin: name.clone(),
+                                slot,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Rule 1: undeclared plugin reference on any route hook.
+    for route in &cfg.routes {
+        let Some(plugins_block) = &route.plugins else {
+            continue;
+        };
+        let route_label = format!("{}/{}", route.frontend, route.model);
+        for (hook, plugin_name) in plugins_block.iter_references() {
+            if !cfg.plugins.contains_key(plugin_name) {
+                return Err(ValidationError::UndeclaredPlugin {
+                    route: route_label.clone(),
+                    plugin: plugin_name.to_string(),
+                    hook,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1897,5 +1983,124 @@ routes:
             ),
             "expected StartupError(ImpossibleMinTier), got {err:?}"
         );
+    }
+
+    // ── Phase 7 P03 Layer A plugin validation ───────────────────────────────
+
+    fn mk_cfg_with_routes(routes: Vec<crate::schema::RouteEntry>) -> crate::schema::GatewayConfig {
+        crate::schema::GatewayConfig {
+            server: Default::default(),
+            logging: Default::default(),
+            upstreams: Default::default(),
+            routes,
+            plugins: Default::default(),
+            auth: Default::default(),
+            rate_limit: Default::default(),
+            copilot: None,
+            admin: None,
+            metrics: Default::default(),
+            otel: None,
+        }
+    }
+
+    #[test]
+    fn validate_plugins_rejects_undeclared_reference() {
+        let mut route = crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-sonnet",
+            "anthropic",
+            "claude-sonnet",
+        );
+        route.plugins = Some(crate::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["missing".to_string()],
+            ..Default::default()
+        });
+        let cfg = mk_cfg_with_routes(vec![route]);
+        let err = crate::validation::validate_plugins(&cfg).unwrap_err();
+        match err {
+            ValidationError::UndeclaredPlugin { plugin, hook, .. } => {
+                assert_eq!(plugin, "missing");
+                assert_eq!(hook, "on_decoded_request");
+            }
+            other => panic!("expected UndeclaredPlugin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_plugins_accepts_declared_reference() {
+        let mut route = crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-sonnet",
+            "anthropic",
+            "claude-sonnet",
+        );
+        route.plugins = Some(crate::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["compressor".to_string()],
+            ..Default::default()
+        });
+        let mut cfg = mk_cfg_with_routes(vec![route]);
+        cfg.plugins.insert(
+            "compressor".to_string(),
+            crate::plugins::PluginEntry {
+                kind: "prompt_compressor".to_string(),
+                config: serde_json::json!({}),
+                on_error: crate::plugins::OnErrorYaml::Skip,
+                timeout_ms: None,
+                enabled: true,
+            },
+        );
+        assert!(crate::validation::validate_plugins(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_plugins_rejects_zero_uniform_timeout() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.plugins.insert(
+            "p".to_string(),
+            crate::plugins::PluginEntry {
+                kind: "prompt_compressor".to_string(),
+                config: serde_json::json!({}),
+                on_error: crate::plugins::OnErrorYaml::Skip,
+                timeout_ms: Some(crate::plugins::TimeoutMs::Uniform(0)),
+                enabled: true,
+            },
+        );
+        let err = crate::validation::validate_plugins(&cfg).unwrap_err();
+        match err {
+            ValidationError::ZeroTimeoutMs { plugin, slot } => {
+                assert_eq!(plugin, "p");
+                assert_eq!(slot, "uniform");
+            }
+            other => panic!("expected ZeroTimeoutMs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_plugins_rejects_zero_per_hook_timeout() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.plugins.insert(
+            "p".to_string(),
+            crate::plugins::PluginEntry {
+                kind: "prompt_compressor".to_string(),
+                config: serde_json::json!({}),
+                on_error: crate::plugins::OnErrorYaml::Skip,
+                timeout_ms: Some(crate::plugins::TimeoutMs::PerHook {
+                    default: Some(50),
+                    on_decoded_request: None,
+                    on_resolved: None,
+                    on_stream_event: Some(0), // <- this triggers
+                    on_response_complete: None,
+                }),
+                enabled: true,
+            },
+        );
+        let err = crate::validation::validate_plugins(&cfg).unwrap_err();
+        match err {
+            ValidationError::ZeroTimeoutMs { plugin, slot } => {
+                assert_eq!(plugin, "p");
+                assert_eq!(slot, "on_stream_event");
+            }
+            other => panic!("expected ZeroTimeoutMs, got {other:?}"),
+        }
     }
 }
