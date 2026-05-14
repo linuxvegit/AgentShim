@@ -70,6 +70,17 @@ Pre-network-call check raised as `ProviderError::CapabilityMismatch` when the fr
 **Extensions namespace**
 `ContentBlock`, `Message`, `CanonicalRequest`, and `CanonicalResponse` carry `extensions: HashMap<String, serde_json::Value>` for protocol-specific data not promoted to canonical fields. v0.2 convention: keys are namespaced by provider — `gemini.safety_ratings`, `anthropic.cache_creation`, `deepseek.<...>`. Documented first-class behaviors live in `docs/providers/<provider>.md`. Promotion to typed canonical fields happens in v0.3 based on cross-provider read patterns, not prediction.
 
+## Plugin system (Phase 7 candidate)
+
+**Plugin**
+A YAML-declared, named entry under `plugins:` in `gateway.yaml`. Carries a `kind:` (which Rust implementation), a `config:` blob (kind-specific), an `on_error:` policy, and a `timeout_ms:`. Routes reference plugins by name to attach them to a hook. Analogous shape to **Upstream** — a named, configured entity. Distinct from **PluginKind** (the Rust type).
+
+**PluginKind**
+The Rust implementation of a plugin behavior. Built from a `PluginFactory` at startup. One kind can back many plugins (each with its own config). Naming follows the project's existing `FrontendKind` precedent — the "type" suffix is `Kind`, not "type" or "class". Not part of operator-facing language; lives in code and tests only.
+
+**Hook**
+One of four well-defined points in the request lifecycle where plugins run: `on_decoded_request`, `on_resolved`, `on_stream_event`, `on_response_complete`. Each plugin subscribes to a subset of hooks; route YAML attaches plugins to a hook in a chosen order.
+
 ## Glossary maintenance
 
 When introducing a new domain concept, add it here in the same paragraph it gets named. Don't rename existing terms without a search-and-replace across the codebase.
