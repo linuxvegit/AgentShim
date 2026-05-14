@@ -67,8 +67,9 @@ where
             hook: h,
             field,
         })) => {
-            // Same — programming error, always propagate (subject to
-            // on_error mapping by the registry).
+            // Programming error — honoured by on_error like `Failed`:
+            // `skip` swallows (request continues with prior state),
+            // `fail` propagates as 502. Logged at ERROR either way.
             match on_error {
                 OnError::Skip => InvokeOutcome::Skipped,
                 OnError::Fail => InvokeOutcome::Propagate(PluginError::ProtectedFieldMutated {
