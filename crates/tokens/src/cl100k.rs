@@ -13,9 +13,7 @@ use tiktoken_rs::CoreBPE;
 /// throw-away invocation so the cost is paid off the hot request path.
 pub fn cl100k_encoder() -> &'static CoreBPE {
     static CELL: OnceLock<CoreBPE> = OnceLock::new();
-    CELL.get_or_init(|| {
-        tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize")
-    })
+    CELL.get_or_init(|| tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize"))
 }
 
 /// Count `cl100k_base` tokens in `s`. Uses `encode_ordinary` so
