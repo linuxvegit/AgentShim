@@ -5,6 +5,17 @@ server:
 logging:
   format: pretty
   filter: info,agent_shim=debug
+  # Optional file logging. When set, log events are written to a rolling
+  # file in addition to stdout. Use an ABSOLUTE path on Windows (under
+  # a service the cwd is C:\Windows\System32). Daily rotation with
+  # 7-day retention is a reasonable default; tune for your platform.
+  #
+  # file:
+  #   path: "/var/log/agent-shim/agent-shim.log"   # Linux
+  #   # path: "C:\\ProgramData\\agent-shim\\logs\\agent-shim.log"   # Windows
+  #   format: json
+  #   rotation: daily     # daily | hourly | never
+  #   max_files: 7
 upstreams:
   # DeepSeek-as-backend (talks to api.deepseek.com directly):
   # Uses the native `deepseek` upstream type which adds:
