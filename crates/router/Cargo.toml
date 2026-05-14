@@ -21,7 +21,6 @@ tracing.workspace = true
 tokio = { workspace = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "small_rng"] }
 sha2 = "0.10"
-tiktoken-rs.workspace = true
 agent-shim-tokens = { path = "../tokens" }
 uuid = { workspace = true }
 metrics.workspace = true

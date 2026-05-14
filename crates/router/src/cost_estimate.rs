@@ -13,8 +13,9 @@
 //! Tokens are counted with `tiktoken-rs`'s `cl100k_base` encoder (the
 //! same one frontier models use), using `encode_ordinary` so that
 //! `<|...|>` literals in user content don't blow up the encoder. The
-//! tokenizer is initialised once via a `OnceLock`, matching the pattern
-//! established in `crates/frontends/src/anthropic_messages/count_tokens.rs`.
+//! encoder lives in `agent-shim-tokens` (one workspace-wide `OnceLock`
+//! shared with `frontends::count_tokens` and the plugin system); this
+//! crate accesses it through `agent_shim_tokens::cl100k_encoder()`.
 //!
 //! Text blocks contribute to the input estimate via the `cl100k_base`
 //! tokenizer. Image blocks are accounted for via the per-frontend
@@ -34,7 +35,8 @@ const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 
 /// Outcome of a single estimation. Today this is just the USD cost —
 /// see module docs for the formula. The encoder (`cl100k_base` via
-/// `OnceLock`) is infallible in practice; no fallback flag is needed.
+/// `agent_shim_tokens::cl100k_encoder`) is infallible in practice; no
+/// fallback flag is needed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostEstimate {
     pub cost_usd: f64,
@@ -68,20 +70,15 @@ pub fn estimate_request_cost(
     Some(CostEstimate { cost_usd })
 }
 
-/// Returns the cl100k_base encoder. Delegates to
-/// `agent_shim_tokens::cl100k_encoder` — single workspace-wide source
-/// of truth, matching the pattern in
-/// `crates/frontends/src/anthropic_messages/count_tokens.rs`. (P01 T4.)
-fn cl100k() -> &'static tiktoken_rs::CoreBPE {
-    agent_shim_tokens::cl100k_encoder()
-}
-
 /// Estimate input text tokens using `cl100k_base`. `encode_ordinary`
 /// keeps `<|...|>` literals in user content from being interpreted as
-/// special tokens.
+/// special tokens. The encoder is the workspace-wide singleton owned
+/// by `agent-shim-tokens` (single `OnceLock` warmed at gateway boot).
 fn estimate_text_tokens(request: &CanonicalRequest) -> u32 {
     let text = canonical_request_text(request);
-    cl100k().encode_ordinary(&text).len() as u32
+    agent_shim_tokens::cl100k_encoder()
+        .encode_ordinary(&text)
+        .len() as u32
 }
 
 /// Estimate input image tokens by walking every message's content
