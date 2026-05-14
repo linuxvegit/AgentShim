@@ -9,6 +9,7 @@
 
 pub mod elevation;
 pub mod install;
+pub mod lifecycle;
 pub mod log_fallback;
 pub mod names;
 pub mod run;
@@ -39,17 +40,8 @@ pub async fn run(sub: ServiceCommand) -> anyhow::Result<()> {
         ServiceCommand::Run { config } => tokio::task::spawn_blocking(move || run::run(&config))
             .await
             .map_err(|e| anyhow::anyhow!("service run task panicked: {e}"))?,
-        ServiceCommand::Start { name } => {
-            let _ = name;
-            anyhow::bail!("`agent-shim service start` lands in Phase 4")
-        }
-        ServiceCommand::Stop { name } => {
-            let _ = name;
-            anyhow::bail!("`agent-shim service stop` lands in Phase 4")
-        }
-        ServiceCommand::Restart { name } => {
-            let _ = name;
-            anyhow::bail!("`agent-shim service restart` lands in Phase 4")
-        }
+        ServiceCommand::Start { name } => lifecycle::start(&name),
+        ServiceCommand::Stop { name } => lifecycle::stop(&name),
+        ServiceCommand::Restart { name } => lifecycle::restart(&name),
     }
 }
