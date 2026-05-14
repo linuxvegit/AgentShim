@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod cli;
 pub mod commands;
 pub mod handlers;
 pub mod image_estimator_selector;
