@@ -994,4 +994,75 @@ otel: {}
         assert_eq!(otel.service_name, "agent-shim");
         assert_eq!(otel.sample_ratio, 1.0);
     }
+
+    // Plan windows-service P02 T2: failing TDD-red tests for
+    // FileLoggingConfig and RotationPolicy.
+    #[test]
+    fn file_logging_config_roundtrips_defaults() {
+        // Default for FileLoggingConfig is "no file logging" — the parent
+        // LoggingConfig.file field is Option<FileLoggingConfig>, default None.
+        let yaml = r#"
+format: json
+filter: info
+file:
+  path: /var/log/agent-shim/agent-shim.log
+"#;
+        let cfg: LoggingConfig = serde_yaml::from_str(yaml).unwrap();
+        let file = cfg.file.expect("file: section should parse");
+        assert_eq!(
+            file.path,
+            std::path::PathBuf::from("/var/log/agent-shim/agent-shim.log")
+        );
+        assert_eq!(file.format, LogFormat::Json);
+        assert_eq!(file.rotation, RotationPolicy::Daily);
+        assert_eq!(file.max_files, 7);
+    }
+
+    #[test]
+    fn file_logging_config_explicit_all_fields() {
+        let yaml = r#"
+format: pretty
+filter: debug
+file:
+  path: /tmp/agent.log
+  format: pretty
+  rotation: hourly
+  max_files: 24
+"#;
+        let cfg: LoggingConfig = serde_yaml::from_str(yaml).unwrap();
+        let file = cfg.file.unwrap();
+        assert_eq!(file.format, LogFormat::Pretty);
+        assert_eq!(file.rotation, RotationPolicy::Hourly);
+        assert_eq!(file.max_files, 24);
+    }
+
+    #[test]
+    fn rotation_policy_serde_snake_case() {
+        assert_eq!(
+            serde_yaml::from_str::<RotationPolicy>("daily").unwrap(),
+            RotationPolicy::Daily,
+        );
+        assert_eq!(
+            serde_yaml::from_str::<RotationPolicy>("hourly").unwrap(),
+            RotationPolicy::Hourly,
+        );
+        assert_eq!(
+            serde_yaml::from_str::<RotationPolicy>("never").unwrap(),
+            RotationPolicy::Never,
+        );
+    }
+
+    #[test]
+    fn file_logging_unknown_field_rejected() {
+        // deny_unknown_fields contract: typos must fail at startup.
+        let yaml = r#"
+format: json
+filter: info
+file:
+  path: /tmp/x.log
+  weekly: true
+"#;
+        let result: Result<LoggingConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "unknown field should be rejected");
+    }
 }
