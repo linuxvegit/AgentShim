@@ -18,6 +18,10 @@ Filename convention: `docs/superpowers/plans/2026-05-XX-phase-7-pNN-<short-slug>
 
 ## P03 — Config integration (Layer A validation)
 
+**Status:** ✅ Promoted to full plan: [`2026-05-14-phase-7-p03-config-integration.md`](2026-05-14-phase-7-p03-config-integration.md)
+
+(Outline below preserved for context but superseded by the full plan.)
+
 **Source spec:** §5.1, §5.2, §5.3 Layer A, §5.4, §5.5, §5.6.
 
 **Goal:** Add `plugins:` top-level and `routes[].plugins:` per-route blocks to `agent-shim-config`. Implement Layer A validation (undeclared plugin reference / `timeout_ms == 0` / duplicate plugin names). Env-var overlay verified.
