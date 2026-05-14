@@ -17,6 +17,7 @@ use crate::error::{OnError, PluginError, PluginResult};
 /// Outcome of a single invocation. Distinct from `PluginResult` because
 /// the registry needs to know "swallowed by on_error: skip" (Ok(None))
 /// vs "success" (Ok(Some(v))) vs "propagate" (Err).
+#[allow(dead_code)] // used by P04 run_* methods
 pub(crate) enum InvokeOutcome<T> {
     /// Plugin ran successfully and returned a value the caller should
     /// apply (e.g. the rewritten CanonicalRequest).
@@ -39,6 +40,7 @@ pub(crate) enum InvokeOutcome<T> {
 /// `work`: a future producing `PluginResult<T>`. The factory will
 /// typically build this via a closure capturing the plugin's hook
 /// method call.
+#[allow(dead_code)] // used by P04 run_* methods
 pub(crate) async fn invoke<T, Fut>(
     plugin_name: &str,
     _ctx: &PluginContext,
@@ -60,18 +62,20 @@ where
             // Aborted is NEVER subject to on_error — always propagate.
             InvokeOutcome::Propagate(PluginError::Aborted { plugin, reason })
         }
-        Ok(Err(PluginError::ProtectedFieldMutated { plugin, hook: h, field })) => {
+        Ok(Err(PluginError::ProtectedFieldMutated {
+            plugin,
+            hook: h,
+            field,
+        })) => {
             // Same — programming error, always propagate (subject to
             // on_error mapping by the registry).
             match on_error {
                 OnError::Skip => InvokeOutcome::Skipped,
-                OnError::Fail => {
-                    InvokeOutcome::Propagate(PluginError::ProtectedFieldMutated {
-                        plugin,
-                        hook: h,
-                        field,
-                    })
-                }
+                OnError::Fail => InvokeOutcome::Propagate(PluginError::ProtectedFieldMutated {
+                    plugin,
+                    hook: h,
+                    field,
+                }),
             }
         }
         Ok(Err(err)) => match on_error {
@@ -100,6 +104,7 @@ where
 /// Protected fields: `id`, `frontend`, `model`, `stream`. The four
 /// fields that drive routing, identity, and pipeline branching.
 /// (Spec §4.5 / Q3.)
+#[allow(dead_code)] // used by P04 run_* methods
 pub(crate) fn check_protected_fields(
     plugin_name: &str,
     hook: &'static str,
