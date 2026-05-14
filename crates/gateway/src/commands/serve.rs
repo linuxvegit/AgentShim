@@ -112,12 +112,24 @@ where
     let public_listener = tokio::net::TcpListener::bind(public_bind).await?;
     let public_local = public_listener.local_addr()?;
     tracing::info!("Listening on {} (public)", public_local);
-    on_listening(public_local);
 
-    let result = if let Some(admin_cfg) = state.core.admin_config.clone() {
+    // Bind admin (if configured) BEFORE firing on_listening, so a bind
+    // failure here aborts before any caller is told "running".
+    let admin_listener_opt = if let Some(admin_cfg) = state.core.admin_config.clone() {
         let admin_bind: SocketAddr = format!("{}:{}", admin_cfg.bind, admin_cfg.port).parse()?;
         let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
         tracing::info!("Listening on {} (admin)", admin_listener.local_addr()?);
+        Some(admin_listener)
+    } else {
+        None
+    };
+
+    // Fire only after every listener is bound — used by the Windows Service
+    // SCM entry to signal SERVICE_RUNNING; we must not signal "up" if a
+    // subsequent bind could still fail.
+    on_listening(public_local);
+
+    let result = if let Some(admin_listener) = admin_listener_opt {
         crate::server::run_with_admin_on_listeners(
             public_listener,
             admin_listener,

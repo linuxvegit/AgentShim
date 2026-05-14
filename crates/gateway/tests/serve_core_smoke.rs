@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+const LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn ephemeral_config() -> GatewayConfig {
     GatewayConfig {
         // port: 0 → OS picks a free port at bind time
@@ -51,7 +54,7 @@ async fn run_core_invokes_on_listening_and_respects_custom_shutdown() {
 
     // Poll for the listening address (on_listening should fire within a few
     // milliseconds of binding).
-    let addr = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let addr = tokio::time::timeout(LISTEN_TIMEOUT, async {
         loop {
             if let Some(addr) = *bound_addr.lock().unwrap() {
                 return addr;
@@ -70,7 +73,7 @@ async fn run_core_invokes_on_listening_and_respects_custom_shutdown() {
     let _ = shutdown_tx.send(());
 
     // Server should return Ok within shutdown grace window.
-    let result = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+    let result = tokio::time::timeout(SHUTDOWN_TIMEOUT, server_task)
         .await
         .expect("server did not shut down within 5s")
         .expect("server task panicked");
