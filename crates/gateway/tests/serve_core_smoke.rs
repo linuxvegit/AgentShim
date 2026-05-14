@@ -118,6 +118,8 @@ async fn run_core_writes_log_file_when_configured() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let _ = shutdown_tx.send(());
+    // run_core returning drops TracingHandles, which drops the WorkerGuard
+    // and flushes pending events to disk synchronously.
     let _ = server_task.await.unwrap();
 
     // File should exist under the configured directory.

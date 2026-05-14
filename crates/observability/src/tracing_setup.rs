@@ -109,9 +109,13 @@ fn build_file_layer(
     };
 
     // 1. Resolve directory and filename prefix.
+    // Path::new("foo.log").parent() returns Some("") (NOT None) — filter the
+    // empty path so bare filenames fall through to cwd as intended, rather
+    // than triggering create_dir_all("") which errors with "path not found".
     let dir = cfg
         .path
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| {
             // `path` was a bare filename (no parent). Use cwd.
@@ -137,6 +141,10 @@ fn build_file_layer(
     // 3. Optional warning for relative paths — they resolve against cwd,
     // which is C:\Windows\System32 under Windows Service. Documented in
     // the spec; we surface it loudly here.
+    // TODO(windows-service P04): when run from the Windows Service Control
+    // Manager, stderr is detached, so this warning vanishes. Route through
+    // the SCM event log (or the rolling file we're about to install) in
+    // Phase 4 so operators see it.
     if cfg.path.is_relative() {
         eprintln!(
             "WARNING: logging.file.path {:?} is relative — under Windows \
@@ -154,6 +162,10 @@ fn build_file_layer(
     let mut builder = RollingFileAppender::builder()
         .rotation(rotation)
         .filename_prefix(prefix);
+    // `max_files == 0` means unlimited retention — omit the builder call
+    // entirely so tracing-appender keeps every rolled file. Don't substitute
+    // usize::MAX; that would cap (very high but finite) and behave subtly
+    // different from "no cap".
     if cfg.max_files > 0 {
         builder = builder.max_log_files(cfg.max_files);
     }
