@@ -34,3 +34,4 @@ prometheus-parse.workspace = true
 axum = { workspace = true, features = ["macros"] }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio", "testing"] }
 serde_json.workspace = true
+tempfile = "3"
