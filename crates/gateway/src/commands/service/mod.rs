@@ -11,11 +11,8 @@ pub mod elevation;
 pub mod install;
 pub mod log_fallback;
 pub mod names;
+pub mod run;
 pub mod status;
-
-// run/start/stop/restart land in Phase 4. Stub the module so the dispatch
-// table compiles today.
-pub mod run_stub;
 
 use crate::cli::ServiceCommand;
 
@@ -39,7 +36,9 @@ pub async fn run(sub: ServiceCommand) -> anyhow::Result<()> {
         }),
         ServiceCommand::Uninstall { name } => install::uninstall(&name),
         ServiceCommand::Status { name } => status::status(&name),
-        ServiceCommand::Run { config } => run_stub::run(&config),
+        ServiceCommand::Run { config } => tokio::task::spawn_blocking(move || run::run(&config))
+            .await
+            .map_err(|e| anyhow::anyhow!("service run task panicked: {e}"))?,
         ServiceCommand::Start { name } => {
             let _ = name;
             anyhow::bail!("`agent-shim service start` lands in Phase 4")
