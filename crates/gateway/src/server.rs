@@ -35,6 +35,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Start the server, binding to the address in the config.
+#[allow(dead_code)]
 pub async fn run(state: AppState) -> Result<()> {
     let bind: SocketAddr = format!(
         "{}:{}",
@@ -53,6 +54,7 @@ pub async fn run(state: AppState) -> Result<()> {
 
 /// Run BOTH listeners (public + admin) concurrently with shared graceful
 /// shutdown. Used when `state.core.admin_config` is `Some`.
+#[allow(dead_code)]
 pub async fn run_with_admin(state: AppState) -> Result<()> {
     let public_bind: SocketAddr = format!(
         "{}:{}",
@@ -124,5 +126,45 @@ pub async fn run_on_listener(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await?;
+    Ok(())
+}
+
+/// Phase 1 P01: dual-listener variant accepting pre-bound listeners and a
+/// shared shutdown future. Mirrors `run_with_admin` but lets `run_core`
+/// invoke `on_listening` immediately after the public listener is bound.
+pub async fn run_with_admin_on_listeners(
+    public_listener: tokio::net::TcpListener,
+    admin_listener: tokio::net::TcpListener,
+    state: AppState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    let public_app = build_router(state.clone());
+    let admin_app = crate::admin::build_router(state);
+
+    let token = tokio_util::sync::CancellationToken::new();
+    {
+        let token = token.clone();
+        let signal_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+            shutdown.await;
+            token.cancel();
+        });
+        drop(signal_task);
+    }
+
+    let public_shutdown = {
+        let token = token.clone();
+        async move { token.cancelled().await }
+    };
+    let admin_shutdown = {
+        let token = token.clone();
+        async move { token.cancelled().await }
+    };
+
+    tokio::select! {
+        res = axum::serve(public_listener, public_app)
+            .with_graceful_shutdown(public_shutdown) => res?,
+        res = axum::serve(admin_listener, admin_app)
+            .with_graceful_shutdown(admin_shutdown) => res?,
+    }
     Ok(())
 }
