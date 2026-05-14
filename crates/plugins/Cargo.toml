@@ -24,4 +24,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+serde_yaml = "0.9"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
