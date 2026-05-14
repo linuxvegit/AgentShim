@@ -121,11 +121,7 @@ async fn run_core_writes_log_file_when_configured() {
     let _ = server_task.await.unwrap();
 
     // File should exist under the configured directory.
-    let prefix = log_path
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let prefix = log_path.file_name().unwrap().to_string_lossy().into_owned();
     let entries: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(Result::ok)
