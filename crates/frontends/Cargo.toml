@@ -21,7 +21,7 @@ async-trait.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["time"] }
 parking_lot.workspace = true
-tiktoken-rs.workspace = true
+agent-shim-tokens = { path = "../tokens" }
 tokio-stream.workspace = true
 
 [dev-dependencies]
