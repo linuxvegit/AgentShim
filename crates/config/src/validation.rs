@@ -52,6 +52,34 @@ pub enum ValidationError {
         min_tier: crate::schema::Tier,
         chain_tiers: Vec<(String, crate::schema::Tier)>,
     },
+
+    /// Layer A rule (Plan 07 P03): a route references a plugin name
+    /// that isn't declared under top-level `plugins:`. Phase 7 spec §5.3.
+    #[error(
+        "route `{route}` references plugin `{plugin}` on hook `{hook}`, but no \
+         plugin with that name is declared under top-level `plugins:`"
+    )]
+    UndeclaredPlugin {
+        route: String,
+        plugin: String,
+        hook: &'static str,
+    },
+
+    /// Layer A rule (Plan 07 P03): a plugin sets `timeout_ms: 0`,
+    /// which is rejected as misconfiguration (a zero timeout would
+    /// cause every invocation to time out immediately). Phase 7 spec §5.3.
+    #[error(
+        "plugin `{plugin}` has `timeout_ms: 0` on slot `{slot}` (rejected as \
+         misconfiguration)"
+    )]
+    ZeroTimeoutMs { plugin: String, slot: &'static str },
+
+    /// Layer A rule (Plan 07 P03): duplicate plugin names. YAML map
+    /// key uniqueness usually catches this at parse time, but
+    /// hand-constructed `GatewayConfig` values (test fixtures) may
+    /// still slip through. Phase 7 spec §5.3.
+    #[error("duplicate plugin name: `{0}`")]
+    DuplicatePluginName(String),
 }
 
 /// What "baseline" means for reload validation. Built from the running
