@@ -39,11 +39,17 @@ pub async fn run(sub: ServiceCommand) -> anyhow::Result<()> {
         ServiceCommand::Uninstall { name } => install::uninstall(&name),
         ServiceCommand::Status { name } => status::status(&name),
         ServiceCommand::Run { config } => run_stub::run(&config),
-        ServiceCommand::Start { name }
-        | ServiceCommand::Stop { name }
-        | ServiceCommand::Restart { name } => {
+        ServiceCommand::Start { name } => {
             let _ = name;
-            anyhow::bail!("start/stop/restart land in Phase 4")
+            anyhow::bail!("`agent-shim service start` lands in Phase 4")
+        }
+        ServiceCommand::Stop { name } => {
+            let _ = name;
+            anyhow::bail!("`agent-shim service stop` lands in Phase 4")
+        }
+        ServiceCommand::Restart { name } => {
+            let _ = name;
+            anyhow::bail!("`agent-shim service restart` lands in Phase 4")
         }
     }
 }

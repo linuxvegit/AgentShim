@@ -34,26 +34,45 @@ pub fn format_image_path_for_display(exe: &Path, config: &Path) -> String {
     )
 }
 
-/// Parse `--config <path>` back out of a SCM-formatted ImagePath. The
-/// `windows-service` crate gives us the raw command line as a single
-/// String via `service.query_config()`. We split on `--config` and take
-/// the next token, stripping surrounding quotes.
+/// Parse `--config <path>` back out of a SCM-formatted ImagePath.
+/// The ImagePath is a Win32 command-line string with double-quoted
+/// tokens around paths that contain spaces (notably `C:\Program Files`).
 ///
-/// Returns `None` if the `--config` flag is absent (e.g. the service was
-/// registered by something other than `agent-shim service install`).
+/// Returns `None` if `--config` (or `-c`) is absent from the line.
 pub fn parse_config_from_image_path(image_path: &str) -> Option<PathBuf> {
-    // The simplest parse: find "--config" and take the following token.
-    let mut tokens = image_path.split_whitespace();
-    while let Some(t) = tokens.next() {
+    let tokens = tokenize_image_path(image_path);
+    let mut iter = tokens.into_iter();
+    while let Some(t) = iter.next() {
         if t == "--config" || t == "-c" {
-            let raw = tokens.next()?;
-            // Strip a single leading/trailing double-quote if present.
-            // (Windows quotes paths with spaces in the ImagePath.)
-            let stripped = raw.trim_matches('"');
-            return Some(PathBuf::from(stripped));
+            return iter.next().map(PathBuf::from);
         }
     }
     None
+}
+
+/// Quote-aware tokenizer for Win32-style command lines. Splits on
+/// whitespace outside double-quoted spans; strips surrounding quotes
+/// from each token. Does NOT handle escaped quotes (`\"`) because
+/// SCM doesn't produce them in the agent-shim ImagePath.
+fn tokenize_image_path(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 #[cfg(test)]
@@ -98,5 +117,14 @@ mod tests {
     fn parse_config_from_image_path_returns_none_when_flag_absent() {
         let image = r#""C:\bin\agent-shim.exe" serve"#;
         assert_eq!(parse_config_from_image_path(image), None);
+    }
+
+    #[test]
+    fn parse_config_from_image_path_handles_quoted_path_with_spaces() {
+        let image = r#""C:\Program Files\agent-shim\agent-shim.exe" service run --config "C:\Program Files\agent-shim\gateway.yaml""#;
+        assert_eq!(
+            parse_config_from_image_path(image),
+            Some(PathBuf::from(r"C:\Program Files\agent-shim\gateway.yaml")),
+        );
     }
 }

@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 struct ServiceCleanup {
     name: String,
@@ -105,9 +104,6 @@ fn install_status_uninstall_cycle_smoke() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "status should fail post-uninstall");
-
-    // Give SCM a beat to settle, just in case.
-    std::thread::sleep(Duration::from_millis(200));
 }
 
 #[test]
@@ -141,10 +137,8 @@ fn install_requires_admin_when_unelevated() {
         // for some reason. Either way the message should be human-readable
         // (not a Rust panic).
         assert!(
-            stderr.contains("administrator")
-                || stderr.contains("Access is denied")
-                || stderr.contains("error"),
-            "expected friendly error, got: {stderr}",
+            stderr.contains("administrator") || stderr.contains("Access is denied"),
+            "expected admin-gate or access-denied error, got: {stderr}",
         );
     } else {
         // CI runner is elevated and SCM is happy — clean up.
