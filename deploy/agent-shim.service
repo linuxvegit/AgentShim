@@ -1,0 +1,39 @@
+# deploy/agent-shim.service
+#
+# Sample systemd unit for running agent-shim as a long-lived service on
+# Linux. See docs/deployment.md for installation instructions.
+
+[Unit]
+Description=AgentShim Gateway - Protocol-translating API gateway for AI agents
+Documentation=https://github.com/anthropics/agent-shim
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-shim
+Group=agent-shim
+ExecStart=/usr/local/bin/agent-shim serve --config /etc/agent-shim/gateway.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Hardening: minimal sane defaults that don't interfere with agent-shim's
+# work (outbound HTTPS, optional file logging under /var/log/agent-shim).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/agent-shim
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+# File descriptor limit: gateway holds at least 2 FDs per upstream
+# connection plus inbound clients. 65536 covers most workloads.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
