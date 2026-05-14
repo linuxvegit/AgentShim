@@ -44,8 +44,9 @@ pub async fn run_on_listener(
 }
 
 /// Phase 1 P01: dual-listener variant accepting pre-bound listeners and a
-/// shared shutdown future. Mirrors `run_with_admin` but lets `run_core`
-/// invoke `on_listening` immediately after the public listener is bound.
+/// shared shutdown future. `run_core` binds both listeners eagerly so it can
+/// fire `on_listening` only after every bind succeeds, then delegates here
+/// to serve until `shutdown` resolves.
 pub async fn run_with_admin_on_listeners(
     public_listener: tokio::net::TcpListener,
     admin_listener: tokio::net::TcpListener,
@@ -55,6 +56,11 @@ pub async fn run_with_admin_on_listeners(
     let public_app = build_router(state.clone());
     let admin_app = crate::admin::build_router(state);
 
+    // Plan 01 P01 T4 followup: CancellationToken caches cancellation,
+    // so a SIGTERM arriving during boot (before either listener's
+    // graceful_shutdown future has registered with the notify) still
+    // shuts down both listeners. The previous Notify::notify_waiters
+    // shape had a race window where this could hang.
     let token = tokio_util::sync::CancellationToken::new();
     {
         let token = token.clone();
@@ -62,6 +68,11 @@ pub async fn run_with_admin_on_listeners(
             shutdown.await;
             token.cancel();
         });
+        // The signal task is detached deliberately — it terminates when
+        // `shutdown` resolves, which must happen for the process to exit.
+        // We `drop` the JoinHandle (rather than `let _ =`) because clippy's
+        // let_underscore_future would otherwise flag it as accidentally
+        // discarding a future.
         drop(signal_task);
     }
 
