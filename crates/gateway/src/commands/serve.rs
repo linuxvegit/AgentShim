@@ -1,6 +1,37 @@
 use anyhow::Result;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use agent_shim_config::GatewayConfig;
+
+/// Phase 1 P01: shared core of the foreground `serve` command and the
+/// (future) Windows Service SCM entry point. Builds the application state,
+/// spawns the reload-applying task and (on Unix) the SIGHUP listener,
+/// binds the listener(s), invokes `on_listening` with the bound public
+/// address once it is accepting connections, then serves until
+/// `shutdown_signal` resolves.
+///
+/// Callers that load a config from disk should pass `config_path =
+/// Some(path)` so `AppCore::config_path` is populated and SIGHUP /
+/// `POST /admin/reload` (with no body) can re-read the original file.
+/// Callers constructing a config in memory (tests, future programmatic
+/// embedding) pass `None`.
+pub async fn run_core<S, L>(
+    cfg: GatewayConfig,
+    config_path: Option<PathBuf>,
+    shutdown_signal: S,
+    on_listening: L,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+    L: FnOnce(SocketAddr) + Send + 'static,
+{
+    let _ = (cfg, config_path, shutdown_signal, on_listening);
+    unimplemented!("run_core body lands in next task")
+}
 
 pub async fn run(config_path: &Path) -> Result<()> {
     let cfg = agent_shim_config::load_from_path(config_path)
