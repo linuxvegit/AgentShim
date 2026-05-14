@@ -96,7 +96,7 @@ agent-shim service stop           # → graceful shutdown via axum + OTel drain
 agent-shim service restart        # → stop, then start
 ```
 
-`stop` triggers the same graceful-shutdown path used by Ctrl+C in foreground mode: the axum server stops accepting new connections, in-flight streams drain, OTel batches flush. The CLI polls SCM and returns once the service reaches `Stopped` (default 30-second timeout).
+`stop` triggers the same graceful-shutdown path used by Ctrl+C in foreground mode: the axum server stops accepting new connections, in-flight streams drain, OTel batches flush. The CLI polls SCM and returns as soon as the service reaches `Stopped`. Most clean stops complete in well under a second; the CLI's hard timeout for the round-trip is 30 seconds.
 
 ### Uninstall
 
@@ -110,17 +110,17 @@ agent-shim service uninstall
 
 The Windows Service subcommands implement **port-bind-then-Running** semantics: SCM does not transition to `Running` until the public TCP listener is bound and accepting connections. If `bind` fails (e.g. port already in use), the service jumps straight to `Stopped` with a non-zero exit code, so `sc query` accurately reflects "the service is not serving traffic."
 
-If you have the admin port enabled (`admin:` block in the config), it is bound after the public port; the SCM `Running` transition fires once the public port is up, so a slow admin port bind does not delay the status report.
+If the admin port is enabled (`admin:` block in the config), it is bound after the public port. The SCM `Running` transition fires only once **every** configured listener is up, so an admin-port bind failure aborts the start even if the public port is healthy. If you want the public port to come up independently of admin health, omit the `admin:` block (the default).
 
 ### Logs
 
 By default, the service writes JSON-formatted logs to:
 
 ```
-C:\ProgramData\agent-shim\logs\agent-shim.log
+C:\ProgramData\agent-shim\logs\agent-shim.log.YYYY-MM-DD
 ```
 
-with daily rotation and a 7-day retention. The directory is created automatically at first start. Override by setting `logging.file` in the config — see [Configuration → Logging](configuration.md#logging) and [Observability → File logging](observability.md#file-logging) for the full schema.
+with daily rotation and a 7-day retention. The date suffix is the file's actual name on disk — `agent-shim.log` is the prefix, not a live file pointer. See [Observability → File logging](observability.md#file-logging) for the rotation rules. The directory is created automatically at first start. Override by setting `logging.file` in the config — see [Configuration → Logging](configuration.md#logging) and [Observability → File logging](observability.md#file-logging) for the full schema.
 
 Service-launched processes have no console, so `stdout` is detached. Files are the only way to read logs unless you also configure OTel export.
 
