@@ -43,11 +43,7 @@ fn file_logging_writes_json_events_to_configured_path() {
 
     // tracing-appender filenames are `<prefix>.YYYY-MM-DD` (daily) — find
     // any file in the tempdir starting with our prefix.
-    let prefix = log_path
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let prefix = log_path.file_name().unwrap().to_string_lossy().into_owned();
     let entries: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(Result::ok)
