@@ -142,7 +142,8 @@ fn full_spec_5_2_example_deserialises() {
 
 #[test]
 fn full_spec_5_2_example_validates() {
-    let cfg: GatewayConfig = serde_yaml::from_str(FULL_SPEC_5_2_EXAMPLE).unwrap();
+    let cfg: GatewayConfig =
+        serde_yaml::from_str(FULL_SPEC_5_2_EXAMPLE).expect("spec §5.2 example must parse");
     validate(&cfg).expect("spec §5.2 example must pass validation");
 }
 
@@ -206,7 +207,10 @@ routes:
         msg.contains("timeout_ms"),
         "error must mention timeout_ms: {msg}"
     );
-    assert!(msg.contains("bad"), "error must name the plugin: {msg}");
+    assert!(
+        msg.contains("`bad`"),
+        "error must name the plugin (with backticks per `ZeroTimeoutMs` format): {msg}"
+    );
 }
 
 #[test]
