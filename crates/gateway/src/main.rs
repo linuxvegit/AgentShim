@@ -29,6 +29,6 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         #[cfg(windows)]
-        Commands::Service { .. } => anyhow::bail!("service dispatch lands in next commit"),
+        Commands::Service { sub } => commands::service::run(sub).await,
     }
 }
