@@ -20,7 +20,7 @@ use crate::commands::service::log_fallback::apply_service_log_fallback;
 use crate::commands::service::names::DEFAULT_SERVICE_NAME;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use windows_service::define_windows_service;
 use windows_service::service::{
@@ -29,13 +29,20 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
 
+// Macro from windows-service: generates an `extern "system"` shim
+// (`ffi_service_main`) that SCM's StartServiceCtrlDispatcherW expects.
+// The shim unpacks the C-style argument vector and calls our Rust
+// `service_main(Vec<OsString>)` below.
 define_windows_service!(ffi_service_main, service_main);
 
 // The dispatcher does not pass user CLI arguments through to service_main
 // (SCM calls the binary with a fixed ImagePath that was registered at
 // install time). We stash the parsed --config path in a process-wide
-// static so service_main can reach it.
-static CONFIG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+// OnceLock so service_main can reach it.
+//
+// OnceLock (over Mutex<Option<_>>) gives us "set once, read forever"
+// semantics without locking and without poisoning risk.
+static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Entry point invoked from `commands::service::run` dispatch in `mod.rs`.
 /// Stores the config path and hands control to SCM.
@@ -46,7 +53,12 @@ pub fn run(config: &std::path::Path) -> anyhow::Result<()> {
             config
         );
     }
-    *CONFIG_PATH.lock().unwrap() = Some(config.to_path_buf());
+    if CONFIG_PATH.set(config.to_path_buf()).is_err() {
+        // set() only fails if already set — the only way that happens is
+        // if run() is invoked twice in the same process, which SCM never
+        // does. Bail with a clear message instead of overwriting.
+        anyhow::bail!("internal: service::run::run called twice (CONFIG_PATH already set)");
+    }
 
     // Hand control to SCM. This call blocks until the service exits.
     // It returns an error if invoked outside a service context (e.g.
@@ -64,8 +76,13 @@ pub fn run(config: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn service_main(_arguments: Vec<OsString>) {
-    // Pull the config path back out of the static.
-    let config = match CONFIG_PATH.lock().unwrap().clone() {
+    // Note: SCM-launched services have no console attached, so eprintln!
+    // here lands on a dangling stderr handle. These are last-resort
+    // markers visible only when running under a debugger (cdb, Visual
+    // Studio) attached to the service process. The authoritative
+    // failure signal for operators is the Stopped(Win32(1)) status we
+    // report from run_service.
+    let config = match CONFIG_PATH.get().cloned() {
         Some(p) => p,
         None => {
             eprintln!("FATAL: service_main invoked without config path set");
@@ -104,7 +121,13 @@ fn run_service(config_path: PathBuf) -> anyhow::Result<()> {
 
     // Report StartPending. SCM gives us 30s before timeout; setting
     // wait_hint to 30s tells SCM "keep waiting".
-    status_handle.set_service_status(ServiceStatus {
+    //
+    // Best-effort: if the SCM round-trip fails here, we can't recover —
+    // we have no console to report to, and bailing out would leave SCM
+    // thinking the service is still StartPending. Push on and let the
+    // final Stopped(exit_code) report (below) be the authoritative
+    // outcome.
+    let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::StartPending,
         controls_accepted: ServiceControlAccept::empty(),
@@ -112,7 +135,7 @@ fn run_service(config_path: PathBuf) -> anyhow::Result<()> {
         checkpoint: 0,
         wait_hint: Duration::from_secs(30),
         process_id: None,
-    })?;
+    });
 
     // Load config first so we can fail fast (before tokio init) if
     // validation rejects.

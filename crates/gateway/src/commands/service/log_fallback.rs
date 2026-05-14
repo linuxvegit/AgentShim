@@ -12,7 +12,6 @@ use std::path::PathBuf;
 /// Resolve `%PROGRAMDATA%\agent-shim\logs\agent-shim.log`, falling back
 /// to `C:\ProgramData\` if the env var is somehow unset (it's defined
 /// on every supported Windows version, but we don't panic on the off chance).
-#[allow(dead_code)] // Wired into `service::run` in Phase 4 T3.
 pub fn default_service_log_path() -> PathBuf {
     let base = std::env::var_os("PROGRAMDATA")
         .map(PathBuf::from)
@@ -25,7 +24,6 @@ pub fn default_service_log_path() -> PathBuf {
 ///
 /// Must be called BEFORE `commands::serve::run_core`, since tracing
 /// initialization inside `run_core` reads `cfg.logging.file`.
-#[allow(dead_code)] // Wired into `service::run` in Phase 4 T3.
 pub fn apply_service_log_fallback(cfg: &mut GatewayConfig) {
     if cfg.logging.file.is_some() {
         return;

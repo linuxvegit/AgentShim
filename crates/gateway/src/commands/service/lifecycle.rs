@@ -53,8 +53,12 @@ pub fn stop(name: &str) -> Result<()> {
 
 pub fn restart(name: &str) -> Result<()> {
     require_admin()?;
-    // stop first (ignore "already stopped" case)
-    stop(name).ok();
+    if let Err(e) = stop(name) {
+        // A failed stop usually means "already stopped" — proceed with
+        // start. Surface the error so operators see WHY stop failed if
+        // start subsequently also fails.
+        eprintln!("(stop step skipped: {e})");
+    }
     start(name)
 }
 

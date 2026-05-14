@@ -37,9 +37,16 @@ pub async fn run(sub: ServiceCommand) -> anyhow::Result<()> {
         }),
         ServiceCommand::Uninstall { name } => install::uninstall(&name),
         ServiceCommand::Status { name } => status::status(&name),
-        ServiceCommand::Run { config } => tokio::task::spawn_blocking(move || run::run(&config))
-            .await
-            .map_err(|e| anyhow::anyhow!("service run task panicked: {e}"))?,
+        ServiceCommand::Run { config } => {
+            // service_dispatcher::start blocks the calling thread for the
+            // full lifetime of the service (it doesn't return until SCM
+            // reports the service stopped). Isolate it on tokio's blocking
+            // pool so the runtime stays responsive for the SCM stop signal
+            // path (which itself dispatches into a tokio-managed task).
+            tokio::task::spawn_blocking(move || run::run(&config))
+                .await
+                .map_err(|e| anyhow::anyhow!("service run task panicked: {e}"))?
+        }
         ServiceCommand::Start { name } => lifecycle::start(&name),
         ServiceCommand::Stop { name } => lifecycle::stop(&name),
         ServiceCommand::Restart { name } => lifecycle::restart(&name),
