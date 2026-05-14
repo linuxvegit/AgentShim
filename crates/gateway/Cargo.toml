@@ -56,6 +56,10 @@ tracing-opentelemetry.workspace = true
 prometheus-parse.workspace = true
 serde_yaml = "0.9"
 
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }
+windows = { workspace = true }
+
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
