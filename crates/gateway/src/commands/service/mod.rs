@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod log_fallback;
 pub mod names;
 pub mod run;
+pub mod startup_error;
 pub mod status;
 
 use crate::cli::ServiceCommand;
