@@ -593,6 +593,24 @@ async fn dispatch_inner(
     // correct because every chain element shares the same `RoutePolicy`.
     canonical.resolved_policy = first_target.policy.resolve(&canonical);
 
+    // ── Plan 07 P04 spec §6.6 anchor 2: H3 (on_resolved) ──────────────
+    // After route resolve + policy snapshot, before capability gate.
+    // Plugins see the resolved `BackendTarget` (= chain head) so they
+    // can adapt to per-upstream context (e.g., target-specific prompt
+    // shaping). Failure semantics identical to H2 (PluginFailed → 502;
+    // Aborted → 400).
+    canonical = state
+        .core
+        .plugins
+        .run_on_resolved(
+            (frontend_kind_for_hooks, model_alias.as_str()),
+            &plugin_ctx,
+            canonical,
+            &first_target,
+        )
+        .await
+        .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
+
     // Capability gate. Reject before any network call when the request asks
     // for a feature the target provider can't deliver — today this is just
     // vision (image blocks against a text-only backend). The check has to
