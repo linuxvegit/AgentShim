@@ -146,6 +146,31 @@ routes:
 The route table is consulted by `agent_shim_router::StaticRouter`. Wildcards
 (`model: "*"`) are matched only when no exact route exists.
 
+## Logging
+
+### `logging`
+
+| Field    | Type           | Default                        | Description                                            |
+|----------|----------------|--------------------------------|--------------------------------------------------------|
+| `format` | enum           | `pretty`                       | `pretty` or `json`. Stdout format.                     |
+| `filter` | string         | `info`                         | `EnvFilter` directive (e.g. `info,agent_shim=debug`).  |
+| `file`   | object or null | `null`                         | Optional rolling file output. See [File logging](observability.md#file-logging) for the full schema and behavior. |
+
+#### `logging.file` (optional)
+
+| Field         | Type    | Default | Description                                                                  |
+|---------------|---------|---------|------------------------------------------------------------------------------|
+| `path`        | path    | —       | Required. Absolute path strongly recommended.                                |
+| `format`      | enum    | `json`  | `json` or `pretty`. Independent of `logging.format`.                         |
+| `rotation`    | enum    | `daily` | `daily`, `hourly`, or `never`.                                               |
+| `max_files`   | integer | `7`     | Retention count; `0` disables retention.                                     |
+
+When `logging.file` is set, the gateway writes structured events to the
+file in addition to stdout. Writes are async (non-blocking) and flushed
+on graceful shutdown — see
+[`docs/observability.md#file-logging`](observability.md#file-logging)
+for full semantics and the Windows Service Control Manager fallback.
+
 ## Environment overlay
 
 Every config field can be overridden via environment variables with the

@@ -181,6 +181,8 @@ export DEEPSEEK_API_KEY=sk-...
 agent-shim serve --config gateway.yaml
 ```
 
+Running as a long-lived service? See [docs/deployment.md](docs/deployment.md) for Windows Service and Linux systemd setup.
+
 Now point your agent at `http://127.0.0.1:8787`:
 - Claude Code / Anthropic clients → `http://127.0.0.1:8787/v1/messages`
 - Cursor / Codex / OpenAI Chat clients → `http://127.0.0.1:8787/v1/chat/completions`

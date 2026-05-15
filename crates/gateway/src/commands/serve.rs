@@ -1,12 +1,39 @@
 use anyhow::Result;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-pub async fn run(config_path: &Path) -> Result<()> {
-    let cfg = agent_shim_config::load_from_path(config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
-    agent_shim_config::validate(&cfg)
-        .map_err(|e| anyhow::anyhow!("Config validation failed: {}", e))?;
+use agent_shim_config::GatewayConfig;
+
+/// Phase 1 P01: shared core of the foreground `serve` command and the
+/// (future) Windows Service SCM entry point. Builds the application state,
+/// spawns the reload-applying task and (on Unix) the SIGHUP listener,
+/// binds the listener(s), invokes `on_listening` with the bound public
+/// address once it is accepting connections, then serves until
+/// `shutdown_signal` resolves.
+///
+/// Callers that load a config from disk should pass `config_path =
+/// Some(path)` so `AppCore::config_path` is populated and SIGHUP /
+/// `POST /admin/reload` (with no body) can re-read the original file.
+/// Callers constructing a config in memory (tests, future programmatic
+/// embedding) pass `None`.
+pub async fn run_core<S, L>(
+    cfg: GatewayConfig,
+    config_path: Option<PathBuf>,
+    shutdown_signal: S,
+    on_listening: L,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+    L: FnOnce(SocketAddr) + Send + 'static,
+{
+    // Phase 1 P01: validation is the caller's responsibility — `run`
+    // validates the on-disk config before invoking us. In-memory callers
+    // (tests, the future Windows Service SCM entry) pass pre-validated
+    // configs or skip validation entirely (e.g. tests that bind port 0
+    // via TcpListener and rely on the OS to pick a free port).
     let tracing_handles = agent_shim_observability::init(&cfg.logging, cfg.otel.as_ref());
     let (mut state, mut reload_rx) = crate::state::AppState::new(cfg).await;
 
@@ -17,7 +44,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     // a fresh `AppCore` here with the path filled in. Cheap — every
     // field is `Arc`-shaped.
     let core_with_path = Arc::new(crate::state::AppCore {
-        config_path: Some(config_path.to_path_buf()),
+        config_path: config_path.clone(),
         ..(*state.core).clone()
     });
     state.core = core_with_path;
@@ -71,15 +98,67 @@ pub async fn run(config_path: &Path) -> Result<()> {
         });
     }
 
-    let result = if state.core.admin_config.is_some() {
-        crate::server::run_with_admin(state).await
+    // Phase 1 P01: bind listener(s) eagerly so `on_listening` can fire
+    // with the real bound address before we hand control to
+    // `axum::serve`. Previously this binding happened inside
+    // `server::run` / `server::run_with_admin`; extracting it here lets
+    // the (future) Windows Service SCM entry point observe the bound
+    // address and report SERVICE_RUNNING to the SCM at the right moment.
+    let public_bind: SocketAddr = format!(
+        "{}:{}",
+        state.core.server_config.bind, state.core.server_config.port
+    )
+    .parse()?;
+    let public_listener = tokio::net::TcpListener::bind(public_bind).await?;
+    let public_local = public_listener.local_addr()?;
+    tracing::info!("Listening on {} (public)", public_local);
+
+    // Bind admin (if configured) BEFORE firing on_listening, so a bind
+    // failure here aborts before any caller is told "running".
+    let admin_listener_opt = if let Some(admin_cfg) = state.core.admin_config.clone() {
+        let admin_bind: SocketAddr = format!("{}:{}", admin_cfg.bind, admin_cfg.port).parse()?;
+        let admin_listener = tokio::net::TcpListener::bind(admin_bind).await?;
+        tracing::info!("Listening on {} (admin)", admin_listener.local_addr()?);
+        Some(admin_listener)
     } else {
-        crate::server::run(state).await
+        None
     };
+
+    // Fire only after every listener is bound — used by the Windows Service
+    // SCM entry to signal SERVICE_RUNNING; we must not signal "up" if a
+    // subsequent bind could still fail.
+    on_listening(public_local);
+
+    let result = if let Some(admin_listener) = admin_listener_opt {
+        crate::server::run_with_admin_on_listeners(
+            public_listener,
+            admin_listener,
+            state,
+            shutdown_signal,
+        )
+        .await
+    } else {
+        crate::server::run_on_listener(public_listener, state, shutdown_signal).await
+    };
+
     if let Some(otel) = tracing_handles.otel {
         otel.shutdown();
     }
     result
+}
+
+pub async fn run(config_path: &Path) -> Result<()> {
+    let cfg = agent_shim_config::load_from_path(config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+    agent_shim_config::validate(&cfg)
+        .map_err(|e| anyhow::anyhow!("Config validation failed: {}", e))?;
+    run_core(
+        cfg,
+        Some(config_path.to_path_buf()),
+        crate::shutdown::shutdown_signal(),
+        |_addr| {}, // foreground: no-op on listening
+    )
+    .await
 }
 
 /// Plan 04 P04 T4: reload-applying handler. One copy runs in the task

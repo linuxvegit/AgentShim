@@ -1,13 +1,23 @@
-use agent_shim_config::schema::{LogFormat, LoggingConfig, OtelConfig};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use agent_shim_config::schema::{
+    FileLoggingConfig, LogFormat, LoggingConfig, OtelConfig, RotationPolicy,
+};
+use tracing_appender::{
+    non_blocking::WorkerGuard,
+    rolling::{RollingFileAppender, Rotation},
+};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter, Layer, Registry};
 
 use crate::otel::{build_layer, OtelHandle};
 
 /// Tracing handles whose lifetimes must extend to process shutdown.
-/// Hold this in `main.rs` (or `commands::serve::run`) and drop /
-/// `shutdown()` it before exit so the OTLP batch exporter drains.
+/// Hold this in `main.rs` (or `commands::serve::run_core`) and drop /
+/// `shutdown()` it before exit so the OTLP batch exporter drains and
+/// the non-blocking file writer flushes buffered events.
+///
+/// Plan windows-service P02 T5 — added `file_guard` field.
 pub struct TracingHandles {
     pub otel: Option<OtelHandle>,
+    pub file_guard: Option<WorkerGuard>,
 }
 
 /// Initialize the global subscriber. Called once at startup.
@@ -16,6 +26,9 @@ pub struct TracingHandles {
 /// only, no spans exported. `Some(cfg)` adds the OTel layer; if
 /// `cfg.endpoint` is also `None`, the OTel layer is built but is a
 /// no-op (spans flow only to the fmt layer).
+///
+/// When `log.file = Some(...)`, a rolling-file layer is also installed
+/// — see [`build_file_layer`]. Plan windows-service P02 T5.
 pub fn init(log: &LoggingConfig, otel_cfg: Option<&OtelConfig>) -> TracingHandles {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::try_new(&log.filter).unwrap_or_else(|_| EnvFilter::new("info"))
@@ -23,8 +36,8 @@ pub fn init(log: &LoggingConfig, otel_cfg: Option<&OtelConfig>) -> TracingHandle
 
     // Build the optional OTel layer. Errors here are fatal — operators
     // who configure an endpoint expect spans to flow.
-    let (otel_layer, handle) = if let Some(cfg) = otel_cfg {
-        match build_layer::<tracing_subscriber::Registry>(cfg) {
+    let (otel_layer, otel_handle) = if let Some(cfg) = otel_cfg {
+        match build_layer::<Registry>(cfg) {
             Ok(Some((layer, handle))) => (Some(layer), Some(handle)),
             Ok(None) => (None, None),
             Err(e) => {
@@ -36,7 +49,25 @@ pub fn init(log: &LoggingConfig, otel_cfg: Option<&OtelConfig>) -> TracingHandle
         (None, None)
     };
 
-    let registry = tracing_subscriber::registry().with(otel_layer).with(filter);
+    // Optional file layer (Plan windows-service P02 T5).
+    let (file_layer, file_guard) = build_file_layer(log.file.as_ref());
+
+    // Both the OTel layer (`OpenTelemetryLayer<Registry, _>`) and the boxed
+    // file layer only implement `Layer<Registry>`, not `Layer<Layered<...>>`.
+    // We can't chain them via `.with(a).with(b)` because after the first
+    // `.with(...)` the subscriber type is no longer `Registry`. The fix is
+    // to collect both into a single `Vec<Box<dyn Layer<Registry>>>`, which
+    // itself implements `Layer<Registry>` and applies all inner layers at
+    // once. Plan windows-service P02 T5.
+    let mut composite: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
+    if let Some(otel) = otel_layer {
+        composite.push(Box::new(otel));
+    }
+    if let Some(file) = file_layer {
+        composite.push(file);
+    }
+
+    let registry = tracing_subscriber::registry().with(composite).with(filter);
 
     match log.format {
         LogFormat::Json => {
@@ -47,7 +78,121 @@ pub fn init(log: &LoggingConfig, otel_cfg: Option<&OtelConfig>) -> TracingHandle
         }
     }
 
-    TracingHandles { otel: handle }
+    TracingHandles {
+        otel: otel_handle,
+        file_guard,
+    }
+}
+
+/// Build the optional file-logging layer.
+///
+/// Behavior:
+/// - `cfg = None` → returns `(None, None)`; subscriber has no file layer.
+/// - `cfg = Some(...)` → ensures the parent directory exists (fatal on failure,
+///   matching OTel init's behavior), constructs a `RollingFileAppender` with
+///   the configured rotation and `max_log_files` retention, and wraps it in
+///   `tracing_appender::non_blocking` for async writes.
+///
+/// The returned `WorkerGuard` must outlive every emitted event; the caller
+/// stores it on `TracingHandles.file_guard` so it lives until process
+/// shutdown drops the handles.
+///
+/// Plan windows-service P02 T5.
+fn build_file_layer(
+    cfg: Option<&FileLoggingConfig>,
+) -> (
+    Option<Box<dyn Layer<Registry> + Send + Sync>>,
+    Option<WorkerGuard>,
+) {
+    let Some(cfg) = cfg else {
+        return (None, None);
+    };
+
+    // 1. Resolve directory and filename prefix.
+    // Path::new("foo.log").parent() returns Some("") (NOT None) — filter the
+    // empty path so bare filenames fall through to cwd as intended, rather
+    // than triggering create_dir_all("") which errors with "path not found".
+    let dir = cfg
+        .path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| {
+            // `path` was a bare filename (no parent). Use cwd.
+            std::path::PathBuf::from(".")
+        });
+    let prefix = match cfg.path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => {
+            eprintln!(
+                "FATAL: logging.file.path has no filename component: {:?}",
+                cfg.path
+            );
+            std::process::exit(2);
+        }
+    };
+
+    // 2. Create directory if needed. Fatal on failure (matches OTel behavior).
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("FATAL: cannot create log directory {:?}: {}", dir, e);
+        std::process::exit(2);
+    }
+
+    // 3. Optional warning for relative paths — they resolve against cwd,
+    // which is C:\Windows\System32 under Windows Service. Documented in
+    // the spec; we surface it loudly here.
+    // Note: under Windows Service mode (SCM-launched), stderr is detached,
+    // so this warning vanishes. It still fires correctly for foreground
+    // `agent-shim serve` invocations on all platforms. A more robust path
+    // (Windows Event Log) is out of scope for v0.6.x; tracking as a known
+    // limitation: an operator who installs with a relative `logging.file.path`
+    // under Windows Service won't see a warning, but the resulting path
+    // resolves to a subdirectory of C:\Windows\System32 — usually a
+    // permission-denied which fails fast and is visible via the
+    // Stopped(Win32(2)) status reported by run_service.
+    if cfg.path.is_relative() {
+        eprintln!(
+            "WARNING: logging.file.path {:?} is relative — under Windows \
+             Service the cwd is C:\\Windows\\System32. Use an absolute path.",
+            cfg.path
+        );
+    }
+
+    // 4. Build the rolling appender.
+    let rotation = match cfg.rotation {
+        RotationPolicy::Daily => Rotation::DAILY,
+        RotationPolicy::Hourly => Rotation::HOURLY,
+        RotationPolicy::Never => Rotation::NEVER,
+    };
+    let mut builder = RollingFileAppender::builder()
+        .rotation(rotation)
+        .filename_prefix(prefix);
+    // `max_files == 0` means unlimited retention — omit the builder call
+    // entirely so tracing-appender keeps every rolled file. Don't substitute
+    // usize::MAX; that would cap (very high but finite) and behave subtly
+    // different from "no cap".
+    if cfg.max_files > 0 {
+        builder = builder.max_log_files(cfg.max_files);
+    }
+    let appender = match builder.build(&dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "FATAL: cannot initialize rolling file appender at {:?}: {}",
+                dir, e
+            );
+            std::process::exit(2);
+        }
+    };
+
+    // 5. Wrap in non_blocking and build the layer.
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+    let layer: Box<dyn Layer<Registry> + Send + Sync> = match cfg.format {
+        LogFormat::Json => Box::new(fmt::layer().json().with_writer(non_blocking)),
+        LogFormat::Pretty => Box::new(fmt::layer().with_writer(non_blocking)),
+    };
+
+    (Some(layer), Some(guard))
 }
 
 #[cfg(test)]
@@ -59,6 +204,7 @@ mod tests {
         let cfg = LoggingConfig {
             format: LogFormat::Pretty,
             filter: "info".to_string(),
+            file: None,
         };
         let _ = init(&cfg, None);
     }
@@ -68,6 +214,7 @@ mod tests {
         let cfg = LoggingConfig {
             format: LogFormat::Json,
             filter: "debug".to_string(),
+            file: None,
         };
         let _ = init(&cfg, None);
     }
@@ -77,9 +224,11 @@ mod tests {
         let cfg = LoggingConfig {
             format: LogFormat::Pretty,
             filter: "info".to_string(),
+            file: None,
         };
         let otel = OtelConfig::default(); // endpoint = None
         let handles = init(&cfg, Some(&otel));
         assert!(handles.otel.is_none(), "no endpoint → no OtelHandle");
+        assert!(handles.file_guard.is_none(), "no file cfg → no guard");
     }
 }

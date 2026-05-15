@@ -1,6 +1,7 @@
 use crate::secrets::Secret;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Top-level gateway configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +174,11 @@ pub struct LoggingConfig {
     pub format: LogFormat,
     #[serde(default = "default_filter")]
     pub filter: String,
+    /// Optional file logging configuration. When set, log events are
+    /// written to a rolling file in addition to stdout. See
+    /// `FileLoggingConfig` for fields. Plan windows-service P02 T3.
+    #[serde(default)]
+    pub file: Option<FileLoggingConfig>,
 }
 
 fn default_filter() -> String {
@@ -184,8 +190,55 @@ impl Default for LoggingConfig {
         Self {
             format: LogFormat::default(),
             filter: default_filter(),
+            file: None,
         }
     }
+}
+
+/// File-logging configuration. When present on `LoggingConfig::file`,
+/// a `tracing-appender` rolling file writer is installed in addition
+/// to the stdout layer. Async writes via `tracing_appender::non_blocking`;
+/// the `WorkerGuard` lives on `TracingHandles` and is dropped at process
+/// exit to flush. SIGKILL bypasses the flush — documented in
+/// `docs/observability.md`. Plan windows-service P02 T3.
+///
+/// All fields except `path` have defaults; `path` is required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileLoggingConfig {
+    /// Absolute log file path. The parent directory is created at
+    /// startup if it does not exist; permission failure is fatal.
+    pub path: PathBuf,
+    /// File log format. Independent of `LoggingConfig::format`
+    /// (which controls stdout). Defaults to `json` because files
+    /// are usually consumed by tooling, not humans.
+    #[serde(default = "default_file_format")]
+    pub format: LogFormat,
+    /// Rotation cadence: `daily`, `hourly`, or `never`.
+    #[serde(default)]
+    pub rotation: RotationPolicy,
+    /// Maximum number of log files retained (current file + history).
+    /// `0` means unlimited; otherwise the oldest rolled file is deleted
+    /// after rotation. Default: 7 — one week of daily logs.
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationPolicy {
+    #[default]
+    Daily,
+    Hourly,
+    Never,
+}
+
+fn default_file_format() -> LogFormat {
+    LogFormat::Json
+}
+
+fn default_max_files() -> usize {
+    7
 }
 
 /// Service tier label on an upstream. Used by Phase 6 cost-aware
@@ -1006,5 +1059,76 @@ otel: {}
         assert!(otel.endpoint.is_none(), "default endpoint should be None");
         assert_eq!(otel.service_name, "agent-shim");
         assert_eq!(otel.sample_ratio, 1.0);
+    }
+
+    // Plan windows-service P02 T2: failing TDD-red tests for
+    // FileLoggingConfig and RotationPolicy.
+    #[test]
+    fn file_logging_config_roundtrips_defaults() {
+        // Default for FileLoggingConfig is "no file logging" — the parent
+        // LoggingConfig.file field is Option<FileLoggingConfig>, default None.
+        let yaml = r#"
+format: json
+filter: info
+file:
+  path: /var/log/agent-shim/agent-shim.log
+"#;
+        let cfg: LoggingConfig = serde_yaml::from_str(yaml).unwrap();
+        let file = cfg.file.expect("file: section should parse");
+        assert_eq!(
+            file.path,
+            std::path::PathBuf::from("/var/log/agent-shim/agent-shim.log")
+        );
+        assert_eq!(file.format, LogFormat::Json);
+        assert_eq!(file.rotation, RotationPolicy::Daily);
+        assert_eq!(file.max_files, 7);
+    }
+
+    #[test]
+    fn file_logging_config_explicit_all_fields() {
+        let yaml = r#"
+format: pretty
+filter: debug
+file:
+  path: /tmp/agent.log
+  format: pretty
+  rotation: hourly
+  max_files: 24
+"#;
+        let cfg: LoggingConfig = serde_yaml::from_str(yaml).unwrap();
+        let file = cfg.file.unwrap();
+        assert_eq!(file.format, LogFormat::Pretty);
+        assert_eq!(file.rotation, RotationPolicy::Hourly);
+        assert_eq!(file.max_files, 24);
+    }
+
+    #[test]
+    fn rotation_policy_serde_snake_case() {
+        assert_eq!(
+            serde_yaml::from_str::<RotationPolicy>("daily").unwrap(),
+            RotationPolicy::Daily,
+        );
+        assert_eq!(
+            serde_yaml::from_str::<RotationPolicy>("hourly").unwrap(),
+            RotationPolicy::Hourly,
+        );
+        assert_eq!(
+            serde_yaml::from_str::<RotationPolicy>("never").unwrap(),
+            RotationPolicy::Never,
+        );
+    }
+
+    #[test]
+    fn file_logging_unknown_field_rejected() {
+        // deny_unknown_fields contract: typos must fail at startup.
+        let yaml = r#"
+format: json
+filter: info
+file:
+  path: /tmp/x.log
+  weekly: true
+"#;
+        let result: Result<LoggingConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "unknown field should be rejected");
     }
 }
