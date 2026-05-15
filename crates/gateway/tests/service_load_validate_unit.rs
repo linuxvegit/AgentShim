@@ -34,9 +34,8 @@ fn yaml_tempfile(yaml: &str) -> (tempfile::NamedTempFile, std::path::PathBuf) {
 
 #[test]
 fn returns_err_when_config_file_missing() {
-    let path = std::path::PathBuf::from(
-        r"C:\__agent_shim_test_definitely_does_not_exist__\nope.yaml",
-    );
+    let path =
+        std::path::PathBuf::from(r"C:\__agent_shim_test_definitely_does_not_exist__\nope.yaml");
     let result = load_validate_inject_fallback(&path);
     assert!(
         result.is_err(),

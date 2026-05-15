@@ -45,6 +45,14 @@ where
 
 /// Production-friendly path resolver: reads `PROGRAMDATA` from the
 /// process environment.
+///
+/// Currently unused at runtime (everything goes through `record` →
+/// `record_with_env`), kept for diagnostics tooling and to anchor the
+/// production env-var lookup at one call site. `#[allow(dead_code)]`
+/// is preferred over removing it because the test surface is the
+/// `_with_env` variant — when an operator or test author asks "where
+/// does the file actually live?" the answer is this function.
+#[allow(dead_code)]
 pub fn startup_error_log_path() -> PathBuf {
     startup_error_log_path_with_env(|k| std::env::var_os(k))
 }
