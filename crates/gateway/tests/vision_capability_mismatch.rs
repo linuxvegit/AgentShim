@@ -139,6 +139,7 @@ fn make_app_state() -> AppState {
                 "text-only-model",
             ),
         ],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

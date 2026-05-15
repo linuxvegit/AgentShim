@@ -1,0 +1,28 @@
+[package]
+name = "agent-shim-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "agent_shim_plugins"
+path = "src/lib.rs"
+
+[dependencies]
+agent-shim-core = { path = "../core" }
+agent-shim-tokens = { path = "../tokens" }
+async-trait.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+serde_yaml = "0.9"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }

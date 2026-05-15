@@ -15,6 +15,11 @@ pub struct GatewayConfig {
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteEntry>,
+    /// Top-level plugin declarations. Each entry is a named plugin
+    /// instance keyed by `<plugin_name>`. Routes reference these by
+    /// name. Plan 07 P03.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, crate::plugins::PluginEntry>,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
@@ -477,6 +482,13 @@ pub struct RouteEntry {
     /// Plan 06 P03 — optional. When None, no cap applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<f64>,
+
+    // ── Per-route plugin attachments (Phase 7 P03) ─────────────────────────
+    /// Per-hook ordered lists of plugin references. `None` (or all-empty
+    /// lists) means no plugins run on this route — the registry's fast
+    /// path is enabled. Plan 07 P03.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<crate::plugins::RoutePluginsBlock>,
 }
 
 impl RouteEntry {
@@ -503,6 +515,7 @@ impl RouteEntry {
             breaker: BreakerConfig::default(),
             min_tier: None,
             max_cost_usd: None,
+            plugins: None,
         }
     }
 }

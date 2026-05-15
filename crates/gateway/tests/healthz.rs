@@ -10,6 +10,7 @@ fn minimal_config() -> GatewayConfig {
         logging: LoggingConfig::default(),
         upstreams: BTreeMap::new(),
         routes: vec![],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

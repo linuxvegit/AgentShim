@@ -119,7 +119,9 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
             // tokens × 3.0/1M ≈ 0.00006 USD). 0.001 sits comfortably
             // inside the gap.
             max_cost_usd: Some(0.001),
+            plugins: None,
         }],
+        plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

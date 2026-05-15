@@ -11,8 +11,6 @@ use agent_shim_core::{
     request::CanonicalRequest,
     tool::{ToolCallArguments, ToolChoice, ToolDefinition},
 };
-use std::sync::OnceLock;
-use tiktoken_rs::CoreBPE;
 
 // Per-piece structural overhead. See spec §"Per-piece structural overhead".
 const PER_MESSAGE: u32 = 4;
@@ -105,11 +103,11 @@ fn count_tool_choice(c: &ToolChoice) -> u32 {
 
 /// Count the cl100k_base tokens in a string. Uses `encode_ordinary` so
 /// `<|...|>` literals in user content do not blow up.
+///
+/// Delegates to `agent_shim_tokens::count_text` — the single
+/// workspace-wide source of truth for the cl100k encoder. (P01 T3.)
 fn count_text(s: &str) -> u32 {
-    static CELL: OnceLock<CoreBPE> = OnceLock::new();
-    let bpe = CELL
-        .get_or_init(|| tiktoken_rs::cl100k_base().expect("cl100k_base tokenizer must initialize"));
-    bpe.encode_ordinary(s).len() as u32
+    agent_shim_tokens::count_text(s)
 }
 
 #[cfg(test)]

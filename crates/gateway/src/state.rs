@@ -299,6 +299,12 @@ impl AppState {
         // so the same handle can back `PrometheusLatencyProbe`.
         let metrics = agent_shim_observability::install_metrics(&config.metrics);
 
+        // Plan 07 P01 T5: pre-warm the cl100k tokenizer so the first request
+        // doesn't pay the ~50-100ms init cost on the hot path. The result is
+        // dropped — we only care about the side-effect of populating the
+        // `OnceLock` cell inside `agent-shim-tokens`.
+        let _ = agent_shim_tokens::cl100k_encoder();
+
         // Plan 06 P04 T5: Prometheus-backed latency probe for the
         // cost filter's latency axis. Renders `metrics` on demand to
         // pull the recent p95 of `agent_shim_upstream_duration_seconds`.

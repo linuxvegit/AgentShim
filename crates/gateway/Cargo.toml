@@ -29,6 +29,7 @@ agent-shim-observability = { path = "../observability" }
 agent-shim-frontends = { path = "../frontends" }
 agent-shim-providers = { path = "../providers" }
 agent-shim-router = { path = "../router" }
+agent-shim-tokens = { path = "../tokens" }
 tokio.workspace = true
 tokio-util.workspace = true
 axum.workspace = true
