@@ -365,6 +365,52 @@ impl PluginRegistry {
         });
         Box::pin(wrapped.flat_map(futures::stream::iter))
     }
+
+    /// H7 hook — fire-and-forget. Spec §6.2 / §6.7 / §6.8.
+    ///
+    /// Each subscribed plugin is `tokio::spawn`-ed. This function returns
+    /// synchronously; the spawned tasks live until they complete or are
+    /// dropped at shutdown. P05 will wire these into a `JoinSet` so
+    /// shutdown can flush them within a deadline.
+    pub fn run_on_response_complete(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: crate::PluginContext,
+        summary: crate::ResponseSummary,
+    ) {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return;
+        };
+        if plan.on_response_complete.is_empty() {
+            return;
+        }
+        let summary = Arc::new(summary);
+        let ctx = Arc::new(ctx);
+        for entry in &plan.on_response_complete {
+            if !entry.enabled {
+                continue;
+            }
+            let plugin = entry.plugin.clone();
+            let plugin_name = entry.name.clone();
+            let timeout_ms = entry.timeouts.for_hook(Hook::ResponseComplete);
+            let on_error = entry.on_error;
+            let summary = summary.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let _ = crate::invoke::invoke::<(), _>(
+                    &plugin_name,
+                    &ctx,
+                    Hook::ResponseComplete.as_str(),
+                    timeout_ms,
+                    on_error,
+                    plugin.on_response_complete(&ctx, &summary),
+                )
+                .await;
+                // Return value is discarded — H7 cannot affect the response.
+                // Outcome is captured via the logging/metrics in P05.
+            });
+        }
+    }
 }
 
 /// Errors the registry surfaces during construction. Wrapped by
@@ -898,5 +944,113 @@ mod tests {
             }
             other => panic!("expected StreamEvent::Error, got {other:?}"),
         }
+    }
+
+    // ── Plan 07 P04 T4: run_on_response_complete (H7) ───────────────────────
+
+    #[tokio::test]
+    async fn run_on_response_complete_fires_async() {
+        use crate::ResponseSummary;
+
+        struct RecordSummary {
+            captured: Arc<tokio::sync::Mutex<Option<u64>>>,
+        }
+        #[async_trait]
+        impl crate::Plugin for RecordSummary {
+            fn kind_name(&self) -> &'static str {
+                "record_summary"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::RESPONSE_COMPLETE
+            }
+            async fn on_response_complete(
+                &self,
+                _ctx: &crate::PluginContext,
+                summary: &ResponseSummary,
+            ) -> crate::PluginResult<()> {
+                *self.captured.lock().await = Some(summary.elapsed_ms);
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(tokio::sync::Mutex::new(None));
+        let entry = Arc::new(PluginEntry {
+            name: "rs".to_string(),
+            plugin: Arc::new(RecordSummary {
+                captured: captured.clone(),
+            }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_response_complete: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("rs".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        registry.run_on_response_complete(
+            (FrontendKind::AnthropicMessages, "m"),
+            ctx,
+            ResponseSummary {
+                usage: None,
+                elapsed_ms: 42,
+                upstream_status: crate::UpstreamStatus::Success,
+            },
+        );
+        // Spawned task — yield in a loop until the captured value lands or
+        // 1 s elapses (tokio scheduling can take a beat under load).
+        for _ in 0..100 {
+            if captured.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(*captured.lock().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn run_on_response_complete_empty_registry_is_noop() {
+        use crate::ResponseSummary;
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        registry.run_on_response_complete(
+            (FrontendKind::AnthropicMessages, "anything"),
+            ctx,
+            ResponseSummary {
+                usage: None,
+                elapsed_ms: 0,
+                upstream_status: crate::UpstreamStatus::Success,
+            },
+        );
+        // No assertion needed — just verify the call returns without panic.
     }
 }
