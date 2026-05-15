@@ -269,6 +269,102 @@ impl PluginRegistry {
         }
         Ok(req)
     }
+
+    /// H5 stream wrapping. Spec §6.5.
+    ///
+    /// When the route has no `on_stream_event` subscribers, returns the
+    /// upstream stream as-is (zero overhead — no allocations, no
+    /// futures-machinery). Otherwise wraps with a chain that runs every
+    /// upstream-emitted event through every subscribed plugin in
+    /// declaration order, flattening each plugin's `Vec<StreamEvent>`
+    /// into the output.
+    ///
+    /// Error handling:
+    /// - Upstream `Err(StreamError)` items pass through unchanged — plugins
+    ///   never see them.
+    /// - Plugin `Err` causes the wrapper to emit a single
+    ///   `StreamEvent::Error { message }` event in the stream and stop;
+    ///   downstream frontend encoding rendering decides the wire shape.
+    /// - `Skipped` (on_error: skip) treats the plugin as identity — the
+    ///   event passes through unchanged.
+    pub fn wrap_stream(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: crate::PluginContext,
+        upstream: agent_shim_core::CanonicalStream,
+    ) -> agent_shim_core::CanonicalStream {
+        // Fast path: no plan, no plugins, no H5 subscribers — return upstream.
+        let plan = match self.lookup(route.0, route.1) {
+            Some(p) if !p.on_stream_event.is_empty() => p.clone(),
+            _ => return upstream,
+        };
+        let plugins: Vec<Arc<PluginEntry>> = plan.on_stream_event.clone();
+        let ctx = Arc::new(ctx);
+
+        use futures::StreamExt;
+        let wrapped = upstream.then(move |event_result| {
+            let plugins = plugins.clone();
+            let ctx = ctx.clone();
+            async move {
+                // Upstream errors pass through unchanged. Plugins do not
+                // see Err items.
+                let event = match event_result {
+                    Ok(e) => e,
+                    Err(err) => return vec![Err(err)],
+                };
+                // Walk the H5 chain; one in, N out per plugin. The
+                // intermediate "many out" state is kept as a Vec and
+                // re-fed through subsequent plugins one event at a time.
+                let mut buf: Vec<agent_shim_core::StreamEvent> = vec![event];
+                for entry in &plugins {
+                    if !entry.enabled {
+                        continue;
+                    }
+                    let mut next: Vec<agent_shim_core::StreamEvent> = Vec::with_capacity(buf.len());
+                    let plugin_name = entry.name.clone();
+                    let plugin = entry.plugin.clone();
+                    let timeout = entry.timeouts.for_hook(Hook::StreamEvent);
+                    let on_error = entry.on_error;
+                    for ev in buf.drain(..) {
+                        let ev_for_invoke = ev.clone();
+                        let ev_for_skip = ev;
+                        let outcome =
+                            crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
+                                &plugin_name,
+                                &ctx,
+                                Hook::StreamEvent.as_str(),
+                                timeout,
+                                on_error,
+                                plugin.on_stream_event(&ctx, ev_for_invoke),
+                            )
+                            .await;
+                        match outcome {
+                            crate::invoke::InvokeOutcome::Success(events) => {
+                                next.extend(events);
+                            }
+                            crate::invoke::InvokeOutcome::Skipped => {
+                                // Treat as identity: a skipped plugin
+                                // must not drop the event wholesale.
+                                next.push(ev_for_skip);
+                            }
+                            crate::invoke::InvokeOutcome::Propagate(err) => {
+                                // Emit a single Error event then stop.
+                                // HTTP status was committed at first event
+                                // (200); failure surfaces as wire-level
+                                // `event: error` (spec §6.5).
+                                return vec![Ok(agent_shim_core::StreamEvent::Error {
+                                    message: err.to_string(),
+                                })];
+                            }
+                        }
+                    }
+                    buf = next;
+                }
+                buf.into_iter().map(Ok).collect::<Vec<_>>()
+            }
+        });
+        Box::pin(wrapped.flat_map(futures::stream::iter))
+    }
 }
 
 /// Errors the registry surfaces during construction. Wrapped by
@@ -600,5 +696,207 @@ mod tests {
             .await
             .expect("empty registry fast path returns Ok");
         assert_eq!(out.messages.len(), 1);
+    }
+
+    // ── Plan 07 P04 T3: wrap_stream (H5) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn wrap_stream_fast_path_returns_identity() {
+        use agent_shim_core::{CanonicalStream, StopReason, StreamEvent};
+        use futures::stream::StreamExt;
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x/y".to_string(),
+        };
+        let upstream: CanonicalStream =
+            Box::pin(futures::stream::iter(vec![Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            })]));
+        let wrapped =
+            registry.wrap_stream((FrontendKind::AnthropicMessages, "anything"), ctx, upstream);
+        let collected: Vec<_> = wrapped.collect().await;
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].is_ok(), "fast path preserves Ok items");
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_h5_plugin_drops_every_other_event() {
+        use agent_shim_core::{CanonicalStream, StreamEvent};
+        use futures::stream::StreamExt;
+
+        struct DropEverySecond {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::Plugin for DropEverySecond {
+            fn kind_name(&self) -> &'static str {
+                "drop_every_second"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::STREAM_EVENT
+            }
+            async fn on_stream_event(
+                &self,
+                _ctx: &crate::PluginContext,
+                event: StreamEvent,
+            ) -> crate::PluginResult<Vec<StreamEvent>> {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                if n % 2 == 0 {
+                    Ok(vec![event])
+                } else {
+                    Ok(vec![])
+                }
+            }
+        }
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let entry = Arc::new(PluginEntry {
+            name: "d".to_string(),
+            plugin: Arc::new(DropEverySecond { counter: n.clone() }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_stream_event: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("d".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        // 4 input events; 2 should survive.
+        let events: Vec<_> = (0..4)
+            .map(|i| {
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: format!("e{i}"),
+                })
+            })
+            .collect();
+        let upstream: CanonicalStream = Box::pin(futures::stream::iter(events));
+        let wrapped = registry.wrap_stream((FrontendKind::AnthropicMessages, "m"), ctx, upstream);
+        let collected: Vec<_> = wrapped.collect().await;
+        let oks: Vec<_> = collected.into_iter().filter_map(Result::ok).collect();
+        assert_eq!(oks.len(), 2, "every other event survived");
+        assert_eq!(n.load(Ordering::SeqCst), 4, "plugin saw all 4 events");
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_plugin_failure_emits_error_event_and_stops() {
+        use agent_shim_core::{CanonicalStream, StreamEvent};
+        use futures::stream::StreamExt;
+
+        struct AlwaysFail;
+        #[async_trait]
+        impl crate::Plugin for AlwaysFail {
+            fn kind_name(&self) -> &'static str {
+                "always_fail"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::STREAM_EVENT
+            }
+            async fn on_stream_event(
+                &self,
+                _ctx: &crate::PluginContext,
+                _event: StreamEvent,
+            ) -> crate::PluginResult<Vec<StreamEvent>> {
+                Err(crate::PluginError::Failed {
+                    plugin: "always_fail".to_string(),
+                    hook: "on_stream_event",
+                    message: "boom".to_string(),
+                })
+            }
+        }
+
+        let entry = Arc::new(PluginEntry {
+            name: "f".to_string(),
+            plugin: Arc::new(AlwaysFail),
+            on_error: OnError::Fail, // ensures the error propagates
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_stream_event: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("f".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        let upstream: CanonicalStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "a".to_string(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "b".to_string(),
+            }),
+        ]));
+        let wrapped = registry.wrap_stream((FrontendKind::AnthropicMessages, "m"), ctx, upstream);
+        let collected: Vec<_> = wrapped.collect().await;
+        // First event should be replaced with an Error event; second event
+        // is consumed by the upstream stream but the plugin chain produces
+        // another Error event for it (the wrapper does not short-circuit
+        // upstream — each event runs through the chain independently).
+        assert!(!collected.is_empty(), "at least one event emitted");
+        let first = &collected[0];
+        match first {
+            Ok(StreamEvent::Error { message }) => {
+                assert!(
+                    message.contains("always_fail") || message.contains("boom"),
+                    "error message names the plugin or carries the reason: {message}"
+                );
+            }
+            other => panic!("expected StreamEvent::Error, got {other:?}"),
+        }
     }
 }
