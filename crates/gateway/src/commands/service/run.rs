@@ -65,6 +65,15 @@ pub fn run(config: &std::path::Path) -> anyhow::Result<()> {
     // user typed `agent-shim service run --config foo.yaml` in a
     // regular terminal), which is exactly the user-facing message
     // we want.
+    // Note: We pass DEFAULT_SERVICE_NAME ("agent-shim") here, but the
+    // service may have been installed under a different --name (e.g.
+    // "agent-shim-anthropic" for multi-instance setups). This works
+    // because ServiceType::OWN_PROCESS services ignore the name
+    // parameter on StartServiceCtrlDispatcher and
+    // RegisterServiceCtrlHandlerEx — Windows routes by PID, not name.
+    // If we ever switch to SHARE_PROCESS, we'd need to thread the
+    // install-time --name through to this call site (probably via the
+    // ImagePath parser already used by status::status).
     service_dispatcher::start(DEFAULT_SERVICE_NAME, ffi_service_main).map_err(|e| {
         anyhow::anyhow!(
             "service_dispatcher::start failed: {e}.\n\
@@ -116,6 +125,8 @@ fn run_service(config_path: PathBuf) -> anyhow::Result<()> {
         }
     };
 
+    // See the OWN_PROCESS note in `run()` above for why hardcoding
+    // DEFAULT_SERVICE_NAME here is correct.
     let status_handle = service_control_handler::register(DEFAULT_SERVICE_NAME, event_handler)
         .map_err(|e| anyhow::anyhow!("register control handler: {e}"))?;
 
@@ -141,6 +152,20 @@ fn run_service(config_path: PathBuf) -> anyhow::Result<()> {
     // validation rejects.
     let mut cfg = agent_shim_config::load_from_path(&config_path)?;
     agent_shim_config::validate(&cfg)?;
+    // Ordering invariant: load → validate → apply_service_log_fallback
+    // → run_core. The fallback MUST run before run_core because:
+    //   (1) run_core calls agent_shim_observability::init, which reads
+    //       cfg.logging.file to decide whether to build a file layer
+    //       (Phase 2), and
+    //   (2) under SCM there is no console — without the fallback, an
+    //       operator who installs without a `logging.file` block in
+    //       their gateway.yaml gets no logs at all.
+    //
+    // Removing this call has no compile-time consequence; only the
+    // #[ignore]'d service_full_lifecycle acceptance test catches it.
+    // TODO(v0.7): refactor so a unit test can pin this call site —
+    // extract run_service's body to take an injected "serve fn" closure
+    // and assert the fallback ran before serve is invoked.
     apply_service_log_fallback(&mut cfg);
 
     // Build a multi-thread tokio runtime. A current-thread runtime would

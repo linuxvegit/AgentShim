@@ -141,10 +141,15 @@ fn build_file_layer(
     // 3. Optional warning for relative paths — they resolve against cwd,
     // which is C:\Windows\System32 under Windows Service. Documented in
     // the spec; we surface it loudly here.
-    // TODO(windows-service P04): when run from the Windows Service Control
-    // Manager, stderr is detached, so this warning vanishes. Route through
-    // the SCM event log (or the rolling file we're about to install) in
-    // Phase 4 so operators see it.
+    // Note: under Windows Service mode (SCM-launched), stderr is detached,
+    // so this warning vanishes. It still fires correctly for foreground
+    // `agent-shim serve` invocations on all platforms. A more robust path
+    // (Windows Event Log) is out of scope for v0.6.x; tracking as a known
+    // limitation: an operator who installs with a relative `logging.file.path`
+    // under Windows Service won't see a warning, but the resulting path
+    // resolves to a subdirectory of C:\Windows\System32 — usually a
+    // permission-denied which fails fast and is visible via the
+    // Stopped(Win32(2)) status reported by run_service.
     if cfg.path.is_relative() {
         eprintln!(
             "WARNING: logging.file.path {:?} is relative — under Windows \
