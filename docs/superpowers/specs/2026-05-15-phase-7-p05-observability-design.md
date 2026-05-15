@@ -49,29 +49,49 @@ P05 ships the **only** Phase 7 observability work. P06 reuses these telemetry su
                    ▼                          ▼
         ┌──────────────────┐         ┌──────────────────────────┐
         │  invoke() helper │         │  PluginSupervisor (NEW)  │
-        │  - timeout       │         │  - tasks: Mutex<JoinSet> │
-        │  - on_error      │         │  - spawn_h7(future)      │
-        │  - protected diff│         │  - flush_pending_h7(dur) │
-        │  - LogFields ◄── NEW       │    → returns dropped: usize
-        │  - metric record◄── NEW    └──────────────────────────┘
-        └────────┬─────────┘                       ▲
-                 ▼                                 │ on shutdown
-        ┌──────────────────────────┐               │
-        │ observability crate      │               │
+        │  - timeout       │         │  - tasks: std::Mutex<JS> │
+        │  - on_error      │         │  - pending: HashMap<     │
+        │  - protected diff│         │    String, u64>          │
+        │  - InvokeArgs◄─NEW│         │  - spawn_h7(name, fut)   │
+        │  - SpanMode  ◄─NEW│         │  - flush_pending_h7(dur) │
+        │  - LogFields ◄─NEW│         │    → Vec<(String, u64)>  │
+        │  - metric record◄─NEW                                  │
+        └────────┬─────────┘         └──────────────────────────┘
+                 ▼                                 ▲
+        ┌──────────────────────────┐               │ flush from
+        │ observability crate      │               │ run_core
         │  metrics::recorders::    │               │
         │   record_plugin_invocation(...)          │
-        │   record_h7_dropped(name)                │
+        │   record_h7_dropped(name, count)         │
         │   names::PLUGIN_*                        │
         │   catalog::iter_descriptors              │
         └──────────────────────────┘               │
                                                    │
-                              ┌────────────────────┴──────────────┐
-                              │ gateway::commands::serve / shutdown│
-                              │   on shutdown signal:              │
-                              │     plugins.flush_pending_h7(dur) ─┘
-                              │   then continue normal shutdown    │
-                              └────────────────────────────────────┘
+                              ┌────────────────────┴────────────────┐
+                              │ gateway::commands::serve::run_core  │
+                              │   1. axum serve.await (drain HTTP)  │
+                              │   2. plugins.flush_pending_h7(dur)──┘
+                              │   3. otel.shutdown()                │
+                              └─────────────────────────────────────┘
 ```
+
+## Field naming convention
+
+Tracing and Prometheus have different identifier rules. The two surfaces use parallel, non-interchangeable names for the same conceptual field:
+
+| Concept | Tracing field (dotted, OTel) | Metric label (snake, Prometheus) |
+|---|---|---|
+| Plugin instance name | `"plugin.name"` | `plugin_name` |
+| Plugin kind | `"plugin.kind"` | `plugin_kind` |
+| Hook | `"plugin.hook"` | `hook` |
+| Request ID | `"agent_shim.request_id"` | (n/a — high cardinality) |
+| Route | `"agent_shim.route"` | (n/a — operator-controlled) |
+| Outcome | `"plugin.outcome"` | `outcome` |
+| Elapsed ms | `"plugin.elapsed_ms"` | (n/a — histogram value) |
+| On-error policy | `"plugin.on_error_policy"` | (n/a — policy attribute) |
+| Error message | `"plugin.error"` | (n/a — text) |
+
+Dotted names go into tracing field syntax via `"plugin.name" = value` (string-keyed). Bare snake names go into `metrics::counter!("..." => value)` directly. The two are never substituted — implementer should not paste a dotted name into a metric label (rejected by Prometheus) or a snake name into an OTel attribute (violates semantic convention).
 
 ## Components
 
@@ -89,7 +109,7 @@ pub(crate) struct PluginLogFields<'a> {
     pub plugin_name: &'a str,
     pub plugin_kind: &'static str,
     pub plugin_hook: &'static str,
-    pub request_id: &'a str,
+    pub request_id: &'a agent_shim_core::RequestId,  // emit as `%self.request_id` (Display)
     pub route: &'a str,
     pub outcome: PluginOutcome,
     pub elapsed_ms: u64,
@@ -124,38 +144,204 @@ The fields struct is `pub(crate)`. The `as_label` and `level` helpers encode the
 | Aborted | INFO | INFO |
 | ProtectedFieldMutated | ERROR | ERROR |
 
-The `emit()` method on `PluginLogFields` is the only path through which logs leave `invoke()`. There are no raw `tracing::info!` calls inside `invoke()`.
+`PluginLogFields::emit()` is the only path through which logs leave `invoke()`. There are no raw `tracing::info!` / `debug!` / `error!` / `warn!` calls inside `invoke.rs` proper.
+
+**Implementation: `emit()` uses an internal macro to avoid duplicating the field list across the 4 tracing-level macros (Q3 decision):**
+
+```rust
+// Inside log_fields.rs, file-local:
+macro_rules! emit_at_level {
+    ($level:expr, $f:expr) => {
+        match $level {
+            tracing::Level::ERROR => tracing::error!(
+                "plugin.name" = $f.plugin_name,
+                "plugin.kind" = $f.plugin_kind,
+                "plugin.hook" = $f.plugin_hook,
+                "agent_shim.request_id" = %$f.request_id,
+                "agent_shim.route" = $f.route,
+                "plugin.outcome" = $f.outcome.as_label(),
+                "plugin.elapsed_ms" = $f.elapsed_ms,
+                "plugin.on_error_policy" = ?$f.on_error_policy,
+                "plugin.error" = $f.error,
+            ),
+            tracing::Level::WARN  => tracing::warn!(/* SAME field set */),
+            tracing::Level::INFO  => tracing::info!(/* SAME field set */),
+            tracing::Level::DEBUG => tracing::debug!(/* SAME field set */),
+            _ => {},
+        }
+    };
+}
+
+impl PluginLogFields<'_> {
+    fn emit(&self) {
+        // §7.5 noise control: H5 success skips log emission (metric still updates).
+        if self.outcome == PluginOutcome::Success && self.plugin_hook == "on_stream_event" {
+            return;
+        }
+        emit_at_level!(self.outcome.level(self.on_error_policy), self);
+    }
+}
+```
+
+Rust's `tracing::event!()` macro requires the `Level` argument to be a compile-time path expression, not a runtime variable. The 4-way `match` is unavoidable; the file-local macro keeps the field-list duplication to a single place. Adding a new tracing field → edit the macro body in one location.
 
 ### 2. `invoke()` extension (`crates/plugins/src/invoke.rs`)
 
-Signature changes minimally — adds `plugin_kind: &'static str` because metric label demands it (Q6). H5 callers (wrap_stream) pass `emit_span: false`; H2/H3/H7 callers pass `emit_span: true` (Q5).
+The 8-positional-args version of `invoke()` is refactored to take an `InvokeArgs` struct + `ctx` + `work` (3 args total). The struct also has a `from_entry` builder for the common case (Q7 decision).
 
 ```rust
+pub(crate) struct InvokeArgs<'a> {
+    pub plugin_name: &'a str,
+    pub plugin_kind: &'static str,
+    pub hook: &'static str,
+    pub timeout_ms: u64,
+    pub on_error: OnError,
+    pub span_mode: SpanMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SpanMode {
+    /// H2/H3/H7: open a per-invocation `plugin.invoke` span.
+    PerInvocation,
+    /// H5: do NOT open a new span; events are attached to the
+    /// outer `plugin.stream` span owned by `wrap_stream`.
+    Aggregated,
+}
+
+impl InvokeArgs<'_> {
+    pub fn from_entry<'a>(
+        entry: &'a PluginEntry,
+        hook: Hook,
+        span_mode: SpanMode,
+    ) -> InvokeArgs<'a> {
+        InvokeArgs {
+            plugin_name: &entry.name,
+            plugin_kind: entry.kind,    // cached &'static str (Component 4)
+            hook: hook.as_str(),
+            timeout_ms: entry.timeouts.for_hook(hook),
+            on_error: entry.on_error,
+            span_mode,
+        }
+    }
+}
+
 pub(crate) async fn invoke<T, Fut>(
-    plugin_name: &str,
-    plugin_kind: &'static str,    // ← NEW
+    args: InvokeArgs<'_>,
     ctx: &PluginContext,
-    hook: &'static str,
-    timeout_ms: u64,
-    on_error: OnError,
-    emit_span: bool,              // ← NEW; false for H5, true otherwise
     work: Fut,
 ) -> InvokeOutcome<T>
+where
+    Fut: Future<Output = PluginResult<T>>,
+{ ... }
 ```
 
-Inside `invoke()`:
+**P04 callsite changes:** all four existing callsites in `registry.rs` (`run_on_decoded_request`, `run_on_resolved`, `wrap_stream`'s `then` closure, `run_on_response_complete`) are refactored to:
 
-1. If `emit_span`, enter `tracing::info_span!("plugin.invoke", plugin.name, plugin.kind, plugin.hook, plugin.outcome = tracing::field::Empty, plugin.elapsed_ms = tracing::field::Empty)`. The two `Empty` fields are recorded on the span before exit.
-2. Time the work via `Instant::now()`.
-3. Build a `PluginLogFields` based on the outcome.
-4. Call `fields.emit()` to log + record on span.
-5. Call `record_plugin_invocation(...)` (observability crate helper) to update counter + histogram.
+```rust
+let outcome = invoke::invoke(
+    InvokeArgs::from_entry(entry, Hook::DecodedRequest, SpanMode::PerInvocation),
+    ctx,
+    plugin.on_decoded_request(ctx, candidate),
+).await;
+```
 
-The internal logic for outcome mapping is unchanged from P04: aborted always propagates, timeout/failed/protected mapped through on_error, success returns value.
+H5 callsite passes `SpanMode::Aggregated`; others pass `SpanMode::PerInvocation`.
+
+**Span lifecycle inside `invoke()` (Q16 decision):** the function uses `Span::none()` for the `Aggregated` case and always calls `.instrument(span.clone())` on the work future. This keeps the timeout logic a single code path without if-else duplication:
+
+```rust
+use tracing::Instrument;
+
+let span = match args.span_mode {
+    SpanMode::PerInvocation => tracing::info_span!(
+        "plugin.invoke",
+        "plugin.name" = args.plugin_name,
+        "plugin.kind" = args.plugin_kind,
+        "plugin.hook" = args.hook,
+        "plugin.outcome" = tracing::field::Empty,
+        "plugin.elapsed_ms" = tracing::field::Empty,
+    ),
+    SpanMode::Aggregated => tracing::Span::none(),
+};
+
+let started = Instant::now();
+let result = tokio::time::timeout(
+    Duration::from_millis(args.timeout_ms),
+    work.instrument(span.clone()),
+).await;
+let elapsed_ms = started.elapsed().as_millis() as u64;
+
+// outcome matching (unchanged from P04) ...
+
+// Record span fields. No-op when span is Span::none() (Aggregated).
+span.record("plugin.outcome", outcome.as_label());
+span.record("plugin.elapsed_ms", elapsed_ms);
+
+// LogFields emit (mode-agnostic; H5 success skips log per §7.5).
+let fields = PluginLogFields {
+    plugin_name: args.plugin_name,
+    plugin_kind: args.plugin_kind,
+    plugin_hook: args.hook,
+    request_id: &ctx.request_id,
+    route: &ctx.route_label,
+    outcome,
+    elapsed_ms,
+    on_error_policy: args.on_error,
+    error: error_str.as_deref(),
+};
+fields.emit();
+
+// Metric recording (mode-agnostic).
+record_plugin_invocation(
+    args.plugin_kind,
+    args.plugin_name,
+    args.hook,
+    outcome.as_label(),
+    elapsed_ms as f64 / 1000.0,
+);
+```
+
+`Span::clone()` is cheap (atomic refcount on `Arc<Inner>`). `work.instrument(span.clone())` moves the clone into the future; the original `span` survives for `record()` calls after the await.
 
 ### 3. `wrap_stream()` H5 span aggregation (`crates/plugins/src/registry.rs`)
 
-Today `wrap_stream()` runs per-event invokes inside a `then().flat_map()` pipeline. P05 wraps that pipeline in a single `plugin.stream` span entered before the first event and exited when the stream is dropped.
+P04's `wrap_stream` runs per-event invokes inside a `then().flat_map()` pipeline. P05 wraps that pipeline in a `GuardedH5Stream` which (a) holds a `plugin.stream` span entered on every `poll_next` (Q17), and (b) carries a `StreamSpanRecorder` drop guard that writes final `event_count` / `failure_count` to the span at stream end (Q4).
+
+```rust
+// crates/plugins/src/registry.rs (private types)
+
+/// Drop-time recorder that writes aggregated counters to `plugin.stream` span.
+struct StreamSpanRecorder {
+    span: tracing::Span,
+    event_count: Arc<AtomicU64>,
+    failure_count: Arc<AtomicU64>,
+}
+impl Drop for StreamSpanRecorder {
+    fn drop(&mut self) {
+        self.span.record("plugin.event_count", self.event_count.load(Ordering::Relaxed));
+        self.span.record("plugin.failure_count", self.failure_count.load(Ordering::Relaxed));
+    }
+}
+
+/// Stream wrapper that enters `plugin.stream` for each poll and owns the recorder.
+struct GuardedH5Stream<S> {
+    inner: S,
+    span: tracing::Span,
+    _recorder: StreamSpanRecorder,
+}
+impl<S: futures::Stream + Unpin> futures::Stream for GuardedH5Stream<S> {
+    type Item = S::Item;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let _enter = self.span.enter();  // RAII; `Entered<'_>` is !Send but stack-local within poll body
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+```
+
+`wrap_stream` body:
 
 ```rust
 pub fn wrap_stream(
@@ -164,25 +350,58 @@ pub fn wrap_stream(
     ctx: PluginContext,
     upstream: CanonicalStream,
 ) -> CanonicalStream {
-    let plan = match self.lookup(...) { ... };  // fast path unchanged
+    let plan = match self.lookup(...) { /* fast path returns upstream unchanged */ };
 
-    // ── P05: open plugin.stream span for the whole stream lifetime ──
+    // Open the aggregated H5 span. NO plugin.name field — the span covers
+    // ALL H5 plugins on this route. Per-plugin attribution lives in the
+    // per-event LogFields (request_id correlation; Q14 trade-off).
     let span = tracing::info_span!(
         "plugin.stream",
-        plugin.event_count = tracing::field::Empty,
-        plugin.failure_count = tracing::field::Empty,
-        // No plugin.name — the span covers ALL H5 plugins on this route.
-        // Per-plugin attribution is in the per-event metrics.
+        "agent_shim.request_id" = %ctx.request_id,
+        "agent_shim.route" = %ctx.route_label,
+        "plugin.event_count" = tracing::field::Empty,
+        "plugin.failure_count" = tracing::field::Empty,
     );
+    let event_count = Arc::new(AtomicU64::new(0));
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let recorder = StreamSpanRecorder {
+        span: span.clone(),
+        event_count: Arc::clone(&event_count),
+        failure_count: Arc::clone(&failure_count),
+    };
 
-    // Wrap the existing stream pipeline in `.instrument(span)` so every
-    // poll keeps the span entered. Per-event `invoke()` is called with
-    // emit_span=false so it does not stack another span.
-    ...
+    let plugins: Vec<Arc<PluginEntry>> = plan.on_stream_event.clone();
+    let ctx = Arc::new(ctx);
+
+    let inner_stream = upstream.then(move |event_result| {
+        let plugins = plugins.clone();
+        let ctx = ctx.clone();
+        let event_count = Arc::clone(&event_count);
+        let failure_count = Arc::clone(&failure_count);
+        async move {
+            event_count.fetch_add(1, Ordering::Relaxed);
+            // existing P04 logic for chained invoke() calls per event,
+            // with SpanMode::Aggregated and failure_count.fetch_add on errors
+        }
+    }).flat_map(futures::stream::iter);
+
+    Box::pin(GuardedH5Stream { inner: inner_stream, span, _recorder: recorder })
 }
 ```
 
-Per-event log lines are still emitted (with the same `PluginLogFields`), and the §7.5 success-path noise control still applies (Q5): success outcome's `PluginLogFields::emit()` will skip the log line but still update metrics. This is done by the `emit()` method itself — it checks outcome ∈ {Success, Skipped(success path)} + hook == "on_stream_event" and short-circuits log emission.
+**Per-event invoke() call inside the closure** passes `SpanMode::Aggregated`:
+
+```rust
+let outcome = invoke::invoke(
+    InvokeArgs::from_entry(entry, Hook::StreamEvent, SpanMode::Aggregated),
+    &ctx,
+    plugin.on_stream_event(&ctx, ev_for_invoke),
+).await;
+```
+
+`PluginLogFields::emit()` inside invoke() checks `(outcome == Success && hook == on_stream_event)` → skip log (§7.5 noise control). Failure outcomes still log normally, and the event attaches to the `plugin.stream` span via `Span::current()`.
+
+**H5 failure attribution trade-off (Q14):** When a H5 plugin fails on event N, the trace shows only one `plugin.stream` span with `failure_count > 0`; no per-plugin child spans. Per-plugin attribution lives in the failure log line: `outcome="failed"` + `plugin.name="..."` + `agent_shim.request_id="..."`. Operators correlate failures to specific plugins via log search rather than the trace tree. This is consistent with §7.5 noise control — span granularity matches log granularity.
 
 ### 4. `PluginEntry.kind` field (`crates/plugins/src/registry.rs`)
 
@@ -199,97 +418,84 @@ pub struct PluginEntry {
 
 Construction sites (`for_testing_single_plugin` + future P06 `from_specs`) populate it once from `plugin.kind_name()`.
 
+**Constraint (Q1):** `Plugin::kind_name()` must return a string literal (`&'static str` referring to constant data), not a leaked allocation. This is enforced by rustdoc convention — the trait method's documentation MUST explicitly state "return a `&'static str` that is a string literal; do not return `Box::leak`-derived references; new kinds at runtime are not supported." Acceptance criterion checks for this rustdoc note on the trait definition.
+
 ### 5. `PluginSupervisor` (`crates/plugins/src/supervisor.rs`, new file)
 
 ```rust
 pub struct PluginSupervisor {
-    // std::sync::Mutex is sufficient: spawn_h7 is called from sync code
-    // (run_on_response_complete returns synchronously) and the critical
-    // section is just a JoinSet::spawn call (a few ns). The async path
-    // (flush_pending_h7) is the only one that takes the lock for longer,
-    // but during flush the gateway is shutting down — no concurrent spawns.
-    tasks: std::sync::Mutex<tokio::task::JoinSet<HandleResult>>,
-    names: std::sync::Mutex<HashMap<tokio::task::Id, String>>,
-}
-
-/// Per-task outcome captured by spawn_h7's wrapper so flush can attribute
-/// drops to plugin_name.
-struct HandleResult {
-    plugin_name: String,
+    /// std::sync::Mutex (NOT tokio::sync): the critical section is only
+    /// `JoinSet::spawn` (ns) or `std::mem::take` (ns) — never held across
+    /// `.await`. Confirmed clean by `clippy::await_holding_lock`.
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// plugin_name → pending count. spawn_h7 increments; the task body
+    /// (clone of this Arc) decrements on completion. On flush timeout
+    /// the remaining (name, count) pairs are the dropped attribution.
+    pending: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl PluginSupervisor {
-    pub fn new() -> Self { ... }
+    pub fn new() -> Self {
+        Self {
+            tasks: std::sync::Mutex::new(JoinSet::new()),
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 
-    /// Spawn an H7 future. The wrapper records the result so flush can
-    /// attribute drops by plugin_name. Returns synchronously.
+    /// Spawn an H7 future. Returns synchronously. Records plugin_name in
+    /// the pending map; the task body decrements on completion.
     pub fn spawn_h7(
         &self,
         plugin_name: String,
         fut: impl Future<Output = ()> + Send + 'static,
     ) {
-        // std::sync::Mutex: lock held for nanoseconds (JoinSet::spawn).
-        // Sync function — safe to call from non-async context if needed.
-        let mut tasks = self.tasks.lock().unwrap();
-        let handle = tasks.spawn(async move {
+        // Increment pending count for this plugin name.
+        *self.pending.lock().unwrap()
+            .entry(plugin_name.clone()).or_insert(0) += 1;
+
+        let pending = Arc::clone(&self.pending);
+        self.tasks.lock().unwrap().spawn(async move {
             fut.await;
-            HandleResult { plugin_name: plugin_name.clone() }
+            // On task completion, decrement count. Remove zero entries.
+            let mut p = pending.lock().unwrap();
+            if let Some(cnt) = p.get_mut(&plugin_name) {
+                *cnt -= 1;
+                if *cnt == 0 { p.remove(&plugin_name); }
+            }
         });
-        self.names.lock().unwrap().insert(handle.id(), plugin_name);
     }
 
-    /// Wait for pending H7 tasks until `deadline` elapses. Tasks that don't
-    /// complete are aborted; their plugin_name is reported via the H7
-    /// dropped counter. Returns the count of dropped tasks.
-    pub async fn flush_pending_h7(&self, deadline: Duration) -> Vec<String> {
-        // Synchronously take the JoinSet out of the Mutex — we own it for
-        // the duration of flush. spawn_h7 calls after this point will
-        // panic on lock acquisition (poison) but shutdown is monotonic so
-        // this is acceptable.
+    /// Wait for pending H7 tasks until `deadline` elapses. Returns
+    /// `Vec<(plugin_name, dropped_count)>` for tasks that did not
+    /// complete in time. Detaches survivors (they get aborted on
+    /// JoinSet drop or process exit). The caller emits one
+    /// `record_h7_dropped(name, count)` per entry.
+    pub async fn flush_pending_h7(&self, deadline: Duration) -> Vec<(String, u64)> {
+        // Take ownership of the JoinSet for the duration of flush. After
+        // axum drain, no new H7 spawns happen — this take is safe.
         let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
 
-        // Drain by polling until either all tasks finish or deadline elapses.
-        let drain = async {
-            let mut completed_ids = Vec::new();
-            while let Some(res) = tasks.join_next_with_id().await {
-                if let Ok((id, _)) = res {
-                    completed_ids.push(id);
-                }
-            }
-            completed_ids
-        };
+        // Drain tasks until empty or deadline elapses.
+        let _ = tokio::time::timeout(deadline, async {
+            while tasks.join_next().await.is_some() {}
+        }).await;
 
-        match tokio::time::timeout(deadline, drain).await {
-            Ok(_completed) => Vec::new(),
-            Err(_) => {
-                // Deadline elapsed; tasks left over get aborted.
-                let mut names = self.names.lock().unwrap();
-                let dropped: Vec<String> = tasks
-                    .join_next_with_id()  // would block, but we just need IDs;
-                    .now_or_never()        // implementation must enumerate
-                    .into_iter()
-                    .filter_map(|res| match res {
-                        Some(Ok((id, _))) => names.remove(&id),
-                        Some(Err(je)) => names.remove(&je.id()),
-                        None => None,
-                    })
-                    .collect();
-                tasks.shutdown().await;
-                dropped
-            }
-        }
+        // Whatever remains in `pending` did not finish in time.
+        let p = self.pending.lock().unwrap();
+        let dropped: Vec<(String, u64)> = p.iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect();
+
+        // tasks drops here -> aborts in-flight survivors.
+        drop(tasks);
+        dropped
     }
 }
 ```
 
-**Note on the drop attribution:** the public API returns the plugin_names of tasks that didn't complete in time so the shutdown hook can call `record_h7_dropped(name)` per name. The `names: Mutex<HashMap<task::Id, String>>` side-table is the implementation; cleared on successful join, looked up on timeout abort.
+**Why std::sync::Mutex over tokio::sync::Mutex:** critical sections are short (ns-scale: JoinSet::spawn or HashMap entry update), held without `.await`. `clippy::await_holding_lock` linting confirms no violations.
 
-The above pseudocode is approximate; the implementer should refine the timeout/abort dance to actually iterate the remaining handle ids before `shutdown().await`. Two acceptable alternatives:
-
-1. `tokio_util::task::TaskTracker` instead of `JoinSet` — cleaner shutdown semantics, but adds a workspace dep (we already have `tokio-util` for `CancellationToken` though, so this might be free).
-2. Manual `Vec<JoinHandle<HandleResult>>` + `select!` loop — most explicit, most code.
-
-The implementer picks based on what compiles cleanly with our `tokio` version. The contract is: `flush_pending_h7(Duration) -> Vec<String>` returning the dropped plugin_names.
+**Why HashMap<String, u64> instead of HashMap<task::Id, String>:** allowing the same plugin to spawn multiple H7 tasks concurrently (high QPS) means using `String` as key with a count. The H7 dropped metric label only needs plugin_name (not task_id), so no need for task::Id ↔ name reverse lookup. Simpler.
 
 ### 6. Registry wiring (`crates/plugins/src/registry.rs`)
 
@@ -326,17 +532,29 @@ pub fn run_on_response_complete(
 ) {
     let Some(plan) = self.lookup(route.0, route.1) else { return; };
     if plan.on_response_complete.is_empty() { return; }
-    // ... (rest unchanged) ...
+    let summary = Arc::new(summary);
+    let ctx = Arc::new(ctx);
     for entry in &plan.on_response_complete {
         if !entry.enabled { continue; }
-        // ...
-        self.supervisor.spawn_h7(plugin_name_for_supervisor, async move {
-            let _ = invoke::invoke::<(), _>(
-                &plugin_name, plugin_kind, &ctx,
-                Hook::ResponseComplete.as_str(),
+        let plugin = entry.plugin.clone();
+        let plugin_name = entry.name.clone();
+        let plugin_kind = entry.kind;     // &'static str cached on entry
+        let timeout_ms = entry.timeouts.for_hook(Hook::ResponseComplete);
+        let on_error = entry.on_error;
+        let summary = summary.clone();
+        let ctx = ctx.clone();
+        self.supervisor.spawn_h7(plugin_name.clone(), async move {
+            let args = InvokeArgs {
+                plugin_name: &plugin_name,
+                plugin_kind,
+                hook: Hook::ResponseComplete.as_str(),
                 timeout_ms,
                 on_error,
-                /* emit_span */ true,
+                span_mode: SpanMode::PerInvocation,  // H7 gets its own plugin.invoke span
+            };
+            let _ = invoke::invoke::<(), _>(
+                args,
+                &ctx,
                 plugin.on_response_complete(&ctx, &summary),
             ).await;
         });
@@ -359,107 +577,203 @@ pub fn run_on_response_complete(
       hook: &'static str,
       outcome: &'static str,
       duration_secs: f64,
-  ) { /* counter + histogram */ }
+  ) {
+      metrics::counter!(
+          names::PLUGIN_INVOCATIONS_TOTAL,
+          "plugin_kind" => plugin_kind,
+          "plugin_name" => plugin_name.to_string(),
+          "hook" => hook,
+          "outcome" => outcome,
+      ).increment(1);
+      metrics::histogram!(
+          names::PLUGIN_DURATION_SECONDS,
+          "plugin_kind" => plugin_kind,
+          "plugin_name" => plugin_name.to_string(),
+          "hook" => hook,
+      ).record(duration_secs);
+  }
 
-  pub fn record_h7_dropped(plugin_name: &str) {
+  pub fn record_h7_dropped(plugin_name: &str, count: u64) {
       metrics::counter!(names::PLUGIN_H7_DROPPED_TOTAL,
-          "plugin_name" => plugin_name.to_string()).increment(1);
+          "plugin_name" => plugin_name.to_string()).increment(count);
   }
   ```
 
-### 8. YAML config: `plugins.shutdown_flush_secs` (`crates/config/src/plugins.rs`)
+**Histogram bucket defaults (Q10, B+):** `agent_shim_plugin_duration_seconds` gets a hardcoded default bucket set covering sub-millisecond to seconds. Default exporter buckets (5ms-10s) are unsuitable for H5 which fires per SSE event with sub-ms latency.
+
+In `crates/observability/src/metrics/mod.rs::install`, BEFORE iterating `cfg.histogram_buckets` (so operator override still wins), apply:
 
 ```rust
-#[derive(Debug, Clone, Deserialize)]
+const PLUGIN_DURATION_DEFAULT_BUCKETS: &[f64] =
+    &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
+
+builder = builder
+    .set_buckets_for_metric(
+        Matcher::Full(names::PLUGIN_DURATION_SECONDS.to_string()),
+        PLUGIN_DURATION_DEFAULT_BUCKETS,
+    )
+    .expect("plugin duration default buckets must be valid");
+
+// ... existing histogram_buckets cfg loop here, which may override the above ...
+```
+
+Operator can override via `metrics.histogram_buckets: { agent_shim_plugin_duration_seconds: [...] }` in `gateway.yaml`.
+
+### 8. YAML config: `shutdown.plugin_flush_secs` (`crates/config/src/schema.rs`)
+
+P03's `plugins: BTreeMap<String, PluginEntry>` field is a flat map of named instances. Adding `shutdown_flush_secs` there would require restructuring (breaking change). Instead (Q8), introduce a new top-level `shutdown:` block — the natural home for cross-cutting shutdown timing knobs:
+
+```rust
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct PluginsConfig {
-    #[serde(default)]
-    pub instances: BTreeMap<String, PluginEntry>,
-    /// Seconds to wait for H7 (on_response_complete) tasks to complete
-    /// during gateway shutdown before dropping them. Default 5.
-    #[serde(default = "default_shutdown_flush_secs")]
-    pub shutdown_flush_secs: u64,
+pub struct ShutdownConfig {
+    /// Seconds to wait for H7 (on_response_complete) plugin tasks to
+    /// complete during gateway shutdown before dropping them. Default 5.
+    #[serde(default = "default_plugin_flush_secs")]
+    pub plugin_flush_secs: u64,
 }
 
-fn default_shutdown_flush_secs() -> u64 { 5 }
+fn default_plugin_flush_secs() -> u64 { 5 }
+
+// In GatewayConfig:
+pub struct GatewayConfig {
+    // ... existing fields ...
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+}
 ```
 
-Validation: `0 <= shutdown_flush_secs <= 300` (Layer A — reject any >5min as a likely misconfig).
-
-The exact path inside the existing `plugins:` block depends on P03's actual layout — if `plugins:` is currently a map directly (not a struct), this adds a small refactor:
+YAML:
 
 ```yaml
-# Before P03 (instances at top of plugins block):
-plugins:
-  my_compressor:
-    type: prompt_compressor
-    ...
-
-# After P05 (need to nest instances under `instances:`):
-plugins:
-  shutdown_flush_secs: 5      # NEW
-  instances:                   # existing entries move under here
-    my_compressor:
-      ...
+shutdown:
+  plugin_flush_secs: 5    # default 5, Layer A validates 0..=300
 ```
 
-**Decision:** Use the nested form to keep `plugins.*` an extensible namespace. Migration: the old flat form is detected via Serde untagged enum and `tracing::warn!`-logged as deprecated; we silently rewrite to the new shape at parse time. If this turns out to be too painful, we drop the warning and break — P03 was just shipped, no third party depends on the YAML yet.
+**Validation:** Layer A (`crates/config/src/validation.rs`) rejects `plugin_flush_secs > 300` as a likely misconfig.
 
-(**Implementer note:** check P03's actual struct first. If `PluginsBlock` is already a struct with an `instances` field, just add `shutdown_flush_secs` and skip the deprecation path.)
+**Default-on-absence:** Existing `gateway.yaml` files without a `shutdown:` block continue to work (`#[serde(default)]` on `GatewayConfig.shutdown`); plug_flush_secs defaults to 5.
 
-### 9. Gateway shutdown wiring (`crates/gateway/src/commands/serve.rs` or `shutdown.rs`)
+### 9. Gateway shutdown wiring (`crates/gateway/src/commands/serve.rs::run_core`)
 
-Where `commands::serve::run` awaits `shutdown_signal` today, after it resolves but before returning:
+`run_core` calls axum's `run_on_listener` / `run_with_admin_on_listeners` which await graceful shutdown internally (axum returns once in-flight requests drain or its timeout expires). After axum returns, the runtime is still alive — H7 tasks spawned during the drain are still pending in the supervisor's JoinSet.
+
+P05 wedges flush between axum-await-completion and OTel shutdown:
 
 ```rust
-// P05: flush H7 plugin tasks before exit.
-let flush_secs = state.snapshot.load().config.plugins.shutdown_flush_secs;
-let deadline = Duration::from_secs(flush_secs);
-let dropped = state.core.plugins.flush_pending_h7(deadline).await;
-for plugin_name in dropped {
-    agent_shim_observability::metrics::recorders::record_h7_dropped(&plugin_name);
+// Before axum.await — clone the supervisor Arc and read the flush deadline.
+let plugins = state.core.plugins.clone();  // Arc<PluginRegistry>
+let flush_secs = state.snapshot.load().config.shutdown.plugin_flush_secs;
+
+// axum runs and drains in-flight requests (existing P04 code path).
+let result = if let Some(admin_listener) = admin_listener_opt {
+    crate::server::run_with_admin_on_listeners(public_listener, admin_listener, state, shutdown_signal).await
+} else {
+    crate::server::run_on_listener(public_listener, state, shutdown_signal).await
+};
+
+// Plugin flush BEFORE otel.shutdown — flush emits warn! logs and
+// record_h7_dropped() metric points that otel still needs to pick up.
+let dropped = plugins.flush_pending_h7(Duration::from_secs(flush_secs)).await;
+for (plugin_name, count) in dropped {
+    agent_shim_observability::metrics::recorders::record_h7_dropped(&plugin_name, count);
     tracing::warn!(
         plugin.name = %plugin_name,
+        dropped_count = count,
         deadline_secs = flush_secs,
         "H7 task dropped at shutdown",
     );
 }
+
+// OTel last so it can flush the H7-dropped warn! events.
+if let Some(otel) = tracing_handles.otel {
+    otel.shutdown();
+}
+result
 ```
+
+**Ordering rationale (漏4 verify):**
+1. SIGTERM received → `shutdown_signal` future resolves
+2. axum stops accepting new requests, drains in-flight → during drain, H7 tasks get spawned into supervisor
+3. axum returns → no new H7 spawns can happen
+4. `flush_pending_h7(deadline)` — wait up to `flush_secs` for spawned H7 tasks; emit warn + metric for survivors
+5. `otel.shutdown()` — flush remaining tracing events including step 4's warn lines
+6. main returns → tokio runtime drops → any leftover background tasks aborted
 
 ## Testing strategy
 
 ### Plugins crate unit tests (DebuggingRecorder)
 
-`crates/plugins/src/invoke.rs::tests` adds 6 metric-assertion tests, one per outcome:
+Plugins crate dev-dependency:
 
-```rust
-fn assert_invocation_recorded(
-    snapshot: &Snapshot,
-    plugin_kind: &'static str,
-    plugin_name: &str,
-    hook: &'static str,
-    outcome: &'static str,
-) { ... }
-
-#[tokio::test]
-async fn success_emits_counter_and_histogram_with_outcome_success() {
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    metrics::with_local_recorder(&recorder, || {
-        // ... runs invoke() with a stub plugin returning Ok(()) ...
-    });
-    let snapshot = snapshotter.snapshot();
-    assert_invocation_recorded(&snapshot, "test_kind", "test_name", "on_decoded_request", "success");
-}
-// ... 5 more analogous: skipped, failed, timed_out, aborted, protected_field_mutated
+```toml
+[dev-dependencies]
+metrics-util = "0.17"
 ```
 
-`crates/plugins/src/log_fields.rs::tests`: assert level mapping for every outcome × on_error combination (12 cases).
+**Recorder installation pattern (Q15):** the test module installs `DebuggingRecorder` once via `OnceLock<Snapshotter>` (sibling to observability crate's `INSTALLED: OnceLock<PrometheusHandle>` pattern). cargo test runs each test crate as its own binary/process, so this is process-local — no interference with other crates' recorders.
 
-`crates/plugins/src/supervisor.rs::tests`:
-- `spawn_then_flush_completes_within_deadline` — spawn 3 fast tasks, flush(1s), assert dropped is empty
-- `spawn_then_flush_drops_slow_tasks` — spawn 1 slow task (sleep 1s), flush(10ms), assert dropped == [task_name]
-- `spawn_concurrent_then_flush_handles_all` — 100 tasks, flush, assert no panic
+```rust
+use metrics_util::debugging::{DebuggingRecorder, Snapshotter};
+use std::sync::OnceLock;
+
+static SNAPSHOTTER: OnceLock<Snapshotter> = OnceLock::new();
+
+fn snapshotter() -> &'static Snapshotter {
+    SNAPSHOTTER.get_or_init(|| {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        metrics::set_global_recorder(recorder)
+            .expect("DebuggingRecorder must install in plugin tests");
+        snap
+    })
+}
+
+fn count_invocations(snap: &Snapshot, plugin_name: &str, outcome: &str) -> u64 {
+    snap.into_vec().iter()
+        .filter_map(|(key, _unit, _desc, value)| {
+            if key.key().name() != "agent_shim_plugin_invocations_total" { return None; }
+            // ... label-set match ...
+            // ... extract counter value ...
+        })
+        .sum()
+}
+```
+
+**Tests added (6 outcome variants × 1 metric assertion each, in `invoke.rs::tests`):**
+
+- `success_emits_counter_and_histogram_with_outcome_success`
+- `skipped_emits_counter_with_outcome_skipped`
+- `failed_emits_counter_with_outcome_failed`
+- `timed_out_emits_counter_with_outcome_timed_out`
+- `aborted_emits_counter_with_outcome_aborted`
+- `protected_field_mutated_emits_counter_with_outcome_protected_field_mutated`
+
+Pattern (snapshot diff to handle test parallelism + shared global recorder):
+
+```rust
+#[tokio::test]
+async fn success_emits_counter_with_outcome_success() {
+    let snap = snapshotter();
+    let before = count_invocations(&snap.snapshot(), "test_success", "success");
+    invoke::invoke(
+        InvokeArgs { plugin_name: "test_success", plugin_kind: "test_kind", /* ... */ },
+        &ctx,
+        async { Ok::<_, PluginError>(()) },
+    ).await;
+    let after = count_invocations(&snap.snapshot(), "test_success", "success");
+    assert_eq!(after - before, 1);
+}
+```
+
+**LogFields tests in `log_fields.rs::tests`:** assert level mapping for every outcome × on_error combination (12 cases via `PluginOutcome::level(OnError)`).
+
+**Supervisor tests in `supervisor.rs::tests`:**
+
+- `spawn_then_flush_completes_within_deadline` — spawn 3 fast tasks, flush(1s) returns empty Vec
+- `spawn_then_flush_drops_slow_tasks_returns_attribution` — spawn 1 slow task (sleep 1s), flush(10ms), assert dropped == `[("slow_plugin", 1)]`
+- `spawn_concurrent_same_plugin_returns_aggregated_count` — spawn the same plugin name 5 times slow, flush(10ms), assert dropped == `[("slow_plugin", 5)]` (Q9 verify)
+- `spawn_concurrent_then_flush_handles_all` — 100 fast tasks, flush(1s), assert no panic + empty Vec
 
 ### Gateway integration test (`crates/gateway/tests/plugins_observability.rs`, new)
 
@@ -493,20 +807,23 @@ Histogram is updated unconditionally because operators want timing distributions
 
 ## Acceptance criteria
 
-1. `invoke()` signature accepts `plugin_kind: &'static str` + `emit_span: bool`.
-2. `PluginLogFields` struct exists; only it can `emit()` to the tracing subsystem from inside `invoke()`. Search-and-confirm: no other `tracing::info!`/`debug!`/`error!`/`warn!` inside `invoke.rs` proper.
-3. Every outcome variant maps to the level table above (asserted by 6 unit tests).
-4. `PluginEntry.kind: &'static str` exists and is populated at construction.
-5. `PluginSupervisor` struct exists with `spawn_h7` + `flush_pending_h7(deadline) -> Vec<String>` API.
-6. `PluginRegistry.supervisor: Arc<PluginSupervisor>` exists; `run_on_response_complete` routes through it (no bare `tokio::spawn`).
-7. `plugins.shutdown_flush_secs: u64` (default 5, max 300) lands in config schema with Layer A validation.
-8. Gateway shutdown calls `state.core.plugins.flush_pending_h7(deadline).await` and emits `agent_shim_plugin_h7_dropped_at_shutdown_total{plugin_name}` + a WARN log per dropped task.
-9. `wrap_stream` enters `plugin.stream` span; inner `invoke()` calls use `emit_span: false`. Per-event `PluginLogFields::emit()` skips the log on success/H5 hook combo.
-10. Three metrics added to observability crate's `names` + `catalog` + `recorders`.
-11. `cargo nextest run --workspace`: 789 → ~800+ (depending on exact test count).
-12. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
-13. `cargo fmt --all -- --check`: clean.
-14. **Frozen-core invariant preserved.** `git diff master..HEAD -- crates/core/` empty.
+1. `invoke()` is refactored to take `(InvokeArgs, &PluginContext, work)` — 3 args. `InvokeArgs::from_entry` builder exists.
+2. `SpanMode` enum (`PerInvocation` / `Aggregated`) is `pub(crate)`; H5 callsite passes `Aggregated`; H2/H3/H7 pass `PerInvocation`.
+3. `PluginLogFields` struct exists with the 9 fields in §1; only its `emit()` (via internal macro) emits tracing events from inside `invoke.rs`. Search-and-confirm: no other `tracing::info!`/`debug!`/`error!`/`warn!` inside `invoke.rs`.
+4. `PluginLogFields.request_id: &'a RequestId` (NOT `&str`) — emitted as `%self.request_id` Display.
+5. Every outcome variant maps to the level table above (asserted by 12 unit tests in `log_fields.rs::tests` covering outcome × on_error pairs).
+6. `PluginEntry.kind: &'static str` exists and is populated at construction. `Plugin::kind_name()` rustdoc explicitly requires string-literal returns (no leaked allocations); acceptance check grep.
+7. Tracing field names use dotted form (`"plugin.name"`, `"agent_shim.request_id"` etc.) with string-quoted syntax. Metric labels use snake_case (`plugin_name`, `plugin_kind`, `hook`, `outcome`). See § Field naming convention.
+8. `PluginSupervisor` struct exists with `spawn_h7(plugin_name: String, fut)` (sync) + `flush_pending_h7(deadline) -> Vec<(String, u64)>` (async). Uses `std::sync::Mutex` (not `tokio::sync::Mutex`). `clippy::await_holding_lock` clean.
+9. `PluginRegistry.supervisor: Arc<PluginSupervisor>` exists; `run_on_response_complete` routes through `supervisor.spawn_h7`. No bare `tokio::spawn` in `run_on_response_complete` post-P05.
+10. `wrap_stream` opens `plugin.stream` span via `GuardedH5Stream`. `plugin.stream` records `event_count` + `failure_count` via `StreamSpanRecorder` drop guard. Per-event `invoke()` calls pass `SpanMode::Aggregated`. §7.5 noise control: H5 success skips the log line (verified by integration test).
+11. `shutdown.plugin_flush_secs: u64` (default 5, Layer A max 300) lands in `GatewayConfig.shutdown`. Old configs without a `shutdown:` block load with default applied.
+12. Gateway `commands::serve::run_core` calls `state.core.plugins.flush_pending_h7(deadline).await` AFTER axum await, BEFORE `otel.shutdown()`. Each dropped task emits one `record_h7_dropped(name, count)` + one WARN log.
+13. Three new Prometheus metrics added to observability `names` + `catalog` + `recorders`. `agent_shim_plugin_duration_seconds` gets hardcoded default buckets `[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0]`, applied via `Matcher::Full` BEFORE iterating operator's `metrics.histogram_buckets` overrides.
+14. `cargo nextest run --workspace`: workspace test count increases by ~22 (12 LogFields × outcome×on_error tests + 6 invoke outcome tests + 4 supervisor tests).
+15. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+16. `cargo fmt --all -- --check`: clean.
+17. **Frozen-core invariant preserved.** `git diff master..HEAD -- crates/core/` empty.
 
 ## Risks + mitigations
 
