@@ -832,6 +832,15 @@ async fn run_stream(
         HandlerError::from_resilience_error(e, frontend_kind)
     })?;
 
+    // ── Plan 07 P04 spec §6.6 anchor 3 (streaming): H5 (on_stream_event) ──
+    // Per-event plugin chain. Fast path: zero-allocation identity when
+    // no `on_stream_event` subscribers exist for this route.
+    let upstream_stream = state.core.plugins.wrap_stream(
+        (frontend_kind, model_alias.as_str()),
+        plugin_ctx_for_run.clone(),
+        upstream_stream,
+    );
+
     if spec.log_streaming_usage_on_drop {
         // Anthropic-style: log final usage when the SSE stream is dropped.
         let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
@@ -975,6 +984,17 @@ async fn run_unary(
         frontend_kind,
     } = ctx;
 
+    // Plan 07 P04 T10/T11: capture the request ID before the chain walk
+    // consumes `canonical` so H5 wrap_stream + H7 inline fire can build
+    // `PluginContext` and `ResponseSummary` after the response is
+    // collected. `RequestId` is not Copy, so clone explicitly.
+    let canonical_id = canonical.id.clone();
+    let plugin_ctx_for_unary = agent_shim_plugins::PluginContext {
+        request_id: canonical_id.clone(),
+        frontend: frontend_kind,
+        route_label: format!("{:?}/{}", frontend_kind, model_alias),
+    };
+
     // Plan 06 P04 T4: see `run_stream` — cost filter pre-pass via
     // `complete_with_cost_filter` when a route entry is locatable.
     let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
@@ -1025,6 +1045,18 @@ async fn run_unary(
         tracing::error!(error = %e, "resilient call failed");
         HandlerError::from_resilience_error(e, frontend_kind)
     })?;
+
+    // ── Plan 07 P04 spec §6.6 anchor 3 (unary): H5 (on_stream_event) ──
+    // Unary still goes through a stream → collect path internally;
+    // plugins observe the intermediate stream events even though the
+    // caller eventually sees a flat `CanonicalResponse`. Fast path:
+    // identity when no `on_stream_event` subscribers exist.
+    let stream = state.core.plugins.wrap_stream(
+        (frontend_kind, model_alias.as_str()),
+        plugin_ctx_for_unary.clone(),
+        stream,
+    );
+
     let response = collect_stream(stream).await?;
     let (input, output) = match &response.usage {
         Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
