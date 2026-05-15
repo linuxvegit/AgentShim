@@ -193,6 +193,8 @@ fn handler_error_status_hint(e: &HandlerError) -> u16 {
             ..
         } => *status,
         HandlerError::TerminalUpstream { .. } => 502,
+        HandlerError::PluginFailed { aborted: true, .. } => 400,
+        HandlerError::PluginFailed { aborted: false, .. } => 502,
     }
 }
 
