@@ -1062,6 +1062,26 @@ async fn run_unary(
         Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
         None => (0, 0),
     };
+
+    // ── Plan 07 P04 spec §6.6 anchor 4 (unary): H7 (on_response_complete) ──
+    // Unary path runs H7 inline (caller is awaiting the HTTP response,
+    // so plugin time is included in the total elapsed). Streaming path
+    // fires H7 from the `H7Guard`'s Drop — see `H7Guard` in this file.
+    // The call is fire-and-forget (`run_on_response_complete` spawns
+    // internally); plugin completion is not awaited.
+    {
+        let summary = agent_shim_plugins::ResponseSummary {
+            usage: response.usage.clone(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            upstream_status: agent_shim_plugins::UpstreamStatus::Success,
+        };
+        state.core.plugins.run_on_response_complete(
+            (frontend_kind, model_alias.as_str()),
+            plugin_ctx_for_unary,
+            summary,
+        );
+    }
+
     tracing::info!(
         "← {} (unary) | model: {} → {} | input: {} | output: {} | {:.1}s",
         spec.endpoint_label,
