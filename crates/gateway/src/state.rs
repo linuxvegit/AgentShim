@@ -113,6 +113,13 @@ pub struct AppCore {
     /// `/admin/reload` clones this sender.
     #[allow(dead_code)]
     pub reload_tx: tokio::sync::mpsc::Sender<crate::reload_trigger::ReloadRequest>,
+    /// Plan 07 P04: plugin registry. Built once at startup; reload-time
+    /// hot-swapping lands in P07. For now `PluginRegistry::empty()` is
+    /// the always-true default (no config crate path wires plugins
+    /// through yet — that's P06). `#[allow(dead_code)]` falls off in
+    /// T8/T10/T11 once the four hook anchors read this field.
+    #[allow(dead_code)]
+    pub plugins: Arc<agent_shim_plugins::PluginRegistry>,
 }
 
 /// Hot-swappable policy-bearing snapshot. Plan 04 will swap this on
@@ -358,6 +365,7 @@ impl AppState {
             limiter_registry,
             metrics,
             reload_tx,
+            plugins: Arc::new(agent_shim_plugins::PluginRegistry::empty()),
         };
 
         (

@@ -682,6 +682,21 @@ async fn run_stream(
         frontend_kind,
     } = ctx;
 
+    // Plan 07 P04 T7: build a `PluginContext` once for this streaming
+    // request. Used by:
+    //   - the H7Guard's Drop fire (both Anthropic and OpenAI streaming).
+    //   - the H5 wrap_stream call (P04 T10).
+    //   - the H2/H3 anchors live earlier in dispatch_inner so they
+    //     build their own context up there. The `request_id` is captured
+    //     here from the canonical request because this instance is
+    //     scoped to `run_stream`. We clone the id because `canonical` is
+    //     consumed later by the chain walk and `RequestId` is not Copy.
+    let plugin_ctx_for_run = agent_shim_plugins::PluginContext {
+        request_id: canonical.id.clone(),
+        frontend: frontend_kind,
+        route_label: format!("{:?}/{}", frontend_kind, model_alias),
+    };
+
     // Plan 06 P04 T4: dispatch through the cost-filter-aware entry
     // point when we can locate the matching `RouteEntry`. Wildcard
     // routes and routes without `min_tier` / `max_cost_usd` /
@@ -748,9 +763,10 @@ async fn run_stream(
             upstream_model: upstream_model.clone(),
             usage: usage_capture.clone(),
             started,
-            registry: None,
-            route: None,
-            ctx: None,
+            // Plan 07 P04 T7: universal H7 firing.
+            registry: Some(state.core.plugins.clone()),
+            route: Some((frontend_kind, model_alias.clone())),
+            ctx: Some(plugin_ctx_for_run.clone()),
         };
 
         let logging_stream = upstream_stream.map(move |event| {
@@ -799,20 +815,61 @@ async fn run_stream(
             _ => unreachable!("encode_stream must return Stream"),
         }
     } else {
-        // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        // Plan 03 P03 T3: `stream.encode` span around the encoder.
+        // Plan 07 P04 T7: universal H7 guard across all streaming
+        // frontends. Today's OpenAI Chat / Responses branches did not
+        // use a Drop guard; they now do, so `on_response_complete`
+        // fires regardless of inbound frontend (§6.7).
+        let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
+        let guard = H7Guard {
+            endpoint_label: label,
+            model_alias: model_alias.clone(),
+            upstream_model: upstream_model.clone(),
+            usage: usage_capture.clone(),
+            started,
+            registry: Some(state.core.plugins.clone()),
+            route: Some((frontend_kind, model_alias.clone())),
+            ctx: Some(plugin_ctx_for_run.clone()),
+        };
+        // Capture usage events for the guard's final log line.
+        let logging_stream = upstream_stream.map(move |event| {
+            if let Ok(ref ev) = event {
+                match ev {
+                    StreamEvent::UsageDelta { usage } => {
+                        *usage_capture.lock() = Some(usage.clone());
+                    }
+                    StreamEvent::ResponseStop { usage: Some(u) } => {
+                        *usage_capture.lock() = Some(u.clone());
+                    }
+                    _ => {}
+                }
+            }
+            event
+        });
+        let canonical_stream: CanonicalStream = Box::pin(logging_stream);
         let frontend_response = {
             let _encode_span = tracing::info_span!("stream.encode").entered();
-            spec.frontend.encode_stream(upstream_stream)
+            spec.frontend.encode_stream(canonical_stream)
         };
-        tracing::info!(
-            "← {} (stream) | model: {} → {} | {:.1}s",
-            label,
-            model_alias,
-            upstream_model,
-            started.elapsed().as_secs_f64()
-        );
-        Ok(frontend_response_to_axum(frontend_response))
+        match frontend_response {
+            FrontendResponse::Stream {
+                content_type,
+                stream: sse_stream,
+            } => {
+                let guarded = GuardedStream {
+                    inner: sse_stream,
+                    _guard: guard,
+                };
+                let body = Body::from_stream(guarded.map(|r| r.map_err(|e| e.to_string())));
+                let mut r = Response::new(body);
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
+                );
+                Ok(r)
+            }
+            _ => unreachable!("encode_stream must return Stream"),
+        }
     }
 }
 
