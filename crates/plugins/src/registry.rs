@@ -11,9 +11,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_shim_core::FrontendKind;
+use agent_shim_core::{CanonicalRequest, FrontendKind};
 
-use crate::error::{OnError, PluginConfigError};
+use crate::context::PluginContext;
+use crate::error::{OnError, PluginConfigError, PluginResult};
 use crate::trait_def::{Hook, Plugin};
 
 /// Per-hook timeouts for a single plugin. Defaults follow spec §5.4:
@@ -49,7 +50,6 @@ impl HookTimeouts {
         }
     }
 
-    #[allow(dead_code)] // used by P04 run_* methods
     pub(crate) fn for_hook(&self, hook: Hook) -> u64 {
         match hook {
             Hook::DecodedRequest => self.on_decoded_request,
@@ -90,7 +90,7 @@ pub(crate) struct RouteHookPlan {
 }
 
 impl RouteHookPlan {
-    #[allow(dead_code)] // used by P04 run_* methods
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.on_decoded_request.is_empty()
             && self.on_resolved.is_empty()
@@ -102,9 +102,8 @@ impl RouteHookPlan {
 /// Top-level plugin registry. Constructed once at startup. Immutable
 /// thereafter; reload rebuilds the whole thing and arc-swaps (Q12).
 pub struct PluginRegistry {
-    #[allow(dead_code)] // used by P04 run_* methods
+    #[allow(dead_code)]
     pub(crate) plugins: HashMap<String, Arc<PluginEntry>>,
-    #[allow(dead_code)] // used by P04 run_* methods
     pub(crate) plans: HashMap<FrontendKind, FrontendRoutePlans>,
 }
 
@@ -122,7 +121,6 @@ impl PluginRegistry {
     /// Lookup helper used by P04's `run_*` methods. Returns the route
     /// plan matching `(frontend, model)` if any plugin actually subscribes
     /// to any hook for that route. Returns `None` for the fast path.
-    #[allow(dead_code)] // used by P04 run_* methods
     pub(crate) fn lookup<'a>(
         &'a self,
         frontend: FrontendKind,
@@ -137,6 +135,60 @@ impl PluginRegistry {
             return Some(plan);
         }
         fp.wildcard.as_ref()
+    }
+
+    /// H2 runner: execute the `on_decoded_request` hook for every
+    /// plugin subscribed to the `(frontend, model)` route, in order.
+    /// Returns the final rewritten `CanonicalRequest`.
+    ///
+    /// Fast path: returns identity when no plan exists for the route
+    /// or the plan's `on_decoded_request` list is empty.
+    pub async fn run_on_decoded_request(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: &PluginContext,
+        mut req: CanonicalRequest,
+    ) -> PluginResult<CanonicalRequest> {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return Ok(req);
+        };
+        if plan.on_decoded_request.is_empty() {
+            return Ok(req);
+        }
+        let hook = Hook::DecodedRequest.as_str();
+        for entry in &plan.on_decoded_request {
+            if !entry.enabled {
+                continue;
+            }
+            let plugin_name = entry.name.clone();
+            let plugin = Arc::clone(&entry.plugin);
+            let candidate = req.clone();
+            let ctx_clone = ctx.clone();
+            let outcome = crate::invoke::invoke(
+                &plugin_name,
+                &ctx_clone.clone(),
+                hook,
+                entry.timeouts.for_hook(Hook::DecodedRequest),
+                entry.on_error,
+                async move { plugin.on_decoded_request(&ctx_clone, candidate).await },
+            )
+            .await;
+            match outcome {
+                crate::invoke::InvokeOutcome::Success(updated) => {
+                    match crate::invoke::check_protected_fields(&plugin_name, hook, &req, &updated)
+                    {
+                        Ok(()) => req = updated,
+                        Err(e) => match entry.on_error {
+                            OnError::Skip => { /* keep req */ }
+                            OnError::Fail => return Err(e),
+                        },
+                    }
+                }
+                crate::invoke::InvokeOutcome::Skipped => {}
+                crate::invoke::InvokeOutcome::Propagate(err) => return Err(err),
+            }
+        }
+        Ok(req)
     }
 }
 
@@ -174,7 +226,38 @@ pub enum RegistryBuildError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::trait_def::HookSet;
+    use agent_shim_core::{
+        request::RequestMetadata, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
+        GenerationOptions, RequestId, ResolvedPolicy,
+    };
+
+    fn req() -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::AnthropicMessages,
+                requested_model: FrontendModel::from("m"),
+            },
+            model: FrontendModel::from("m"),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: RequestMetadata::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: ResolvedPolicy::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
 
     #[test]
     fn empty_registry_lookup_returns_none() {
@@ -218,5 +301,119 @@ mod tests {
     fn route_hook_plan_default_is_empty() {
         let plan = RouteHookPlan::default();
         assert!(plan.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_on_decoded_request_empty_registry_is_identity() {
+        let registry = PluginRegistry::empty();
+        let ctx = PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "test/m".to_string(),
+        };
+        let original = req();
+        let result = registry
+            .run_on_decoded_request(
+                (FrontendKind::AnthropicMessages, "m"),
+                &ctx,
+                original.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.id, original.id);
+    }
+
+    #[tokio::test]
+    async fn run_on_decoded_request_fires_two_plugins_in_order() {
+        // Counter plugin: increments shared AtomicUsize and records call order.
+        struct CountingPlugin {
+            counter: Arc<AtomicUsize>,
+            my_order: usize,
+            order_log: Arc<std::sync::Mutex<Vec<usize>>>,
+        }
+
+        #[async_trait]
+        impl Plugin for CountingPlugin {
+            fn kind_name(&self) -> &'static str {
+                "counting"
+            }
+            fn hooks(&self) -> HookSet {
+                HookSet::DECODED_REQUEST
+            }
+            async fn on_decoded_request(
+                &self,
+                _ctx: &PluginContext,
+                req: CanonicalRequest,
+            ) -> PluginResult<CanonicalRequest> {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                self.order_log.lock().unwrap().push(self.my_order);
+                Ok(req)
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let order_log: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(vec![]));
+
+        let plugin_a = Arc::new(CountingPlugin {
+            counter: Arc::clone(&counter),
+            my_order: 0,
+            order_log: Arc::clone(&order_log),
+        });
+        let plugin_b = Arc::new(CountingPlugin {
+            counter: Arc::clone(&counter),
+            my_order: 1,
+            order_log: Arc::clone(&order_log),
+        });
+
+        let entry_a = Arc::new(PluginEntry {
+            name: "a".to_string(),
+            plugin: plugin_a as Arc<dyn Plugin>,
+            on_error: OnError::Fail,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let entry_b = Arc::new(PluginEntry {
+            name: "b".to_string(),
+            plugin: plugin_b as Arc<dyn Plugin>,
+            on_error: OnError::Fail,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+
+        let plan = RouteHookPlan {
+            on_decoded_request: vec![Arc::clone(&entry_a), Arc::clone(&entry_b)],
+            ..Default::default()
+        };
+
+        let mut specific = HashMap::new();
+        specific.insert("m".to_string(), plan);
+
+        let fp = FrontendRoutePlans {
+            specific,
+            wildcard: None,
+            is_empty: false,
+        };
+
+        let mut plans = HashMap::new();
+        plans.insert(FrontendKind::AnthropicMessages, fp);
+
+        let registry = PluginRegistry {
+            plugins: HashMap::new(),
+            plans,
+        };
+
+        let ctx = PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "test/m".to_string(),
+        };
+
+        registry
+            .run_on_decoded_request((FrontendKind::AnthropicMessages, "m"), &ctx, req())
+            .await
+            .unwrap();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(*order_log.lock().unwrap(), vec![0, 1]);
     }
 }
