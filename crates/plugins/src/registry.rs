@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use agent_shim_core::FrontendKind;
 
-use crate::error::{OnError, PluginConfigError};
+use crate::error::{OnError, PluginConfigError, PluginError};
 use crate::trait_def::{Hook, Plugin};
 
 /// Per-hook timeouts for a single plugin. Defaults follow spec §5.4:
@@ -49,7 +49,6 @@ impl HookTimeouts {
         }
     }
 
-    #[allow(dead_code)] // used by P04 run_* methods
     pub(crate) fn for_hook(&self, hook: Hook) -> u64 {
         match hook {
             Hook::DecodedRequest => self.on_decoded_request,
@@ -90,7 +89,7 @@ pub(crate) struct RouteHookPlan {
 }
 
 impl RouteHookPlan {
-    #[allow(dead_code)] // used by P04 run_* methods
+    #[allow(dead_code)] // used by P04 T2/T3 (run_on_resolved, wrap_stream) and tests
     pub(crate) fn is_empty(&self) -> bool {
         self.on_decoded_request.is_empty()
             && self.on_resolved.is_empty()
@@ -102,9 +101,8 @@ impl RouteHookPlan {
 /// Top-level plugin registry. Constructed once at startup. Immutable
 /// thereafter; reload rebuilds the whole thing and arc-swaps (Q12).
 pub struct PluginRegistry {
-    #[allow(dead_code)] // used by P04 run_* methods
+    #[allow(dead_code)] // populated by P06 from_specs; lookup goes via `plans`
     pub(crate) plugins: HashMap<String, Arc<PluginEntry>>,
-    #[allow(dead_code)] // used by P04 run_* methods
     pub(crate) plans: HashMap<FrontendKind, FrontendRoutePlans>,
 }
 
@@ -122,7 +120,6 @@ impl PluginRegistry {
     /// Lookup helper used by P04's `run_*` methods. Returns the route
     /// plan matching `(frontend, model)` if any plugin actually subscribes
     /// to any hook for that route. Returns `None` for the fast path.
-    #[allow(dead_code)] // used by P04 run_* methods
     pub(crate) fn lookup<'a>(
         &'a self,
         frontend: FrontendKind,
@@ -137,6 +134,78 @@ impl PluginRegistry {
             return Some(plan);
         }
         fp.wildcard.as_ref()
+    }
+
+    /// H2 hook chain walk. Spec §6.2 / §6.3 / §6.4 / §4.5.
+    ///
+    /// Walks the route's `on_decoded_request` list in declaration order.
+    /// Each plugin sees the request as left by the previous successful
+    /// plugin (clone-then-swap on every iteration). Errors are routed
+    /// through the per-plugin `on_error` policy by `invoke()`; `Aborted`
+    /// always propagates. The protected-field diff (`id`, `frontend`,
+    /// `model`, `stream`) runs after every successful call.
+    ///
+    /// Fast path: when `lookup()` returns `None` or the route's
+    /// `on_decoded_request` list is empty, the function returns `Ok(req)`
+    /// without cloning. This is the zero-overhead case verified by the
+    /// integration test in T12.
+    pub async fn run_on_decoded_request(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: &crate::PluginContext,
+        mut req: agent_shim_core::CanonicalRequest,
+    ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return Ok(req);
+        };
+        if plan.on_decoded_request.is_empty() {
+            return Ok(req);
+        }
+        for entry in &plan.on_decoded_request {
+            if !entry.enabled {
+                continue;
+            }
+            let candidate = req.clone();
+            let plugin = entry.plugin.clone();
+            let plugin_name = entry.name.clone();
+            let hook_str = Hook::DecodedRequest.as_str();
+            let outcome = crate::invoke::invoke(
+                &plugin_name,
+                ctx,
+                hook_str,
+                entry.timeouts.for_hook(Hook::DecodedRequest),
+                entry.on_error,
+                plugin.on_decoded_request(ctx, candidate),
+            )
+            .await;
+            match outcome {
+                crate::invoke::InvokeOutcome::Success(new_req) => {
+                    // Protected-field diff: id / frontend / model / stream
+                    // are not allowed to change. If the plugin mutated one,
+                    // honour on_error (Skip → keep prior `req`; Fail →
+                    // propagate ProtectedFieldMutated as 502).
+                    if let Err(e) = crate::invoke::check_protected_fields(
+                        &plugin_name,
+                        hook_str,
+                        &req,
+                        &new_req,
+                    ) {
+                        match entry.on_error {
+                            OnError::Skip => continue,
+                            OnError::Fail => return Err(e),
+                        }
+                    }
+                    req = new_req;
+                }
+                crate::invoke::InvokeOutcome::Skipped => {
+                    // Keep prior `req`; loop to next plugin.
+                }
+                crate::invoke::InvokeOutcome::Propagate(err) => {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(req)
     }
 }
 
@@ -175,6 +244,108 @@ pub enum RegistryBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_shim_core::{
+        request::RequestMetadata, CanonicalRequest, ContentBlock, ExtensionMap, FrontendInfo,
+        FrontendModel, GenerationOptions, Message, RequestId, ResolvedPolicy, TextBlock,
+    };
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn req() -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::AnthropicMessages,
+                requested_model: FrontendModel::from("m"),
+            },
+            model: FrontendModel::from("m"),
+            system: vec![],
+            messages: vec![Message::user(vec![ContentBlock::Text(TextBlock {
+                text: "hello".to_string(),
+                extensions: ExtensionMap::new(),
+            })])],
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: RequestMetadata::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: ResolvedPolicy::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
+
+    /// Stub plugin used by `run_on_decoded_request` tests. Increments a
+    /// shared atomic counter on each call and appends a marker message
+    /// to `req.messages` so we can verify firing order downstream.
+    struct CounterPlugin {
+        n: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::Plugin for CounterPlugin {
+        fn kind_name(&self) -> &'static str {
+            "counter"
+        }
+        fn hooks(&self) -> crate::HookSet {
+            crate::HookSet::DECODED_REQUEST
+        }
+        async fn on_decoded_request(
+            &self,
+            _ctx: &crate::PluginContext,
+            mut req: CanonicalRequest,
+        ) -> crate::PluginResult<CanonicalRequest> {
+            self.n.fetch_add(1, Ordering::SeqCst);
+            req.messages
+                .push(Message::user(vec![ContentBlock::Text(TextBlock {
+                    text: "counter".to_string(),
+                    extensions: ExtensionMap::new(),
+                })]));
+            Ok(req)
+        }
+    }
+
+    fn registry_with_two_h2_plugins(
+        counter_a: Arc<AtomicUsize>,
+        counter_b: Arc<AtomicUsize>,
+    ) -> PluginRegistry {
+        let a = Arc::new(PluginEntry {
+            name: "a".to_string(),
+            plugin: Arc::new(CounterPlugin { n: counter_a }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let b = Arc::new(PluginEntry {
+            name: "b".to_string(),
+            plugin: Arc::new(CounterPlugin { n: counter_b }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_decoded_request: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("test-model".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert("a".to_string(), a);
+        plugins.insert("b".to_string(), b);
+        PluginRegistry { plugins, plans }
+    }
 
     #[test]
     fn empty_registry_lookup_returns_none() {
@@ -218,5 +389,52 @@ mod tests {
     fn route_hook_plan_default_is_empty() {
         let plan = RouteHookPlan::default();
         assert!(plan.is_empty());
+    }
+
+    // ── Plan 07 P04 T1: run_on_decoded_request ──────────────────────────────
+
+    #[tokio::test]
+    async fn run_on_decoded_request_fires_two_plugins_in_order() {
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_two_h2_plugins(a.clone(), b.clone());
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "anthropic_messages/test-model".to_string(),
+        };
+        let out = registry
+            .run_on_decoded_request((FrontendKind::AnthropicMessages, "test-model"), &ctx, req())
+            .await
+            .expect("run_on_decoded_request must succeed for both plugins");
+        assert_eq!(a.load(Ordering::SeqCst), 1, "plugin a fired once");
+        assert_eq!(b.load(Ordering::SeqCst), 1, "plugin b fired once");
+        // Each plugin appended one message; original had 1, expect 3.
+        assert_eq!(
+            out.messages.len(),
+            3,
+            "both plugin marker messages survived"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_on_decoded_request_empty_registry_is_identity() {
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x/y".to_string(),
+        };
+        let original = req();
+        let original_len = original.messages.len();
+        let out = registry
+            .run_on_decoded_request(
+                (FrontendKind::AnthropicMessages, "anything"),
+                &ctx,
+                original,
+            )
+            .await
+            .expect("empty registry fast path returns Ok");
+        assert_eq!(out.messages.len(), original_len, "request was untouched");
     }
 }
