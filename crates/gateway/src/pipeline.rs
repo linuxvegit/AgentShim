@@ -742,12 +742,15 @@ async fn run_stream(
     if spec.log_streaming_usage_on_drop {
         // Anthropic-style: log final usage when the SSE stream is dropped.
         let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
-        let logger = StreamLogger {
+        let guard = H7Guard {
             endpoint_label: label,
             model_alias: model_alias.clone(),
             upstream_model: upstream_model.clone(),
             usage: usage_capture.clone(),
             started,
+            registry: None,
+            route: None,
+            ctx: None,
         };
 
         let logging_stream = upstream_stream.map(move |event| {
@@ -782,7 +785,7 @@ async fn run_stream(
             } => {
                 let guarded = GuardedStream {
                     inner: sse_stream,
-                    _logger: logger,
+                    _guard: guard,
                 };
                 let body = Body::from_stream(guarded.map(|r| r.map_err(|e| e.to_string())));
                 let mut r = Response::new(body);
@@ -1016,15 +1019,29 @@ fn request_has_image(req: &CanonicalRequest) -> bool {
         .any(|b| matches!(b, ContentBlock::Image(_)))
 }
 
-struct StreamLogger {
+/// Plan 07 P04 T6/T7: universal H7 guard. Fires `run_on_response_complete`
+/// on the registry when the SSE stream finishes (or is dropped early by
+/// client disconnect). Replaces the Anthropic-only `StreamLogger` of v0.6
+/// — wiring for the registry/route/ctx happens in T7, so the new fields
+/// are `Option<_>` for now (None == log only, no H7 invocation).
+///
+/// The structured-log line (today's "← {label} (stream) | ..." emission)
+/// remains; it's folded into the Drop alongside the H7 firing so both
+/// happen at the same lifecycle point.
+struct H7Guard {
     endpoint_label: &'static str,
     model_alias: String,
     upstream_model: String,
     usage: Arc<Mutex<Option<Usage>>>,
     started: std::time::Instant,
+    /// `None` means "log only, no H7 invocation" — T6 ships this state.
+    /// T7 wires the registry/route/ctx for production callers.
+    registry: Option<Arc<agent_shim_plugins::PluginRegistry>>,
+    route: Option<(agent_shim_core::FrontendKind, String)>,
+    ctx: Option<agent_shim_plugins::PluginContext>,
 }
 
-impl Drop for StreamLogger {
+impl Drop for H7Guard {
     fn drop(&mut self) {
         let u = self.usage.lock().clone();
         let (input, output) = match u {
@@ -1034,6 +1051,7 @@ impl Drop for StreamLogger {
             ),
             None => (0, 0),
         };
+        let elapsed = self.started.elapsed();
         tracing::info!(
             "← {} (stream) | model: {} → {} | input: {} | output: {} | {:.1}s",
             self.endpoint_label,
@@ -1041,14 +1059,24 @@ impl Drop for StreamLogger {
             self.upstream_model,
             input,
             output,
-            self.started.elapsed().as_secs_f64()
+            elapsed.as_secs_f64()
         );
+        if let (Some(registry), Some(route), Some(ctx)) =
+            (self.registry.take(), self.route.take(), self.ctx.take())
+        {
+            let summary = agent_shim_plugins::ResponseSummary {
+                usage: u,
+                elapsed_ms: elapsed.as_millis() as u64,
+                upstream_status: agent_shim_plugins::UpstreamStatus::Success,
+            };
+            registry.run_on_response_complete((route.0, route.1.as_str()), ctx, summary);
+        }
     }
 }
 
 struct GuardedStream<S> {
     inner: S,
-    _logger: StreamLogger,
+    _guard: H7Guard,
 }
 
 impl<S: futures::Stream + Unpin> futures::Stream for GuardedStream<S> {
