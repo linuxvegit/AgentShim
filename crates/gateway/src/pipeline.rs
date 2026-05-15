@@ -198,6 +198,45 @@ fn handler_error_status_hint(e: &HandlerError) -> u16 {
     }
 }
 
+/// Plan 07 P04: bridge from `PluginError` (raw, frontend-agnostic) to
+/// `HandlerError::PluginFailed` (kind-aware, axum-renderable). Splits
+/// `Aborted` from everything else into the `aborted: true | false`
+/// distinction the status mapper consumes.
+fn handler_error_from_plugin_error(
+    err: agent_shim_plugins::PluginError,
+    kind: agent_shim_core::FrontendKind,
+) -> HandlerError {
+    use agent_shim_plugins::PluginError;
+    match err {
+        PluginError::Aborted { plugin, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            // Aborted isn't tied to one hook; the diagnostic is the
+            // operator-facing message, not the hook string.
+            hook: "aborted",
+            aborted: true,
+        },
+        PluginError::Timeout { plugin, hook, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            hook,
+            aborted: false,
+        },
+        PluginError::Failed { plugin, hook, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            hook,
+            aborted: false,
+        },
+        PluginError::ProtectedFieldMutated { plugin, hook, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            hook,
+            aborted: false,
+        },
+    }
+}
+
 /// Body of [`dispatch`], pulled into a separate async fn so the parent can
 /// wrap it with `.instrument(root_span)` rather than holding an `Entered`
 /// guard across `.await` (Plan 03 P03 T3 followup, IMPORTANT-1).
@@ -525,6 +564,27 @@ async fn dispatch_inner(
     if spec.capture_anthropic_headers {
         canonical.inbound_anthropic_headers = capture_anthropic_headers(&headers);
     }
+
+    // ── Plan 07 P04 spec §6.6 anchor 1: H2 (on_decoded_request) ───────
+    // After decode + header capture, before route resolution. The
+    // registry walks the route's H2 chain; protected-field violations
+    // and `on_error: fail` propagate as `HandlerError::PluginFailed`.
+    let frontend_kind_for_hooks = spec.frontend.kind();
+    let plugin_ctx = agent_shim_plugins::PluginContext {
+        request_id: canonical.id.clone(),
+        frontend: frontend_kind_for_hooks,
+        route_label: format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
+    };
+    canonical = state
+        .core
+        .plugins
+        .run_on_decoded_request(
+            (frontend_kind_for_hooks, model_alias.as_str()),
+            &plugin_ctx,
+            canonical,
+        )
+        .await
+        .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
 
     // Snapshot the merged route policy onto the canonical request. Providers
     // and logging both read from `resolved_policy` so the merge rule lives in

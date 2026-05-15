@@ -102,7 +102,6 @@ pub enum HandlerError {
     /// `plugin` and `hook` are operator-facing diagnostic strings; both
     /// appear in the error envelope's `message` field so operators can
     /// trace which hook failed.
-    #[allow(dead_code)] // constructed by P04 T8 once the H2 anchor wires PluginError → HandlerError
     #[error("plugin `{plugin}` failed on hook `{hook}` (aborted={aborted})")]
     PluginFailed {
         kind: FrontendKind,

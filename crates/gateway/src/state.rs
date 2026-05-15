@@ -116,9 +116,8 @@ pub struct AppCore {
     /// Plan 07 P04: plugin registry. Built once at startup; reload-time
     /// hot-swapping lands in P07. For now `PluginRegistry::empty()` is
     /// the always-true default (no config crate path wires plugins
-    /// through yet — that's P06). `#[allow(dead_code)]` falls off in
-    /// T8/T10/T11 once the four hook anchors read this field.
-    #[allow(dead_code)]
+    /// through yet — that's P06). Consumed by the H2/H3/H5/H7 anchor
+    /// points in `pipeline::dispatch_inner` / `run_stream` / `run_unary`.
     pub plugins: Arc<agent_shim_plugins::PluginRegistry>,
 }
 
