@@ -117,6 +117,54 @@ impl PluginRegistry {
         }
     }
 
+    /// Plan 07 P04 T12: test-only constructor for integration tests in
+    /// other crates. Builds a registry containing a single
+    /// `(name, plugin, on_error, hook)` entry bound to one
+    /// `(frontend, model)` route. Tests in `crates/gateway/tests/` cannot
+    /// reach the `pub(crate)` `RouteHookPlan` and `FrontendRoutePlans`
+    /// types directly, so the plumbing has to live here.
+    ///
+    /// `#[doc(hidden)]` keeps this out of rustdoc; it has no production
+    /// use. The full YAML-driven `from_specs` constructor lands in P06.
+    #[doc(hidden)]
+    pub fn for_testing_single_plugin(
+        name: &str,
+        plugin: Arc<dyn crate::Plugin>,
+        on_error: OnError,
+        hook: Hook,
+        frontend: FrontendKind,
+        model: &str,
+    ) -> Self {
+        let entry = Arc::new(PluginEntry {
+            name: name.to_string(),
+            plugin,
+            on_error,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let mut plan = RouteHookPlan::default();
+        match hook {
+            Hook::DecodedRequest => plan.on_decoded_request.push(entry.clone()),
+            Hook::Resolved => plan.on_resolved.push(entry.clone()),
+            Hook::StreamEvent => plan.on_stream_event.push(entry.clone()),
+            Hook::ResponseComplete => plan.on_response_complete.push(entry.clone()),
+        }
+        let mut specific = HashMap::new();
+        specific.insert(model.to_string(), plan);
+        let mut plans = HashMap::new();
+        plans.insert(
+            frontend,
+            FrontendRoutePlans {
+                specific,
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert(name.to_string(), entry);
+        Self { plugins, plans }
+    }
+
     /// Lookup helper used by P04's `run_*` methods. Returns the route
     /// plan matching `(frontend, model)` if any plugin actually subscribes
     /// to any hook for that route. Returns `None` for the fast path.
