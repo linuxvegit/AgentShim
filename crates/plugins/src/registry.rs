@@ -207,6 +207,68 @@ impl PluginRegistry {
         }
         Ok(req)
     }
+
+    /// H3 hook chain walk. Spec §6.2 / §6.4 / §4.5.
+    ///
+    /// Identical shape to `run_on_decoded_request` but:
+    /// - walks `plan.on_resolved`,
+    /// - passes the resolved `BackendTarget` to each plugin.
+    ///
+    /// Protected-field semantics are the same — including `stream`, even
+    /// though by §6.6 H3 runs after the streaming-vs-unary branch was
+    /// decided (mutating `stream` here would silently inconsistency the
+    /// downstream code path, hence the rejection).
+    pub async fn run_on_resolved(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: &crate::PluginContext,
+        mut req: agent_shim_core::CanonicalRequest,
+        target: &agent_shim_core::BackendTarget,
+    ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return Ok(req);
+        };
+        if plan.on_resolved.is_empty() {
+            return Ok(req);
+        }
+        for entry in &plan.on_resolved {
+            if !entry.enabled {
+                continue;
+            }
+            let candidate = req.clone();
+            let plugin = entry.plugin.clone();
+            let plugin_name = entry.name.clone();
+            let hook_str = Hook::Resolved.as_str();
+            let outcome = crate::invoke::invoke(
+                &plugin_name,
+                ctx,
+                hook_str,
+                entry.timeouts.for_hook(Hook::Resolved),
+                entry.on_error,
+                plugin.on_resolved(ctx, candidate, target),
+            )
+            .await;
+            match outcome {
+                crate::invoke::InvokeOutcome::Success(new_req) => {
+                    if let Err(e) = crate::invoke::check_protected_fields(
+                        &plugin_name,
+                        hook_str,
+                        &req,
+                        &new_req,
+                    ) {
+                        match entry.on_error {
+                            OnError::Skip => continue,
+                            OnError::Fail => return Err(e),
+                        }
+                    }
+                    req = new_req;
+                }
+                crate::invoke::InvokeOutcome::Skipped => {}
+                crate::invoke::InvokeOutcome::Propagate(err) => return Err(err),
+            }
+        }
+        Ok(req)
+    }
 }
 
 /// Errors the registry surfaces during construction. Wrapped by
@@ -436,5 +498,107 @@ mod tests {
             .await
             .expect("empty registry fast path returns Ok");
         assert_eq!(out.messages.len(), original_len, "request was untouched");
+    }
+
+    // ── Plan 07 P04 T2: run_on_resolved ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_on_resolved_fires_plugin_with_target() {
+        use agent_shim_core::BackendTarget;
+
+        struct ResolvedCounter(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::Plugin for ResolvedCounter {
+            fn kind_name(&self) -> &'static str {
+                "resolved_counter"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::RESOLVED
+            }
+            async fn on_resolved(
+                &self,
+                _ctx: &crate::PluginContext,
+                req: CanonicalRequest,
+                _target: &BackendTarget,
+            ) -> crate::PluginResult<CanonicalRequest> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(req)
+            }
+        }
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let entry = Arc::new(PluginEntry {
+            name: "rc".to_string(),
+            plugin: Arc::new(ResolvedCounter(n.clone())),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_resolved: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("rc".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "anthropic_messages/m".to_string(),
+        };
+        let target = BackendTarget {
+            provider: "test".to_string(),
+            model: "u".to_string(),
+            policy: Default::default(),
+        };
+        let _ = registry
+            .run_on_resolved((FrontendKind::AnthropicMessages, "m"), &ctx, req(), &target)
+            .await
+            .expect("run_on_resolved must succeed");
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_on_resolved_empty_registry_is_identity() {
+        use agent_shim_core::BackendTarget;
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        let target = BackendTarget {
+            provider: "test".to_string(),
+            model: "u".to_string(),
+            policy: Default::default(),
+        };
+        let out = registry
+            .run_on_resolved(
+                (FrontendKind::AnthropicMessages, "anything"),
+                &ctx,
+                req(),
+                &target,
+            )
+            .await
+            .expect("empty registry fast path returns Ok");
+        assert_eq!(out.messages.len(), 1);
     }
 }
