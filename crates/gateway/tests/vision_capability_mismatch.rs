@@ -201,6 +201,8 @@ fn make_app_state() -> AppState {
             // no real consumer; that's fine because this test never
             // triggers a reload. Plan 04 P04 T2.
             reload_tx: tokio::sync::mpsc::channel(1).0,
+            // Plan 07 P04 T7: tests inherit the empty-registry fast path.
+            plugins: Arc::new(agent_shim_plugins::PluginRegistry::empty()),
         }),
         snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
             config: Arc::new(cfg),

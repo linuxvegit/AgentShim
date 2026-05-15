@@ -17,6 +17,7 @@ fn empty_config() -> GatewayConfig {
         logging: LoggingConfig::default(),
         upstreams: BTreeMap::new(),
         routes: vec![],
+        plugins: BTreeMap::new(),
         auth: Default::default(),
         rate_limit: Default::default(),
         copilot: None,

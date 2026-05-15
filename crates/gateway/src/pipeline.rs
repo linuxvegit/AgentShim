@@ -193,6 +193,47 @@ fn handler_error_status_hint(e: &HandlerError) -> u16 {
             ..
         } => *status,
         HandlerError::TerminalUpstream { .. } => 502,
+        HandlerError::PluginFailed { aborted: true, .. } => 400,
+        HandlerError::PluginFailed { aborted: false, .. } => 502,
+    }
+}
+
+/// Plan 07 P04: bridge from `PluginError` (raw, frontend-agnostic) to
+/// `HandlerError::PluginFailed` (kind-aware, axum-renderable). Splits
+/// `Aborted` from everything else into the `aborted: true | false`
+/// distinction the status mapper consumes.
+fn handler_error_from_plugin_error(
+    err: agent_shim_plugins::PluginError,
+    kind: agent_shim_core::FrontendKind,
+) -> HandlerError {
+    use agent_shim_plugins::PluginError;
+    match err {
+        PluginError::Aborted { plugin, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            // Aborted isn't tied to one hook; the diagnostic is the
+            // operator-facing message, not the hook string.
+            hook: "aborted",
+            aborted: true,
+        },
+        PluginError::Timeout { plugin, hook, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            hook,
+            aborted: false,
+        },
+        PluginError::Failed { plugin, hook, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            hook,
+            aborted: false,
+        },
+        PluginError::ProtectedFieldMutated { plugin, hook, .. } => HandlerError::PluginFailed {
+            kind,
+            plugin,
+            hook,
+            aborted: false,
+        },
     }
 }
 
@@ -524,12 +565,51 @@ async fn dispatch_inner(
         canonical.inbound_anthropic_headers = capture_anthropic_headers(&headers);
     }
 
+    // ── Plan 07 P04 spec §6.6 anchor 1: H2 (on_decoded_request) ───────
+    // After decode + header capture, before route resolution. The
+    // registry walks the route's H2 chain; protected-field violations
+    // and `on_error: fail` propagate as `HandlerError::PluginFailed`.
+    let frontend_kind_for_hooks = spec.frontend.kind();
+    let plugin_ctx = agent_shim_plugins::PluginContext {
+        request_id: canonical.id.clone(),
+        frontend: frontend_kind_for_hooks,
+        route_label: format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
+    };
+    canonical = state
+        .core
+        .plugins
+        .run_on_decoded_request(
+            (frontend_kind_for_hooks, model_alias.as_str()),
+            &plugin_ctx,
+            canonical,
+        )
+        .await
+        .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
+
     // Snapshot the merged route policy onto the canonical request. Providers
     // and logging both read from `resolved_policy` so the merge rule lives in
     // exactly one place (RoutePolicy::resolve). v0.4 D2: route-level policy
     // is uniform across the chain; resolving against `chain[0]`'s policy is
     // correct because every chain element shares the same `RoutePolicy`.
     canonical.resolved_policy = first_target.policy.resolve(&canonical);
+
+    // ── Plan 07 P04 spec §6.6 anchor 2: H3 (on_resolved) ──────────────
+    // After route resolve + policy snapshot, before capability gate.
+    // Plugins see the resolved `BackendTarget` (= chain head) so they
+    // can adapt to per-upstream context (e.g., target-specific prompt
+    // shaping). Failure semantics identical to H2 (PluginFailed → 502;
+    // Aborted → 400).
+    canonical = state
+        .core
+        .plugins
+        .run_on_resolved(
+            (frontend_kind_for_hooks, model_alias.as_str()),
+            &plugin_ctx,
+            canonical,
+            &first_target,
+        )
+        .await
+        .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
 
     // Capability gate. Reject before any network call when the request asks
     // for a feature the target provider can't deliver — today this is just
@@ -680,6 +760,21 @@ async fn run_stream(
         frontend_kind,
     } = ctx;
 
+    // Plan 07 P04 T7: build a `PluginContext` once for this streaming
+    // request. Used by:
+    //   - the H7Guard's Drop fire (both Anthropic and OpenAI streaming).
+    //   - the H5 wrap_stream call (P04 T10).
+    //   - the H2/H3 anchors live earlier in dispatch_inner so they
+    //     build their own context up there. The `request_id` is captured
+    //     here from the canonical request because this instance is
+    //     scoped to `run_stream`. We clone the id because `canonical` is
+    //     consumed later by the chain walk and `RequestId` is not Copy.
+    let plugin_ctx_for_run = agent_shim_plugins::PluginContext {
+        request_id: canonical.id.clone(),
+        frontend: frontend_kind,
+        route_label: format!("{:?}/{}", frontend_kind, model_alias),
+    };
+
     // Plan 06 P04 T4: dispatch through the cost-filter-aware entry
     // point when we can locate the matching `RouteEntry`. Wildcard
     // routes and routes without `min_tier` / `max_cost_usd` /
@@ -737,15 +832,28 @@ async fn run_stream(
         HandlerError::from_resilience_error(e, frontend_kind)
     })?;
 
+    // ── Plan 07 P04 spec §6.6 anchor 3 (streaming): H5 (on_stream_event) ──
+    // Per-event plugin chain. Fast path: zero-allocation identity when
+    // no `on_stream_event` subscribers exist for this route.
+    let upstream_stream = state.core.plugins.wrap_stream(
+        (frontend_kind, model_alias.as_str()),
+        plugin_ctx_for_run.clone(),
+        upstream_stream,
+    );
+
     if spec.log_streaming_usage_on_drop {
         // Anthropic-style: log final usage when the SSE stream is dropped.
         let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
-        let logger = StreamLogger {
+        let guard = H7Guard {
             endpoint_label: label,
             model_alias: model_alias.clone(),
             upstream_model: upstream_model.clone(),
             usage: usage_capture.clone(),
             started,
+            // Plan 07 P04 T7: universal H7 firing.
+            registry: Some(state.core.plugins.clone()),
+            route: Some((frontend_kind, model_alias.clone())),
+            ctx: Some(plugin_ctx_for_run.clone()),
         };
 
         let logging_stream = upstream_stream.map(move |event| {
@@ -780,7 +888,7 @@ async fn run_stream(
             } => {
                 let guarded = GuardedStream {
                     inner: sse_stream,
-                    _logger: logger,
+                    _guard: guard,
                 };
                 let body = Body::from_stream(guarded.map(|r| r.map_err(|e| e.to_string())));
                 let mut r = Response::new(body);
@@ -794,20 +902,61 @@ async fn run_stream(
             _ => unreachable!("encode_stream must return Stream"),
         }
     } else {
-        // Plain post-spawn log (OpenAI Chat / Responses streaming today).
-        // Plan 03 P03 T3: `stream.encode` span around the encoder.
+        // Plan 07 P04 T7: universal H7 guard across all streaming
+        // frontends. Today's OpenAI Chat / Responses branches did not
+        // use a Drop guard; they now do, so `on_response_complete`
+        // fires regardless of inbound frontend (§6.7).
+        let usage_capture: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
+        let guard = H7Guard {
+            endpoint_label: label,
+            model_alias: model_alias.clone(),
+            upstream_model: upstream_model.clone(),
+            usage: usage_capture.clone(),
+            started,
+            registry: Some(state.core.plugins.clone()),
+            route: Some((frontend_kind, model_alias.clone())),
+            ctx: Some(plugin_ctx_for_run.clone()),
+        };
+        // Capture usage events for the guard's final log line.
+        let logging_stream = upstream_stream.map(move |event| {
+            if let Ok(ref ev) = event {
+                match ev {
+                    StreamEvent::UsageDelta { usage } => {
+                        *usage_capture.lock() = Some(usage.clone());
+                    }
+                    StreamEvent::ResponseStop { usage: Some(u) } => {
+                        *usage_capture.lock() = Some(u.clone());
+                    }
+                    _ => {}
+                }
+            }
+            event
+        });
+        let canonical_stream: CanonicalStream = Box::pin(logging_stream);
         let frontend_response = {
             let _encode_span = tracing::info_span!("stream.encode").entered();
-            spec.frontend.encode_stream(upstream_stream)
+            spec.frontend.encode_stream(canonical_stream)
         };
-        tracing::info!(
-            "← {} (stream) | model: {} → {} | {:.1}s",
-            label,
-            model_alias,
-            upstream_model,
-            started.elapsed().as_secs_f64()
-        );
-        Ok(frontend_response_to_axum(frontend_response))
+        match frontend_response {
+            FrontendResponse::Stream {
+                content_type,
+                stream: sse_stream,
+            } => {
+                let guarded = GuardedStream {
+                    inner: sse_stream,
+                    _guard: guard,
+                };
+                let body = Body::from_stream(guarded.map(|r| r.map_err(|e| e.to_string())));
+                let mut r = Response::new(body);
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
+                );
+                Ok(r)
+            }
+            _ => unreachable!("encode_stream must return Stream"),
+        }
     }
 }
 
@@ -834,6 +983,17 @@ async fn run_unary(
         started,
         frontend_kind,
     } = ctx;
+
+    // Plan 07 P04 T10/T11: capture the request ID before the chain walk
+    // consumes `canonical` so H5 wrap_stream + H7 inline fire can build
+    // `PluginContext` and `ResponseSummary` after the response is
+    // collected. `RequestId` is not Copy, so clone explicitly.
+    let canonical_id = canonical.id.clone();
+    let plugin_ctx_for_unary = agent_shim_plugins::PluginContext {
+        request_id: canonical_id.clone(),
+        frontend: frontend_kind,
+        route_label: format!("{:?}/{}", frontend_kind, model_alias),
+    };
 
     // Plan 06 P04 T4: see `run_stream` — cost filter pre-pass via
     // `complete_with_cost_filter` when a route entry is locatable.
@@ -885,11 +1045,43 @@ async fn run_unary(
         tracing::error!(error = %e, "resilient call failed");
         HandlerError::from_resilience_error(e, frontend_kind)
     })?;
+
+    // ── Plan 07 P04 spec §6.6 anchor 3 (unary): H5 (on_stream_event) ──
+    // Unary still goes through a stream → collect path internally;
+    // plugins observe the intermediate stream events even though the
+    // caller eventually sees a flat `CanonicalResponse`. Fast path:
+    // identity when no `on_stream_event` subscribers exist.
+    let stream = state.core.plugins.wrap_stream(
+        (frontend_kind, model_alias.as_str()),
+        plugin_ctx_for_unary.clone(),
+        stream,
+    );
+
     let response = collect_stream(stream).await?;
     let (input, output) = match &response.usage {
         Some(u) => (u.input_tokens.unwrap_or(0), u.output_tokens.unwrap_or(0)),
         None => (0, 0),
     };
+
+    // ── Plan 07 P04 spec §6.6 anchor 4 (unary): H7 (on_response_complete) ──
+    // Unary path runs H7 inline (caller is awaiting the HTTP response,
+    // so plugin time is included in the total elapsed). Streaming path
+    // fires H7 from the `H7Guard`'s Drop — see `H7Guard` in this file.
+    // The call is fire-and-forget (`run_on_response_complete` spawns
+    // internally); plugin completion is not awaited.
+    {
+        let summary = agent_shim_plugins::ResponseSummary {
+            usage: response.usage.clone(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            upstream_status: agent_shim_plugins::UpstreamStatus::Success,
+        };
+        state.core.plugins.run_on_response_complete(
+            (frontend_kind, model_alias.as_str()),
+            plugin_ctx_for_unary,
+            summary,
+        );
+    }
+
     tracing::info!(
         "← {} (unary) | model: {} → {} | input: {} | output: {} | {:.1}s",
         spec.endpoint_label,
@@ -1014,15 +1206,29 @@ fn request_has_image(req: &CanonicalRequest) -> bool {
         .any(|b| matches!(b, ContentBlock::Image(_)))
 }
 
-struct StreamLogger {
+/// Plan 07 P04 T6/T7: universal H7 guard. Fires `run_on_response_complete`
+/// on the registry when the SSE stream finishes (or is dropped early by
+/// client disconnect). Replaces the Anthropic-only `StreamLogger` of v0.6
+/// — wiring for the registry/route/ctx happens in T7, so the new fields
+/// are `Option<_>` for now (None == log only, no H7 invocation).
+///
+/// The structured-log line (today's "← {label} (stream) | ..." emission)
+/// remains; it's folded into the Drop alongside the H7 firing so both
+/// happen at the same lifecycle point.
+struct H7Guard {
     endpoint_label: &'static str,
     model_alias: String,
     upstream_model: String,
     usage: Arc<Mutex<Option<Usage>>>,
     started: std::time::Instant,
+    /// `None` means "log only, no H7 invocation" — T6 ships this state.
+    /// T7 wires the registry/route/ctx for production callers.
+    registry: Option<Arc<agent_shim_plugins::PluginRegistry>>,
+    route: Option<(agent_shim_core::FrontendKind, String)>,
+    ctx: Option<agent_shim_plugins::PluginContext>,
 }
 
-impl Drop for StreamLogger {
+impl Drop for H7Guard {
     fn drop(&mut self) {
         let u = self.usage.lock().clone();
         let (input, output) = match u {
@@ -1032,6 +1238,7 @@ impl Drop for StreamLogger {
             ),
             None => (0, 0),
         };
+        let elapsed = self.started.elapsed();
         tracing::info!(
             "← {} (stream) | model: {} → {} | input: {} | output: {} | {:.1}s",
             self.endpoint_label,
@@ -1039,14 +1246,24 @@ impl Drop for StreamLogger {
             self.upstream_model,
             input,
             output,
-            self.started.elapsed().as_secs_f64()
+            elapsed.as_secs_f64()
         );
+        if let (Some(registry), Some(route), Some(ctx)) =
+            (self.registry.take(), self.route.take(), self.ctx.take())
+        {
+            let summary = agent_shim_plugins::ResponseSummary {
+                usage: u,
+                elapsed_ms: elapsed.as_millis() as u64,
+                upstream_status: agent_shim_plugins::UpstreamStatus::Success,
+            };
+            registry.run_on_response_complete((route.0, route.1.as_str()), ctx, summary);
+        }
     }
 }
 
 struct GuardedStream<S> {
     inner: S,
-    _logger: StreamLogger,
+    _guard: H7Guard,
 }
 
 impl<S: futures::Stream + Unpin> futures::Stream for GuardedStream<S> {

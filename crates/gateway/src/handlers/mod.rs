@@ -93,6 +93,22 @@ pub enum HandlerError {
     /// failure mode, not the presented value.
     #[error("authentication required")]
     Unauthorized { kind: FrontendKind },
+    /// Plan 07 P04: a plugin returned an error and `on_error: fail` (or
+    /// the error was `Aborted` / `ProtectedFieldMutated`, both of which
+    /// always propagate). `aborted` distinguishes the 400 case (plugin
+    /// chose to reject the request) from the 502 case (plugin or
+    /// gateway-side failure).
+    ///
+    /// `plugin` and `hook` are operator-facing diagnostic strings; both
+    /// appear in the error envelope's `message` field so operators can
+    /// trace which hook failed.
+    #[error("plugin `{plugin}` failed on hook `{hook}` (aborted={aborted})")]
+    PluginFailed {
+        kind: FrontendKind,
+        plugin: String,
+        hook: &'static str,
+        aborted: bool,
+    },
 }
 
 impl HandlerError {
@@ -333,6 +349,38 @@ impl IntoResponse for HandlerError {
             return resp;
         }
 
+        // Plan 07 P04: a plugin's error surfaces here as one of:
+        // - aborted=true: HTTP 400 (plugin chose to reject — user error).
+        // - aborted=false: HTTP 502 (plugin/gateway failure, transient
+        //   or otherwise).
+        // Envelope shape mirrors `CapabilityMismatch` / `Unauthorized` —
+        // dialect-specific JSON keyed off the carried `FrontendKind`.
+        if let HandlerError::PluginFailed { kind, aborted, .. } = &self {
+            let message = self.to_string(); // includes plugin + hook
+            let body = match kind {
+                FrontendKind::AnthropicMessages => serde_json::json!({
+                    "type": "error",
+                    "error": {
+                        "type": if *aborted { "invalid_request_error" } else { "api_error" },
+                        "message": message,
+                    },
+                }),
+                FrontendKind::OpenAiChat | FrontendKind::OpenAiResponses => serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": if *aborted { "invalid_request_error" } else { "api_error" },
+                        "code": if *aborted { "plugin_aborted" } else { "plugin_failed" },
+                    },
+                }),
+            };
+            let status = if *aborted {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            return (status, axum::Json(body)).into_response();
+        }
+
         // Resilience variants (P02 T5): they all carry `kind` so the body
         // can be shaped per-dialect. They share the structure of pulling
         // out the kind, picking a status, building the dialect body, and
@@ -530,4 +578,47 @@ pub(crate) async fn collect_stream(
         stop_sequence,
         usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Plan 07 P04 T5: HandlerError::PluginFailed envelope rendering ───────
+
+    #[test]
+    fn plugin_failed_aborted_renders_400_anthropic_envelope() {
+        let err = HandlerError::PluginFailed {
+            kind: FrontendKind::AnthropicMessages,
+            plugin: "p".to_string(),
+            hook: "on_decoded_request",
+            aborted: true,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn plugin_failed_not_aborted_renders_502_openai_chat_envelope() {
+        let err = HandlerError::PluginFailed {
+            kind: FrontendKind::OpenAiChat,
+            plugin: "p".to_string(),
+            hook: "on_resolved",
+            aborted: false,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn plugin_failed_aborted_renders_400_openai_responses_envelope() {
+        let err = HandlerError::PluginFailed {
+            kind: FrontendKind::OpenAiResponses,
+            plugin: "scrubber".to_string(),
+            hook: "on_decoded_request",
+            aborted: true,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

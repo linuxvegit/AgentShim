@@ -16,6 +16,7 @@ dependencies = [
  "agent-shim-core",
  "agent-shim-frontends",
  "agent-shim-observability",
+ "agent-shim-plugins",
  "agent-shim-providers",
  "agent-shim-router",
  "agent-shim-tokens",

@@ -113,6 +113,12 @@ pub struct AppCore {
     /// `/admin/reload` clones this sender.
     #[allow(dead_code)]
     pub reload_tx: tokio::sync::mpsc::Sender<crate::reload_trigger::ReloadRequest>,
+    /// Plan 07 P04: plugin registry. Built once at startup; reload-time
+    /// hot-swapping lands in P07. For now `PluginRegistry::empty()` is
+    /// the always-true default (no config crate path wires plugins
+    /// through yet — that's P06). Consumed by the H2/H3/H5/H7 anchor
+    /// points in `pipeline::dispatch_inner` / `run_stream` / `run_unary`.
+    pub plugins: Arc<agent_shim_plugins::PluginRegistry>,
 }
 
 /// Hot-swappable policy-bearing snapshot. Plan 04 will swap this on
@@ -158,7 +164,12 @@ impl AppState {
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
     ) {
-        Self::build(config, Arc::new(SystemClock)).await
+        Self::build(
+            config,
+            Arc::new(SystemClock),
+            Arc::new(agent_shim_plugins::PluginRegistry::empty()),
+        )
+        .await
     }
 
     /// Test-only constructor that lets tests inject a custom `Clock` into
@@ -182,17 +193,45 @@ impl AppState {
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
     ) {
-        Self::build(config, clock).await
+        Self::build(
+            config,
+            clock,
+            Arc::new(agent_shim_plugins::PluginRegistry::empty()),
+        )
+        .await
     }
 
-    /// Shared construction path for `new` and `new_with_clock`. The only
-    /// thing the two callers parameterize is the `Clock` handed to
-    /// `BreakerRegistry::new` — everything else (provider registry,
-    /// resolver, frontend handlers) is identical, so extracting this
-    /// helper keeps the two public constructors as one-liners.
+    /// Plan 07 P04 T12: integration-test-only constructor that lets tests
+    /// inject a custom `PluginRegistry` (instead of the default
+    /// `empty()`). Same shape as `new_with_clock`. Production callers
+    /// MUST use `AppState::new`.
+    ///
+    /// `#[allow(dead_code)]` because integration tests in
+    /// `crates/gateway/tests/` are a separate compilation unit; the
+    /// library build proper does not call this constructor and would
+    /// otherwise warn under `-D warnings`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub async fn new_with_plugins(
+        config: agent_shim_config::GatewayConfig,
+        plugins: Arc<agent_shim_plugins::PluginRegistry>,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
+    ) {
+        Self::build(config, Arc::new(SystemClock), plugins).await
+    }
+
+    /// Shared construction path for `new`, `new_with_clock`, and
+    /// `new_with_plugins`. The callers parameterize the `Clock` handed to
+    /// `BreakerRegistry::new` and the `PluginRegistry` placed on
+    /// `AppCore`; everything else (provider registry, resolver, frontend
+    /// handlers) is identical, so extracting this helper keeps the
+    /// public constructors as one-liners.
     async fn build(
         config: agent_shim_config::GatewayConfig,
         clock: Arc<dyn Clock>,
+        plugins: Arc<agent_shim_plugins::PluginRegistry>,
     ) -> (
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
@@ -358,6 +397,7 @@ impl AppState {
             limiter_registry,
             metrics,
             reload_tx,
+            plugins,
         };
 
         (

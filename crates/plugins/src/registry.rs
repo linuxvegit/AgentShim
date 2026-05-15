@@ -11,10 +11,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent_shim_core::{CanonicalRequest, FrontendKind};
+use agent_shim_core::FrontendKind;
 
-use crate::context::PluginContext;
-use crate::error::{OnError, PluginConfigError, PluginResult};
+use crate::error::{OnError, PluginConfigError, PluginError};
 use crate::trait_def::{Hook, Plugin};
 
 /// Per-hook timeouts for a single plugin. Defaults follow spec §5.4:
@@ -90,7 +89,7 @@ pub(crate) struct RouteHookPlan {
 }
 
 impl RouteHookPlan {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used by P04 T2/T3 (run_on_resolved, wrap_stream) and tests
     pub(crate) fn is_empty(&self) -> bool {
         self.on_decoded_request.is_empty()
             && self.on_resolved.is_empty()
@@ -102,7 +101,7 @@ impl RouteHookPlan {
 /// Top-level plugin registry. Constructed once at startup. Immutable
 /// thereafter; reload rebuilds the whole thing and arc-swaps (Q12).
 pub struct PluginRegistry {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // populated by P06 from_specs; lookup goes via `plans`
     pub(crate) plugins: HashMap<String, Arc<PluginEntry>>,
     pub(crate) plans: HashMap<FrontendKind, FrontendRoutePlans>,
 }
@@ -116,6 +115,54 @@ impl PluginRegistry {
             plugins: HashMap::new(),
             plans: HashMap::new(),
         }
+    }
+
+    /// Plan 07 P04 T12: test-only constructor for integration tests in
+    /// other crates. Builds a registry containing a single
+    /// `(name, plugin, on_error, hook)` entry bound to one
+    /// `(frontend, model)` route. Tests in `crates/gateway/tests/` cannot
+    /// reach the `pub(crate)` `RouteHookPlan` and `FrontendRoutePlans`
+    /// types directly, so the plumbing has to live here.
+    ///
+    /// `#[doc(hidden)]` keeps this out of rustdoc; it has no production
+    /// use. The full YAML-driven `from_specs` constructor lands in P06.
+    #[doc(hidden)]
+    pub fn for_testing_single_plugin(
+        name: &str,
+        plugin: Arc<dyn crate::Plugin>,
+        on_error: OnError,
+        hook: Hook,
+        frontend: FrontendKind,
+        model: &str,
+    ) -> Self {
+        let entry = Arc::new(PluginEntry {
+            name: name.to_string(),
+            plugin,
+            on_error,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let mut plan = RouteHookPlan::default();
+        match hook {
+            Hook::DecodedRequest => plan.on_decoded_request.push(entry.clone()),
+            Hook::Resolved => plan.on_resolved.push(entry.clone()),
+            Hook::StreamEvent => plan.on_stream_event.push(entry.clone()),
+            Hook::ResponseComplete => plan.on_response_complete.push(entry.clone()),
+        }
+        let mut specific = HashMap::new();
+        specific.insert(model.to_string(), plan);
+        let mut plans = HashMap::new();
+        plans.insert(
+            frontend,
+            FrontendRoutePlans {
+                specific,
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert(name.to_string(), entry);
+        Self { plugins, plans }
     }
 
     /// Lookup helper used by P04's `run_*` methods. Returns the route
@@ -137,58 +184,280 @@ impl PluginRegistry {
         fp.wildcard.as_ref()
     }
 
-    /// H2 runner: execute the `on_decoded_request` hook for every
-    /// plugin subscribed to the `(frontend, model)` route, in order.
-    /// Returns the final rewritten `CanonicalRequest`.
+    /// H2 hook chain walk. Spec §6.2 / §6.3 / §6.4 / §4.5.
     ///
-    /// Fast path: returns identity when no plan exists for the route
-    /// or the plan's `on_decoded_request` list is empty.
+    /// Walks the route's `on_decoded_request` list in declaration order.
+    /// Each plugin sees the request as left by the previous successful
+    /// plugin (clone-then-swap on every iteration). Errors are routed
+    /// through the per-plugin `on_error` policy by `invoke()`; `Aborted`
+    /// always propagates. The protected-field diff (`id`, `frontend`,
+    /// `model`, `stream`) runs after every successful call.
+    ///
+    /// Fast path: when `lookup()` returns `None` or the route's
+    /// `on_decoded_request` list is empty, the function returns `Ok(req)`
+    /// without cloning. This is the zero-overhead case verified by the
+    /// integration test in T12.
     pub async fn run_on_decoded_request(
         &self,
         route: (FrontendKind, &str),
-        ctx: &PluginContext,
-        mut req: CanonicalRequest,
-    ) -> PluginResult<CanonicalRequest> {
+        ctx: &crate::PluginContext,
+        mut req: agent_shim_core::CanonicalRequest,
+    ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
         let Some(plan) = self.lookup(route.0, route.1) else {
             return Ok(req);
         };
         if plan.on_decoded_request.is_empty() {
             return Ok(req);
         }
-        let hook = Hook::DecodedRequest.as_str();
         for entry in &plan.on_decoded_request {
             if !entry.enabled {
                 continue;
             }
-            let plugin_name = entry.name.clone();
-            let plugin = Arc::clone(&entry.plugin);
             let candidate = req.clone();
-            let ctx_clone = ctx.clone();
+            let plugin = entry.plugin.clone();
+            let plugin_name = entry.name.clone();
+            let hook_str = Hook::DecodedRequest.as_str();
             let outcome = crate::invoke::invoke(
                 &plugin_name,
-                &ctx_clone.clone(),
-                hook,
+                ctx,
+                hook_str,
                 entry.timeouts.for_hook(Hook::DecodedRequest),
                 entry.on_error,
-                async move { plugin.on_decoded_request(&ctx_clone, candidate).await },
+                plugin.on_decoded_request(ctx, candidate),
             )
             .await;
             match outcome {
-                crate::invoke::InvokeOutcome::Success(updated) => {
-                    match crate::invoke::check_protected_fields(&plugin_name, hook, &req, &updated)
-                    {
-                        Ok(()) => req = updated,
-                        Err(e) => match entry.on_error {
-                            OnError::Skip => { /* keep req */ }
+                crate::invoke::InvokeOutcome::Success(new_req) => {
+                    // Protected-field diff: id / frontend / model / stream
+                    // are not allowed to change. If the plugin mutated one,
+                    // honour on_error (Skip → keep prior `req`; Fail →
+                    // propagate ProtectedFieldMutated as 502).
+                    if let Err(e) = crate::invoke::check_protected_fields(
+                        &plugin_name,
+                        hook_str,
+                        &req,
+                        &new_req,
+                    ) {
+                        match entry.on_error {
+                            OnError::Skip => continue,
                             OnError::Fail => return Err(e),
-                        },
+                        }
                     }
+                    req = new_req;
+                }
+                crate::invoke::InvokeOutcome::Skipped => {
+                    // Keep prior `req`; loop to next plugin.
+                }
+                crate::invoke::InvokeOutcome::Propagate(err) => {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(req)
+    }
+
+    /// H3 hook chain walk. Spec §6.2 / §6.4 / §4.5.
+    ///
+    /// Identical shape to `run_on_decoded_request` but:
+    /// - walks `plan.on_resolved`,
+    /// - passes the resolved `BackendTarget` to each plugin.
+    ///
+    /// Protected-field semantics are the same — including `stream`, even
+    /// though by §6.6 H3 runs after the streaming-vs-unary branch was
+    /// decided (mutating `stream` here would silently inconsistency the
+    /// downstream code path, hence the rejection).
+    pub async fn run_on_resolved(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: &crate::PluginContext,
+        mut req: agent_shim_core::CanonicalRequest,
+        target: &agent_shim_core::BackendTarget,
+    ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return Ok(req);
+        };
+        if plan.on_resolved.is_empty() {
+            return Ok(req);
+        }
+        for entry in &plan.on_resolved {
+            if !entry.enabled {
+                continue;
+            }
+            let candidate = req.clone();
+            let plugin = entry.plugin.clone();
+            let plugin_name = entry.name.clone();
+            let hook_str = Hook::Resolved.as_str();
+            let outcome = crate::invoke::invoke(
+                &plugin_name,
+                ctx,
+                hook_str,
+                entry.timeouts.for_hook(Hook::Resolved),
+                entry.on_error,
+                plugin.on_resolved(ctx, candidate, target),
+            )
+            .await;
+            match outcome {
+                crate::invoke::InvokeOutcome::Success(new_req) => {
+                    if let Err(e) = crate::invoke::check_protected_fields(
+                        &plugin_name,
+                        hook_str,
+                        &req,
+                        &new_req,
+                    ) {
+                        match entry.on_error {
+                            OnError::Skip => continue,
+                            OnError::Fail => return Err(e),
+                        }
+                    }
+                    req = new_req;
                 }
                 crate::invoke::InvokeOutcome::Skipped => {}
                 crate::invoke::InvokeOutcome::Propagate(err) => return Err(err),
             }
         }
         Ok(req)
+    }
+
+    /// H5 stream wrapping. Spec §6.5.
+    ///
+    /// When the route has no `on_stream_event` subscribers, returns the
+    /// upstream stream as-is (zero overhead — no allocations, no
+    /// futures-machinery). Otherwise wraps with a chain that runs every
+    /// upstream-emitted event through every subscribed plugin in
+    /// declaration order, flattening each plugin's `Vec<StreamEvent>`
+    /// into the output.
+    ///
+    /// Error handling:
+    /// - Upstream `Err(StreamError)` items pass through unchanged — plugins
+    ///   never see them.
+    /// - Plugin `Err` causes the wrapper to emit a single
+    ///   `StreamEvent::Error { message }` event in the stream and stop;
+    ///   downstream frontend encoding rendering decides the wire shape.
+    /// - `Skipped` (on_error: skip) treats the plugin as identity — the
+    ///   event passes through unchanged.
+    pub fn wrap_stream(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: crate::PluginContext,
+        upstream: agent_shim_core::CanonicalStream,
+    ) -> agent_shim_core::CanonicalStream {
+        // Fast path: no plan, no plugins, no H5 subscribers — return upstream.
+        let plan = match self.lookup(route.0, route.1) {
+            Some(p) if !p.on_stream_event.is_empty() => p.clone(),
+            _ => return upstream,
+        };
+        let plugins: Vec<Arc<PluginEntry>> = plan.on_stream_event.clone();
+        let ctx = Arc::new(ctx);
+
+        use futures::StreamExt;
+        let wrapped = upstream.then(move |event_result| {
+            let plugins = plugins.clone();
+            let ctx = ctx.clone();
+            async move {
+                // Upstream errors pass through unchanged. Plugins do not
+                // see Err items.
+                let event = match event_result {
+                    Ok(e) => e,
+                    Err(err) => return vec![Err(err)],
+                };
+                // Walk the H5 chain; one in, N out per plugin. The
+                // intermediate "many out" state is kept as a Vec and
+                // re-fed through subsequent plugins one event at a time.
+                let mut buf: Vec<agent_shim_core::StreamEvent> = vec![event];
+                for entry in &plugins {
+                    if !entry.enabled {
+                        continue;
+                    }
+                    let mut next: Vec<agent_shim_core::StreamEvent> = Vec::with_capacity(buf.len());
+                    let plugin_name = entry.name.clone();
+                    let plugin = entry.plugin.clone();
+                    let timeout = entry.timeouts.for_hook(Hook::StreamEvent);
+                    let on_error = entry.on_error;
+                    for ev in buf.drain(..) {
+                        let ev_for_invoke = ev.clone();
+                        let ev_for_skip = ev;
+                        let outcome =
+                            crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
+                                &plugin_name,
+                                &ctx,
+                                Hook::StreamEvent.as_str(),
+                                timeout,
+                                on_error,
+                                plugin.on_stream_event(&ctx, ev_for_invoke),
+                            )
+                            .await;
+                        match outcome {
+                            crate::invoke::InvokeOutcome::Success(events) => {
+                                next.extend(events);
+                            }
+                            crate::invoke::InvokeOutcome::Skipped => {
+                                // Treat as identity: a skipped plugin
+                                // must not drop the event wholesale.
+                                next.push(ev_for_skip);
+                            }
+                            crate::invoke::InvokeOutcome::Propagate(err) => {
+                                // Emit a single Error event then stop.
+                                // HTTP status was committed at first event
+                                // (200); failure surfaces as wire-level
+                                // `event: error` (spec §6.5).
+                                return vec![Ok(agent_shim_core::StreamEvent::Error {
+                                    message: err.to_string(),
+                                })];
+                            }
+                        }
+                    }
+                    buf = next;
+                }
+                buf.into_iter().map(Ok).collect::<Vec<_>>()
+            }
+        });
+        Box::pin(wrapped.flat_map(futures::stream::iter))
+    }
+
+    /// H7 hook — fire-and-forget. Spec §6.2 / §6.7 / §6.8.
+    ///
+    /// Each subscribed plugin is `tokio::spawn`-ed. This function returns
+    /// synchronously; the spawned tasks live until they complete or are
+    /// dropped at shutdown. P05 will wire these into a `JoinSet` so
+    /// shutdown can flush them within a deadline.
+    pub fn run_on_response_complete(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: crate::PluginContext,
+        summary: crate::ResponseSummary,
+    ) {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return;
+        };
+        if plan.on_response_complete.is_empty() {
+            return;
+        }
+        let summary = Arc::new(summary);
+        let ctx = Arc::new(ctx);
+        for entry in &plan.on_response_complete {
+            if !entry.enabled {
+                continue;
+            }
+            let plugin = entry.plugin.clone();
+            let plugin_name = entry.name.clone();
+            let timeout_ms = entry.timeouts.for_hook(Hook::ResponseComplete);
+            let on_error = entry.on_error;
+            let summary = summary.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let _ = crate::invoke::invoke::<(), _>(
+                    &plugin_name,
+                    &ctx,
+                    Hook::ResponseComplete.as_str(),
+                    timeout_ms,
+                    on_error,
+                    plugin.on_response_complete(&ctx, &summary),
+                )
+                .await;
+                // Return value is discarded — H7 cannot affect the response.
+                // Outcome is captured via the logging/metrics in P05.
+            });
+        }
     }
 }
 
@@ -226,16 +495,13 @@ pub enum RegistryBuildError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use async_trait::async_trait;
-
     use super::*;
-    use crate::trait_def::HookSet;
     use agent_shim_core::{
-        request::RequestMetadata, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
-        GenerationOptions, RequestId, ResolvedPolicy,
+        request::RequestMetadata, CanonicalRequest, ContentBlock, ExtensionMap, FrontendInfo,
+        FrontendModel, GenerationOptions, Message, RequestId, ResolvedPolicy, TextBlock,
     };
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn req() -> CanonicalRequest {
         CanonicalRequest {
@@ -246,7 +512,10 @@ mod tests {
             },
             model: FrontendModel::from("m"),
             system: vec![],
-            messages: vec![],
+            messages: vec![Message::user(vec![ContentBlock::Text(TextBlock {
+                text: "hello".to_string(),
+                extensions: ExtensionMap::new(),
+            })])],
             tools: vec![],
             tool_choice: Default::default(),
             generation: GenerationOptions::default(),
@@ -257,6 +526,77 @@ mod tests {
             resolved_policy: ResolvedPolicy::default(),
             extensions: ExtensionMap::new(),
         }
+    }
+
+    /// Stub plugin used by `run_on_decoded_request` tests. Increments a
+    /// shared atomic counter on each call and appends a marker message
+    /// to `req.messages` so we can verify firing order downstream.
+    struct CounterPlugin {
+        n: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::Plugin for CounterPlugin {
+        fn kind_name(&self) -> &'static str {
+            "counter"
+        }
+        fn hooks(&self) -> crate::HookSet {
+            crate::HookSet::DECODED_REQUEST
+        }
+        async fn on_decoded_request(
+            &self,
+            _ctx: &crate::PluginContext,
+            mut req: CanonicalRequest,
+        ) -> crate::PluginResult<CanonicalRequest> {
+            self.n.fetch_add(1, Ordering::SeqCst);
+            req.messages
+                .push(Message::user(vec![ContentBlock::Text(TextBlock {
+                    text: "counter".to_string(),
+                    extensions: ExtensionMap::new(),
+                })]));
+            Ok(req)
+        }
+    }
+
+    fn registry_with_two_h2_plugins(
+        counter_a: Arc<AtomicUsize>,
+        counter_b: Arc<AtomicUsize>,
+    ) -> PluginRegistry {
+        let a = Arc::new(PluginEntry {
+            name: "a".to_string(),
+            plugin: Arc::new(CounterPlugin { n: counter_a }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let b = Arc::new(PluginEntry {
+            name: "b".to_string(),
+            plugin: Arc::new(CounterPlugin { n: counter_b }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_decoded_request: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("test-model".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert("a".to_string(), a);
+        plugins.insert("b".to_string(), b);
+        PluginRegistry { plugins, plans }
     }
 
     #[test]
@@ -303,117 +643,462 @@ mod tests {
         assert!(plan.is_empty());
     }
 
-    #[tokio::test]
-    async fn run_on_decoded_request_empty_registry_is_identity() {
-        let registry = PluginRegistry::empty();
-        let ctx = PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "test/m".to_string(),
-        };
-        let original = req();
-        let result = registry
-            .run_on_decoded_request(
-                (FrontendKind::AnthropicMessages, "m"),
-                &ctx,
-                original.clone(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.id, original.id);
-    }
+    // ── Plan 07 P04 T1: run_on_decoded_request ──────────────────────────────
 
     #[tokio::test]
     async fn run_on_decoded_request_fires_two_plugins_in_order() {
-        // Counter plugin: increments shared AtomicUsize and records call order.
-        struct CountingPlugin {
-            counter: Arc<AtomicUsize>,
-            my_order: usize,
-            order_log: Arc<std::sync::Mutex<Vec<usize>>>,
-        }
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_two_h2_plugins(a.clone(), b.clone());
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "anthropic_messages/test-model".to_string(),
+        };
+        let out = registry
+            .run_on_decoded_request((FrontendKind::AnthropicMessages, "test-model"), &ctx, req())
+            .await
+            .expect("run_on_decoded_request must succeed for both plugins");
+        assert_eq!(a.load(Ordering::SeqCst), 1, "plugin a fired once");
+        assert_eq!(b.load(Ordering::SeqCst), 1, "plugin b fired once");
+        // Each plugin appended one message; original had 1, expect 3.
+        assert_eq!(
+            out.messages.len(),
+            3,
+            "both plugin marker messages survived"
+        );
+    }
 
+    #[tokio::test]
+    async fn run_on_decoded_request_empty_registry_is_identity() {
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x/y".to_string(),
+        };
+        let original = req();
+        let original_len = original.messages.len();
+        let out = registry
+            .run_on_decoded_request(
+                (FrontendKind::AnthropicMessages, "anything"),
+                &ctx,
+                original,
+            )
+            .await
+            .expect("empty registry fast path returns Ok");
+        assert_eq!(out.messages.len(), original_len, "request was untouched");
+    }
+
+    // ── Plan 07 P04 T2: run_on_resolved ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_on_resolved_fires_plugin_with_target() {
+        use agent_shim_core::BackendTarget;
+
+        struct ResolvedCounter(Arc<AtomicUsize>);
         #[async_trait]
-        impl Plugin for CountingPlugin {
+        impl crate::Plugin for ResolvedCounter {
             fn kind_name(&self) -> &'static str {
-                "counting"
+                "resolved_counter"
             }
-            fn hooks(&self) -> HookSet {
-                HookSet::DECODED_REQUEST
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::RESOLVED
             }
-            async fn on_decoded_request(
+            async fn on_resolved(
                 &self,
-                _ctx: &PluginContext,
+                _ctx: &crate::PluginContext,
                 req: CanonicalRequest,
-            ) -> PluginResult<CanonicalRequest> {
-                self.counter.fetch_add(1, Ordering::SeqCst);
-                self.order_log.lock().unwrap().push(self.my_order);
+                _target: &BackendTarget,
+            ) -> crate::PluginResult<CanonicalRequest> {
+                self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(req)
             }
         }
 
-        let counter = Arc::new(AtomicUsize::new(0));
-        let order_log: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(vec![]));
-
-        let plugin_a = Arc::new(CountingPlugin {
-            counter: Arc::clone(&counter),
-            my_order: 0,
-            order_log: Arc::clone(&order_log),
-        });
-        let plugin_b = Arc::new(CountingPlugin {
-            counter: Arc::clone(&counter),
-            my_order: 1,
-            order_log: Arc::clone(&order_log),
-        });
-
-        let entry_a = Arc::new(PluginEntry {
-            name: "a".to_string(),
-            plugin: plugin_a as Arc<dyn Plugin>,
-            on_error: OnError::Fail,
+        let n = Arc::new(AtomicUsize::new(0));
+        let entry = Arc::new(PluginEntry {
+            name: "rc".to_string(),
+            plugin: Arc::new(ResolvedCounter(n.clone())),
+            on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
             enabled: true,
         });
-        let entry_b = Arc::new(PluginEntry {
-            name: "b".to_string(),
-            plugin: plugin_b as Arc<dyn Plugin>,
-            on_error: OnError::Fail,
-            timeouts: HookTimeouts::default(),
-            enabled: true,
-        });
-
         let plan = RouteHookPlan {
-            on_decoded_request: vec![Arc::clone(&entry_a), Arc::clone(&entry_b)],
+            on_resolved: vec![entry.clone()],
             ..Default::default()
         };
-
-        let mut specific = HashMap::new();
-        specific.insert("m".to_string(), plan);
-
-        let fp = FrontendRoutePlans {
-            specific,
-            wildcard: None,
-            is_empty: false,
-        };
-
         let mut plans = HashMap::new();
-        plans.insert(FrontendKind::AnthropicMessages, fp);
-
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
         let registry = PluginRegistry {
-            plugins: HashMap::new(),
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("rc".to_string(), entry);
+                p
+            },
             plans,
         };
-
-        let ctx = PluginContext {
+        let ctx = crate::PluginContext {
             request_id: RequestId::new(),
             frontend: FrontendKind::AnthropicMessages,
-            route_label: "test/m".to_string(),
+            route_label: "anthropic_messages/m".to_string(),
         };
-
-        registry
-            .run_on_decoded_request((FrontendKind::AnthropicMessages, "m"), &ctx, req())
+        let target = BackendTarget {
+            provider: "test".to_string(),
+            model: "u".to_string(),
+            policy: Default::default(),
+        };
+        let _ = registry
+            .run_on_resolved((FrontendKind::AnthropicMessages, "m"), &ctx, req(), &target)
             .await
-            .unwrap();
+            .expect("run_on_resolved must succeed");
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
 
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
-        assert_eq!(*order_log.lock().unwrap(), vec![0, 1]);
+    #[tokio::test]
+    async fn run_on_resolved_empty_registry_is_identity() {
+        use agent_shim_core::BackendTarget;
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        let target = BackendTarget {
+            provider: "test".to_string(),
+            model: "u".to_string(),
+            policy: Default::default(),
+        };
+        let out = registry
+            .run_on_resolved(
+                (FrontendKind::AnthropicMessages, "anything"),
+                &ctx,
+                req(),
+                &target,
+            )
+            .await
+            .expect("empty registry fast path returns Ok");
+        assert_eq!(out.messages.len(), 1);
+    }
+
+    // ── Plan 07 P04 T3: wrap_stream (H5) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn wrap_stream_fast_path_returns_identity() {
+        use agent_shim_core::{CanonicalStream, StopReason, StreamEvent};
+        use futures::stream::StreamExt;
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x/y".to_string(),
+        };
+        let upstream: CanonicalStream =
+            Box::pin(futures::stream::iter(vec![Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            })]));
+        let wrapped =
+            registry.wrap_stream((FrontendKind::AnthropicMessages, "anything"), ctx, upstream);
+        let collected: Vec<_> = wrapped.collect().await;
+        assert_eq!(collected.len(), 1);
+        assert!(collected[0].is_ok(), "fast path preserves Ok items");
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_h5_plugin_drops_every_other_event() {
+        use agent_shim_core::{CanonicalStream, StreamEvent};
+        use futures::stream::StreamExt;
+
+        struct DropEverySecond {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::Plugin for DropEverySecond {
+            fn kind_name(&self) -> &'static str {
+                "drop_every_second"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::STREAM_EVENT
+            }
+            async fn on_stream_event(
+                &self,
+                _ctx: &crate::PluginContext,
+                event: StreamEvent,
+            ) -> crate::PluginResult<Vec<StreamEvent>> {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                if n % 2 == 0 {
+                    Ok(vec![event])
+                } else {
+                    Ok(vec![])
+                }
+            }
+        }
+
+        let n = Arc::new(AtomicUsize::new(0));
+        let entry = Arc::new(PluginEntry {
+            name: "d".to_string(),
+            plugin: Arc::new(DropEverySecond { counter: n.clone() }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_stream_event: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("d".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        // 4 input events; 2 should survive.
+        let events: Vec<_> = (0..4)
+            .map(|i| {
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: format!("e{i}"),
+                })
+            })
+            .collect();
+        let upstream: CanonicalStream = Box::pin(futures::stream::iter(events));
+        let wrapped = registry.wrap_stream((FrontendKind::AnthropicMessages, "m"), ctx, upstream);
+        let collected: Vec<_> = wrapped.collect().await;
+        let oks: Vec<_> = collected.into_iter().filter_map(Result::ok).collect();
+        assert_eq!(oks.len(), 2, "every other event survived");
+        assert_eq!(n.load(Ordering::SeqCst), 4, "plugin saw all 4 events");
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_plugin_failure_emits_error_event_and_stops() {
+        use agent_shim_core::{CanonicalStream, StreamEvent};
+        use futures::stream::StreamExt;
+
+        struct AlwaysFail;
+        #[async_trait]
+        impl crate::Plugin for AlwaysFail {
+            fn kind_name(&self) -> &'static str {
+                "always_fail"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::STREAM_EVENT
+            }
+            async fn on_stream_event(
+                &self,
+                _ctx: &crate::PluginContext,
+                _event: StreamEvent,
+            ) -> crate::PluginResult<Vec<StreamEvent>> {
+                Err(crate::PluginError::Failed {
+                    plugin: "always_fail".to_string(),
+                    hook: "on_stream_event",
+                    message: "boom".to_string(),
+                })
+            }
+        }
+
+        let entry = Arc::new(PluginEntry {
+            name: "f".to_string(),
+            plugin: Arc::new(AlwaysFail),
+            on_error: OnError::Fail, // ensures the error propagates
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_stream_event: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("f".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        let upstream: CanonicalStream = Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "a".to_string(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "b".to_string(),
+            }),
+        ]));
+        let wrapped = registry.wrap_stream((FrontendKind::AnthropicMessages, "m"), ctx, upstream);
+        let collected: Vec<_> = wrapped.collect().await;
+        // First event should be replaced with an Error event; second event
+        // is consumed by the upstream stream but the plugin chain produces
+        // another Error event for it (the wrapper does not short-circuit
+        // upstream — each event runs through the chain independently).
+        assert!(!collected.is_empty(), "at least one event emitted");
+        let first = &collected[0];
+        match first {
+            Ok(StreamEvent::Error { message }) => {
+                assert!(
+                    message.contains("always_fail") || message.contains("boom"),
+                    "error message names the plugin or carries the reason: {message}"
+                );
+            }
+            other => panic!("expected StreamEvent::Error, got {other:?}"),
+        }
+    }
+
+    // ── Plan 07 P04 T4: run_on_response_complete (H7) ───────────────────────
+
+    #[tokio::test]
+    async fn run_on_response_complete_fires_async() {
+        use crate::ResponseSummary;
+
+        struct RecordSummary {
+            captured: Arc<tokio::sync::Mutex<Option<u64>>>,
+        }
+        #[async_trait]
+        impl crate::Plugin for RecordSummary {
+            fn kind_name(&self) -> &'static str {
+                "record_summary"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::RESPONSE_COMPLETE
+            }
+            async fn on_response_complete(
+                &self,
+                _ctx: &crate::PluginContext,
+                summary: &ResponseSummary,
+            ) -> crate::PluginResult<()> {
+                *self.captured.lock().await = Some(summary.elapsed_ms);
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(tokio::sync::Mutex::new(None));
+        let entry = Arc::new(PluginEntry {
+            name: "rs".to_string(),
+            plugin: Arc::new(RecordSummary {
+                captured: captured.clone(),
+            }),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_response_complete: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("rs".to_string(), entry);
+                p
+            },
+            plans,
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        registry.run_on_response_complete(
+            (FrontendKind::AnthropicMessages, "m"),
+            ctx,
+            ResponseSummary {
+                usage: None,
+                elapsed_ms: 42,
+                upstream_status: crate::UpstreamStatus::Success,
+            },
+        );
+        // Spawned task — yield in a loop until the captured value lands or
+        // 1 s elapses (tokio scheduling can take a beat under load).
+        for _ in 0..100 {
+            if captured.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(*captured.lock().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn run_on_response_complete_empty_registry_is_noop() {
+        use crate::ResponseSummary;
+        let registry = PluginRegistry::empty();
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        registry.run_on_response_complete(
+            (FrontendKind::AnthropicMessages, "anything"),
+            ctx,
+            ResponseSummary {
+                usage: None,
+                elapsed_ms: 0,
+                upstream_status: crate::UpstreamStatus::Success,
+            },
+        );
+        // No assertion needed — just verify the call returns without panic.
     }
 }

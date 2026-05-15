@@ -47,6 +47,10 @@ Filename convention: `docs/superpowers/plans/2026-05-XX-phase-7-pNN-<short-slug>
 
 ## P04 — Pipeline integration
 
+**Status:** ✅ Promoted to full plan: [`2026-05-14-phase-7-p04-pipeline-integration.md`](2026-05-14-phase-7-p04-pipeline-integration.md)
+
+(Outline below preserved for context but superseded by the full plan.)
+
 **Source spec:** §6.2, §6.4, §6.5, §6.6, §6.7, §6.9.
 
 **Goal:** Wire `PluginRegistry::run_on_decoded_request` / `run_on_resolved` / `wrap_stream` / `run_on_response_complete` into `pipeline.rs::dispatch_inner` at the four documented anchor points. Add universal `H7Guard` covering all three streaming frontends. Add `HandlerError::PluginFailed` and its 400/502 mapping.
