@@ -210,6 +210,32 @@ pub struct ConfigReloadsTotal;
 )]
 pub struct CostFilteredTotal;
 
+// --- Plugin observability (Phase 7 P05) ---
+
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_invocations_total",
+    kind = "counter",
+    help = "Plugin hook invocations by kind, name, hook, outcome (Plan 07 P05)"
+)]
+pub struct PluginInvocationsTotal;
+
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_duration_seconds",
+    kind = "histogram",
+    help = "Plugin hook duration by kind, name, hook (Plan 07 P05)"
+)]
+pub struct PluginDurationSeconds;
+
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_h7_dropped_at_shutdown_total",
+    kind = "counter",
+    help = "H7 plugin tasks dropped at shutdown by plugin_name (Plan 07 P05)"
+)]
+pub struct PluginH7DroppedTotal;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,8 +249,8 @@ mod tests {
         let descriptors = iter_descriptors();
         assert_eq!(
             descriptors.len(),
-            15,
-            "expected 15 metric descriptors in catalog, got {}",
+            18,
+            "expected 18 metric descriptors in catalog, got {}",
             descriptors.len()
         );
     }
