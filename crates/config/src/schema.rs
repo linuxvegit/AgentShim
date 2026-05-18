@@ -33,6 +33,9 @@ pub struct GatewayConfig {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub otel: Option<OtelConfig>,
+    /// Shutdown lifecycle config. Phase 7 P05 §8.
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +160,29 @@ impl Default for OtelConfig {
             resource_attrs: BTreeMap::new(),
         }
     }
+}
+
+/// Shutdown lifecycle timing knobs. Phase 7 P05 §8 / Q8.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ShutdownConfig {
+    /// Seconds to wait for H7 (`on_response_complete`) plugin tasks to
+    /// complete during gateway shutdown before dropping them. Default 5.
+    /// Layer A validation rejects values > 300.
+    #[serde(default = "default_plugin_flush_secs")]
+    pub plugin_flush_secs: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            plugin_flush_secs: default_plugin_flush_secs(),
+        }
+    }
+}
+
+fn default_plugin_flush_secs() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1130,5 +1156,39 @@ file:
 "#;
         let result: Result<LoggingConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "unknown field should be rejected");
+    }
+
+    // ── Phase 7 P05 T10: ShutdownConfig ─────────────────────────────────────
+
+    #[test]
+    fn shutdown_default_when_absent() {
+        let yaml = "upstreams: {}\nroutes: []";
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.shutdown.plugin_flush_secs, 5);
+    }
+
+    #[test]
+    fn shutdown_explicit_value_parsed() {
+        let yaml = r#"
+upstreams: {}
+routes: []
+shutdown:
+  plugin_flush_secs: 30
+"#;
+        let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.shutdown.plugin_flush_secs, 30);
+    }
+
+    #[test]
+    fn shutdown_rejects_unknown_field() {
+        let yaml = r#"
+upstreams: {}
+routes: []
+shutdown:
+  plugin_flush_secs: 5
+  bogus_field: 1
+"#;
+        let r: Result<GatewayConfig, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err(), "deny_unknown_fields must reject `bogus_field`");
     }
 }

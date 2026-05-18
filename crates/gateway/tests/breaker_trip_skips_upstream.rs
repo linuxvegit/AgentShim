@@ -144,6 +144,7 @@ fn make_config(oai_a_url: &str, oai_b_url: &str) -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

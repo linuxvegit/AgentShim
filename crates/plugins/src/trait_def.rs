@@ -94,8 +94,12 @@ impl std::ops::BitOrAssign for HookSet {
 #[async_trait]
 pub trait Plugin: Send + Sync + 'static {
     /// Globally-unique kind name. Matches the YAML `type:` field.
-    /// Must be a `&'static str` so logs and spans can use it without
-    /// allocation.
+    ///
+    /// The returned value MUST be a string literal (`&'static str`
+    /// referring to constant data). DO NOT return `Box::leak`-derived
+    /// references — `PluginEntry.kind` caches this value and metric
+    /// labels rely on its stable identity for cardinality bounds
+    /// (P05 §7.4). Runtime-generated kind names are not supported.
     fn kind_name(&self) -> &'static str;
 
     /// Hook subset this instance subscribes to. Decided at construction

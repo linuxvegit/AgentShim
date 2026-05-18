@@ -176,6 +176,7 @@ fn make_app_state(
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     };
 
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));
@@ -427,6 +428,10 @@ async fn h7_plugin_fires_after_unary_response() {
         OnError::Skip,
         agent_shim_plugins::Hook::ResponseComplete,
     );
+    // Keep a strong Arc alive for the duration of the test. P05 routes H7
+    // tasks through the registry's supervisor JoinSet, so the registry must
+    // outlive the spawned H7 task or it gets aborted on drop.
+    let registry_keepalive = Arc::clone(&registry);
     let state = make_app_state(registry, provider_captured);
     let app = build_router(state);
 
@@ -451,6 +456,7 @@ async fn h7_plugin_fires_after_unary_response() {
         captured.lock().await.is_some(),
         "H7 plugin fired and recorded elapsed_ms"
     );
+    drop(registry_keepalive);
 }
 
 /// T12 §5: an H2 plugin returning `Aborted` produces HTTP 400 with the
