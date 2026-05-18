@@ -39,6 +39,11 @@ pub const CONFIG_RELOADS_TOTAL: &str = ConfigReloadsTotal::NAME;
 // --- Cost-aware routing (Phase 6 P04) ---
 pub const COST_FILTERED_TOTAL: &str = CostFilteredTotal::NAME;
 
+// --- Plugin observability (Phase 7 P05) ---
+pub const PLUGIN_INVOCATIONS_TOTAL: &str = PluginInvocationsTotal::NAME;
+pub const PLUGIN_DURATION_SECONDS: &str = PluginDurationSeconds::NAME;
+pub const PLUGIN_H7_DROPPED_TOTAL: &str = PluginH7DroppedTotal::NAME;
+
 #[cfg(test)]
 mod tests {
     use super::super::catalog;
