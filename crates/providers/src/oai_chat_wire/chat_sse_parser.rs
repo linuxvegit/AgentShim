@@ -51,8 +51,60 @@ where
                     );
                     Vec::new()
                 } else {
+                    // Walk the error chain so we can tell apart
+                    // (a) our own `read_timeout` tripping vs (b) the upstream
+                    // closing mid-stream (hyper `IncompleteMessage`) vs
+                    // (c) raw IO errors. The top-level Display on the
+                    // `EventStreamError<reqwest::Error>` is just "Transport
+                    // error: error decoding response body" and hides which
+                    // of these actually happened.
+                    //
+                    // Quirks:
+                    //   - `EventStreamError` does NOT implement `source()`
+                    //     (its `Error` impl is the default empty one), so
+                    //     we have to hand-match `Transport(inner)` to reach
+                    //     the wrapped `reqwest::Error`.
+                    //   - `reqwest::Error::is_timeout()` only fires for
+                    //     `Kind::Timeout` (total-request timeout), NOT for
+                    //     `Kind::Body` + `io::Error(TimedOut)` which is how
+                    //     our `read_timeout` actually surfaces. We detect
+                    //     that case by walking the reqwest error's source
+                    //     chain and downcasting to `io::Error`.
+                    let mut error_chain: Vec<String> = Vec::new();
+                    let mut reqwest_flags: Option<(bool, bool, bool, bool, bool)> = None;
+                    if let eventsource_stream::EventStreamError::Transport(ref re) = e {
+                        let mut src: Option<&dyn std::error::Error> = Some(re);
+                        let mut io_timed_out = false;
+                        while let Some(err) = src {
+                            error_chain.push(err.to_string());
+                            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                                if io_err.kind() == std::io::ErrorKind::TimedOut {
+                                    io_timed_out = true;
+                                }
+                            }
+                            src = err.source();
+                        }
+                        reqwest_flags = Some((
+                            re.is_timeout() || io_timed_out,
+                            re.is_connect(),
+                            re.is_body(),
+                            re.is_decode(),
+                            io_timed_out,
+                        ));
+                    } else {
+                        error_chain.push(e.to_string());
+                    }
+                    let (is_timeout, is_connect, is_body, is_decode, io_timed_out) =
+                        reqwest_flags.unwrap_or((false, false, false, false, false));
                     tracing::warn!(
                         error = %e,
+                        error_debug = ?e,
+                        error_chain = ?error_chain,
+                        is_timeout,
+                        is_connect,
+                        is_body,
+                        is_decode,
+                        io_timed_out,
                         debug_tag = "DEBUG-sse1",
                         event_count,
                         total_data_bytes,
