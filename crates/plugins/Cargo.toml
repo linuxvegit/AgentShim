@@ -28,4 +28,5 @@ tracing.workspace = true
 metrics-util = "0.17"
 pretty_assertions.workspace = true
 serde_yaml = "0.9"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }

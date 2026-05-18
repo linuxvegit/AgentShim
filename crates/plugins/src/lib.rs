@@ -15,6 +15,7 @@
 mod context;
 mod error;
 mod invoke;
+mod log_fields;
 mod registry;
 mod trait_def;
 

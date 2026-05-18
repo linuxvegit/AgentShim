@@ -62,6 +62,9 @@ impl HookTimeouts {
 /// One entry in the registry, plus the policy knobs bound to it.
 pub struct PluginEntry {
     pub name: String,
+    /// Cached `Plugin::kind_name()` value — `&'static str` literal.
+    /// Populated at construction. P05 §7.1 / Q1.
+    pub kind: &'static str,
     pub plugin: Arc<dyn Plugin>,
     pub on_error: OnError,
     pub timeouts: HookTimeouts,
@@ -135,8 +138,10 @@ impl PluginRegistry {
         frontend: FrontendKind,
         model: &str,
     ) -> Self {
+        let kind = plugin.kind_name();
         let entry = Arc::new(PluginEntry {
             name: name.to_string(),
+            kind,
             plugin,
             on_error,
             timeouts: HookTimeouts::default(),
@@ -564,6 +569,7 @@ mod tests {
     ) -> PluginRegistry {
         let a = Arc::new(PluginEntry {
             name: "a".to_string(),
+            kind: "counter",
             plugin: Arc::new(CounterPlugin { n: counter_a }),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -571,6 +577,7 @@ mod tests {
         });
         let b = Arc::new(PluginEntry {
             name: "b".to_string(),
+            kind: "counter",
             plugin: Arc::new(CounterPlugin { n: counter_b }),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -719,6 +726,7 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let entry = Arc::new(PluginEntry {
             name: "rc".to_string(),
+            kind: "resolved_counter",
             plugin: Arc::new(ResolvedCounter(n.clone())),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -849,6 +857,7 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let entry = Arc::new(PluginEntry {
             name: "d".to_string(),
+            kind: "drop_every_second",
             plugin: Arc::new(DropEverySecond { counter: n.clone() }),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -930,6 +939,7 @@ mod tests {
 
         let entry = Arc::new(PluginEntry {
             name: "f".to_string(),
+            kind: "always_fail",
             plugin: Arc::new(AlwaysFail),
             on_error: OnError::Fail, // ensures the error propagates
             timeouts: HookTimeouts::default(),
@@ -1024,6 +1034,7 @@ mod tests {
         let captured = Arc::new(tokio::sync::Mutex::new(None));
         let entry = Arc::new(PluginEntry {
             name: "rs".to_string(),
+            kind: "record_summary",
             plugin: Arc::new(RecordSummary {
                 captured: captured.clone(),
             }),
