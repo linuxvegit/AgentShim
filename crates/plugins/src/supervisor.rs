@@ -34,11 +34,7 @@ impl PluginSupervisor {
 
     /// Spawn an H7 future. Sync function. Increments the pending counter
     /// for `plugin_name`; the spawned task decrements on completion.
-    pub fn spawn_h7(
-        &self,
-        plugin_name: String,
-        fut: impl Future<Output = ()> + Send + 'static,
-    ) {
+    pub fn spawn_h7(&self, plugin_name: String, fut: impl Future<Output = ()> + Send + 'static) {
         *self
             .pending
             .lock()
@@ -83,8 +79,10 @@ impl PluginSupervisor {
         // Any remaining `pending` entries are tasks that did not finish
         // in time. Snapshot + return + clear.
         let mut p = self.pending.lock().unwrap();
-        let dropped: Vec<(String, u64)> =
-            p.iter().map(|(name, count)| (name.clone(), *count)).collect();
+        let dropped: Vec<(String, u64)> = p
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect();
         p.clear();
         // tasks drops on function exit -> aborts in-flight survivors.
         drop(tasks);

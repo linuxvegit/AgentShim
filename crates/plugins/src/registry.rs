@@ -465,19 +465,17 @@ impl PluginRegistry {
                         for ev in buf.drain(..) {
                             let ev_for_invoke = ev.clone();
                             let ev_for_skip = ev;
-                            let outcome = crate::invoke::invoke::<
-                                Vec<agent_shim_core::StreamEvent>,
-                                _,
-                            >(
-                                crate::invoke::InvokeArgs::from_entry(
-                                    entry,
-                                    Hook::StreamEvent,
-                                    crate::invoke::SpanMode::Aggregated,
-                                ),
-                                &ctx,
-                                plugin.on_stream_event(&ctx, ev_for_invoke),
-                            )
-                            .await;
+                            let outcome =
+                                crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
+                                    crate::invoke::InvokeArgs::from_entry(
+                                        entry,
+                                        Hook::StreamEvent,
+                                        crate::invoke::SpanMode::Aggregated,
+                                    ),
+                                    &ctx,
+                                    plugin.on_stream_event(&ctx, ev_for_invoke),
+                                )
+                                .await;
                             match outcome {
                                 crate::invoke::InvokeOutcome::Success(events) => {
                                     next.extend(events);

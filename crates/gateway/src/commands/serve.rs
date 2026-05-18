@@ -129,6 +129,12 @@ where
     // subsequent bind could still fail.
     on_listening(public_local);
 
+    // P05 T11: clone the plugin Arc + shutdown.plugin_flush_secs BEFORE
+    // moving `state` into axum. After axum drain, no new H7 spawns occur
+    // (no requests in flight) so flush can run safely on this clone.
+    let plugins = state.core.plugins.clone();
+    let flush_secs = state.snapshot.load_full().config.shutdown.plugin_flush_secs;
+
     let result = if let Some(admin_listener) = admin_listener_opt {
         crate::server::run_with_admin_on_listeners(
             public_listener,
@@ -140,6 +146,22 @@ where
     } else {
         crate::server::run_on_listener(public_listener, state, shutdown_signal).await
     };
+
+    // P05 T11: flush H7 plugin tasks AFTER axum drain, BEFORE otel
+    // shutdown — otel must still be live to flush the warn! lines
+    // emitted for dropped tasks. P05 §6.8.
+    let dropped = plugins
+        .flush_pending_h7(std::time::Duration::from_secs(flush_secs))
+        .await;
+    for (plugin_name, count) in dropped {
+        agent_shim_observability::metrics::recorders::record_h7_dropped(&plugin_name, count);
+        tracing::warn!(
+            "plugin.name" = %plugin_name,
+            dropped_count = count,
+            deadline_secs = flush_secs,
+            "H7 task dropped at shutdown",
+        );
+    }
 
     if let Some(otel) = tracing_handles.otel {
         otel.shutdown();

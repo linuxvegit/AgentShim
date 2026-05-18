@@ -303,17 +303,13 @@ mod tests {
     async fn invoke_with_args_failed_skip_returns_skipped() {
         let c = ctx();
         let a = args_for("p", "on_decoded_request");
-        let out: InvokeOutcome<i32> = invoke(
-            a,
-            &c,
-            async {
-                Err(PluginError::Failed {
-                    plugin: "p".to_string(),
-                    hook: "on_decoded_request",
-                    message: "boom".to_string(),
-                })
-            },
-        )
+        let out: InvokeOutcome<i32> = invoke(a, &c, async {
+            Err(PluginError::Failed {
+                plugin: "p".to_string(),
+                hook: "on_decoded_request",
+                message: "boom".to_string(),
+            })
+        })
         .await;
         assert!(matches!(out, InvokeOutcome::Skipped));
     }
@@ -323,17 +319,13 @@ mod tests {
         let c = ctx();
         let mut a = args_for("p", "on_decoded_request");
         a.on_error = OnError::Fail;
-        let out: InvokeOutcome<i32> = invoke(
-            a,
-            &c,
-            async {
-                Err(PluginError::Failed {
-                    plugin: "p".to_string(),
-                    hook: "on_decoded_request",
-                    message: "boom".to_string(),
-                })
-            },
-        )
+        let out: InvokeOutcome<i32> = invoke(a, &c, async {
+            Err(PluginError::Failed {
+                plugin: "p".to_string(),
+                hook: "on_decoded_request",
+                message: "boom".to_string(),
+            })
+        })
         .await;
         assert!(matches!(out, InvokeOutcome::Propagate(_)));
     }
@@ -342,16 +334,12 @@ mod tests {
     async fn invoke_with_args_aborted_always_propagates() {
         let c = ctx();
         let a = args_for("p", "on_decoded_request"); // Skip
-        let out: InvokeOutcome<i32> = invoke(
-            a,
-            &c,
-            async {
-                Err(PluginError::Aborted {
-                    plugin: "p".to_string(),
-                    reason: "policy".to_string(),
-                })
-            },
-        )
+        let out: InvokeOutcome<i32> = invoke(a, &c, async {
+            Err(PluginError::Aborted {
+                plugin: "p".to_string(),
+                reason: "policy".to_string(),
+            })
+        })
         .await;
         match out {
             InvokeOutcome::Propagate(PluginError::Aborted { .. }) => {}
@@ -364,14 +352,10 @@ mod tests {
         let c = ctx();
         let mut a = args_for("p", "on_decoded_request");
         a.timeout_ms = 10;
-        let out: InvokeOutcome<i32> = invoke(
-            a,
-            &c,
-            async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok(42)
-            },
-        )
+        let out: InvokeOutcome<i32> = invoke(a, &c, async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(42)
+        })
         .await;
         assert!(matches!(out, InvokeOutcome::Skipped));
     }
