@@ -223,11 +223,12 @@ impl PluginRegistry {
             let plugin_name = entry.name.clone();
             let hook_str = Hook::DecodedRequest.as_str();
             let outcome = crate::invoke::invoke(
-                &plugin_name,
+                crate::invoke::InvokeArgs::from_entry(
+                    entry,
+                    Hook::DecodedRequest,
+                    crate::invoke::SpanMode::PerInvocation,
+                ),
                 ctx,
-                hook_str,
-                entry.timeouts.for_hook(Hook::DecodedRequest),
-                entry.on_error,
                 plugin.on_decoded_request(ctx, candidate),
             )
             .await;
@@ -293,11 +294,12 @@ impl PluginRegistry {
             let plugin_name = entry.name.clone();
             let hook_str = Hook::Resolved.as_str();
             let outcome = crate::invoke::invoke(
-                &plugin_name,
+                crate::invoke::InvokeArgs::from_entry(
+                    entry,
+                    Hook::Resolved,
+                    crate::invoke::SpanMode::PerInvocation,
+                ),
                 ctx,
-                hook_str,
-                entry.timeouts.for_hook(Hook::Resolved),
-                entry.on_error,
                 plugin.on_resolved(ctx, candidate, target),
             )
             .await;
@@ -374,20 +376,18 @@ impl PluginRegistry {
                         continue;
                     }
                     let mut next: Vec<agent_shim_core::StreamEvent> = Vec::with_capacity(buf.len());
-                    let plugin_name = entry.name.clone();
                     let plugin = entry.plugin.clone();
-                    let timeout = entry.timeouts.for_hook(Hook::StreamEvent);
-                    let on_error = entry.on_error;
                     for ev in buf.drain(..) {
                         let ev_for_invoke = ev.clone();
                         let ev_for_skip = ev;
                         let outcome =
                             crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
-                                &plugin_name,
+                                crate::invoke::InvokeArgs::from_entry(
+                                    entry,
+                                    Hook::StreamEvent,
+                                    crate::invoke::SpanMode::Aggregated,
+                                ),
                                 &ctx,
-                                Hook::StreamEvent.as_str(),
-                                timeout,
-                                on_error,
                                 plugin.on_stream_event(&ctx, ev_for_invoke),
                             )
                             .await;
@@ -445,17 +445,22 @@ impl PluginRegistry {
             }
             let plugin = entry.plugin.clone();
             let plugin_name = entry.name.clone();
+            let plugin_kind: &'static str = entry.kind;
             let timeout_ms = entry.timeouts.for_hook(Hook::ResponseComplete);
             let on_error = entry.on_error;
             let summary = summary.clone();
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let _ = crate::invoke::invoke::<(), _>(
-                    &plugin_name,
+                    crate::invoke::InvokeArgs {
+                        plugin_name: &plugin_name,
+                        plugin_kind,
+                        hook: Hook::ResponseComplete.as_str(),
+                        timeout_ms,
+                        on_error,
+                        span_mode: crate::invoke::SpanMode::PerInvocation,
+                    },
                     &ctx,
-                    Hook::ResponseComplete.as_str(),
-                    timeout_ms,
-                    on_error,
                     plugin.on_response_complete(&ctx, &summary),
                 )
                 .await;

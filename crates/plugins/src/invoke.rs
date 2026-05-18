@@ -277,7 +277,7 @@ mod tests {
         }
     }
 
-    fn args_for(name: &str, hook: &'static str) -> InvokeArgs<'_> {
+    fn args_for<'a>(name: &'a str, hook: &'static str) -> InvokeArgs<'a> {
         InvokeArgs {
             plugin_name: name,
             plugin_kind: "test_kind",
