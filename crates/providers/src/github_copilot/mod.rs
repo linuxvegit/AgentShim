@@ -39,17 +39,23 @@ pub struct CopilotProvider {
 
 impl CopilotProvider {
     fn build_http_client() -> Result<crate::ProviderHttpClient, ProviderError> {
-        // 300s read_timeout — maximum gap between successive body reads.
+        // 900s read_timeout — maximum gap between successive body reads.
         // This is *not* a total request timeout; long Claude tool-call
         // streams can run several minutes total but emit fragments well
         // under a second apart. The high cap accommodates rare longer
         // gaps (model "thinks" before resuming output) while still
         // catching genuinely dead connections in a reasonable window.
-        // Earlier 60s was too tight: tool-call streams were getting
-        // cut mid-emission and surfacing as `error decoding response
-        // body` WARNs. See `http_client::build` for why we use
-        // `read_timeout` instead of a total `timeout`.
-        http_client::build(Duration::from_secs(300))
+        //
+        // History:
+        //   - 60s: too tight, normal tool-call streams hit it.
+        //   - 300s: still hit by opus 1M + extended-thinking mid-tool-call
+        //     (model pauses to think between tool_call argument deltas;
+        //     observed gaps over 5 min on `claude-opus-4.7-1m-internal`).
+        //   - 900s: current. Long enough that any real gap implies a dead
+        //     upstream connection rather than the model thinking.
+        // See `http_client::build` for why we use `read_timeout` instead
+        // of a total `timeout`.
+        http_client::build(Duration::from_secs(900))
     }
 
     /// Create and start a `CopilotProvider` using credentials stored at `credential_path`.

@@ -61,6 +61,22 @@ pub fn install(cfg: &MetricsConfig) -> Arc<MetricsHandle> {
     let handle = INSTALLED.get_or_init(|| {
         let mut builder = PrometheusBuilder::new();
 
+        // Plan 07 P05 (Q10/B+): plugin H5 hook fires per SSE event at
+        // sub-millisecond latency. The default Prometheus exporter buckets
+        // (5ms-10s) put 95% of H5 samples into the first bucket, losing
+        // resolution. Apply a sub-ms-to-5s default for plugin_duration_seconds
+        // BEFORE the operator override loop so explicit YAML overrides still
+        // win. Other metrics keep the exporter default.
+        const PLUGIN_DURATION_DEFAULT_BUCKETS: &[f64] = &[
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0,
+        ];
+        builder = builder
+            .set_buckets_for_metric(
+                Matcher::Full(names::PLUGIN_DURATION_SECONDS.to_string()),
+                PLUGIN_DURATION_DEFAULT_BUCKETS,
+            )
+            .expect("plugin duration default buckets must be valid");
+
         // Per-metric histogram bucket overrides.
         for (name, buckets) in &cfg.histogram_buckets {
             // Accept both qualified (`agent_shim_request_duration_seconds`)
