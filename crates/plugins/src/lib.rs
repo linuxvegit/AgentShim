@@ -17,6 +17,7 @@ mod error;
 mod invoke;
 mod log_fields;
 mod registry;
+mod supervisor;
 mod trait_def;
 
 pub mod builtin;
