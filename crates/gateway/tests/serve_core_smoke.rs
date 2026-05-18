@@ -32,6 +32,7 @@ fn ephemeral_config() -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

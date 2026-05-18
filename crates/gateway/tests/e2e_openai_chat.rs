@@ -43,6 +43,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

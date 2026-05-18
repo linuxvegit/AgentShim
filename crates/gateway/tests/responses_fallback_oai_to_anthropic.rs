@@ -128,6 +128,7 @@ fn make_config(oai_url: &str, anthropic_url: &str) -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

@@ -9,7 +9,9 @@
 //! P05.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_shim_core::FrontendKind;
 
@@ -62,6 +64,9 @@ impl HookTimeouts {
 /// One entry in the registry, plus the policy knobs bound to it.
 pub struct PluginEntry {
     pub name: String,
+    /// Cached `Plugin::kind_name()` value — `&'static str` literal.
+    /// Populated at construction. P05 §7.1 / Q1.
+    pub kind: &'static str,
     pub plugin: Arc<dyn Plugin>,
     pub on_error: OnError,
     pub timeouts: HookTimeouts,
@@ -98,12 +103,62 @@ impl RouteHookPlan {
     }
 }
 
+// ── H5 span aggregation helpers (P05 §3) ─────────────────────────────
+
+/// Drop-time recorder that writes aggregated counters onto the
+/// `plugin.stream` span. `Span::record` after the span has been entered
+/// in `GuardedH5Stream::poll_next` populates the span's fields just
+/// before close, so trace backends see the final values.
+struct StreamSpanRecorder {
+    span: tracing::Span,
+    event_count: Arc<AtomicU64>,
+    failure_count: Arc<AtomicU64>,
+}
+
+impl Drop for StreamSpanRecorder {
+    fn drop(&mut self) {
+        self.span.record(
+            "plugin.event_count",
+            self.event_count.load(Ordering::Relaxed),
+        );
+        self.span.record(
+            "plugin.failure_count",
+            self.failure_count.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Stream wrapper that enters the `plugin.stream` span on every poll
+/// and owns the drop-guard recorder. `EnteredSpan<'_>` is `!Send` but
+/// scope-bounded inside `poll_next`, which is fine because poll runs
+/// synchronously on a single thread.
+struct GuardedH5Stream<S> {
+    inner: S,
+    span: tracing::Span,
+    _recorder: StreamSpanRecorder,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for GuardedH5Stream<S> {
+    type Item = S::Item;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        let _enter = this.span.enter();
+        std::pin::Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
 /// Top-level plugin registry. Constructed once at startup. Immutable
 /// thereafter; reload rebuilds the whole thing and arc-swaps (Q12).
 pub struct PluginRegistry {
     #[allow(dead_code)] // populated by P06 from_specs; lookup goes via `plans`
     pub(crate) plugins: HashMap<String, Arc<PluginEntry>>,
     pub(crate) plans: HashMap<FrontendKind, FrontendRoutePlans>,
+    /// Owns H7 task lifecycle. Lives as long as the registry; gateway
+    /// shutdown calls `flush_pending_h7` to drain. P05 §6.8.
+    pub(crate) supervisor: Arc<crate::supervisor::PluginSupervisor>,
 }
 
 impl PluginRegistry {
@@ -114,7 +169,15 @@ impl PluginRegistry {
         Self {
             plugins: HashMap::new(),
             plans: HashMap::new(),
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         }
+    }
+
+    /// Flush pending H7 tasks during shutdown. Returns
+    /// `Vec<(plugin_name, dropped_count)>` — tasks that did not finish
+    /// within the deadline are aborted (JoinSet drops). P05 §6.8.
+    pub async fn flush_pending_h7(&self, deadline: Duration) -> Vec<(String, u64)> {
+        self.supervisor.flush_pending_h7(deadline).await
     }
 
     /// Plan 07 P04 T12: test-only constructor for integration tests in
@@ -135,8 +198,10 @@ impl PluginRegistry {
         frontend: FrontendKind,
         model: &str,
     ) -> Self {
+        let kind = plugin.kind_name();
         let entry = Arc::new(PluginEntry {
             name: name.to_string(),
+            kind,
             plugin,
             on_error,
             timeouts: HookTimeouts::default(),
@@ -162,7 +227,11 @@ impl PluginRegistry {
         );
         let mut plugins = HashMap::new();
         plugins.insert(name.to_string(), entry);
-        Self { plugins, plans }
+        Self {
+            plugins,
+            plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
+        }
     }
 
     /// Lookup helper used by P04's `run_*` methods. Returns the route
@@ -218,11 +287,12 @@ impl PluginRegistry {
             let plugin_name = entry.name.clone();
             let hook_str = Hook::DecodedRequest.as_str();
             let outcome = crate::invoke::invoke(
-                &plugin_name,
+                crate::invoke::InvokeArgs::from_entry(
+                    entry,
+                    Hook::DecodedRequest,
+                    crate::invoke::SpanMode::PerInvocation,
+                ),
                 ctx,
-                hook_str,
-                entry.timeouts.for_hook(Hook::DecodedRequest),
-                entry.on_error,
                 plugin.on_decoded_request(ctx, candidate),
             )
             .await;
@@ -288,11 +358,12 @@ impl PluginRegistry {
             let plugin_name = entry.name.clone();
             let hook_str = Hook::Resolved.as_str();
             let outcome = crate::invoke::invoke(
-                &plugin_name,
+                crate::invoke::InvokeArgs::from_entry(
+                    entry,
+                    Hook::Resolved,
+                    crate::invoke::SpanMode::PerInvocation,
+                ),
                 ctx,
-                hook_str,
-                entry.timeouts.for_hook(Hook::Resolved),
-                entry.on_error,
                 plugin.on_resolved(ctx, candidate, target),
             )
             .await;
@@ -347,71 +418,95 @@ impl PluginRegistry {
             _ => return upstream,
         };
         let plugins: Vec<Arc<PluginEntry>> = plan.on_stream_event.clone();
+
+        // P05 §3: aggregated plugin.stream span. NO plugin.name field
+        // (covers all H5 plugins). Per-plugin attribution flows through
+        // per-event log lines on failure (§7.5 noise control + Q14).
+        let span = tracing::info_span!(
+            "plugin.stream",
+            "agent_shim.request_id" = ctx.request_id.0.as_str(),
+            "agent_shim.route" = ctx.route_label.as_str(),
+            "plugin.event_count" = tracing::field::Empty,
+            "plugin.failure_count" = tracing::field::Empty,
+        );
+        let event_count = Arc::new(AtomicU64::new(0));
+        let failure_count = Arc::new(AtomicU64::new(0));
+        let recorder = StreamSpanRecorder {
+            span: span.clone(),
+            event_count: Arc::clone(&event_count),
+            failure_count: Arc::clone(&failure_count),
+        };
+
         let ctx = Arc::new(ctx);
 
         use futures::StreamExt;
-        let wrapped = upstream.then(move |event_result| {
-            let plugins = plugins.clone();
-            let ctx = ctx.clone();
-            async move {
-                // Upstream errors pass through unchanged. Plugins do not
-                // see Err items.
-                let event = match event_result {
-                    Ok(e) => e,
-                    Err(err) => return vec![Err(err)],
-                };
-                // Walk the H5 chain; one in, N out per plugin. The
-                // intermediate "many out" state is kept as a Vec and
-                // re-fed through subsequent plugins one event at a time.
-                let mut buf: Vec<agent_shim_core::StreamEvent> = vec![event];
-                for entry in &plugins {
-                    if !entry.enabled {
-                        continue;
-                    }
-                    let mut next: Vec<agent_shim_core::StreamEvent> = Vec::with_capacity(buf.len());
-                    let plugin_name = entry.name.clone();
-                    let plugin = entry.plugin.clone();
-                    let timeout = entry.timeouts.for_hook(Hook::StreamEvent);
-                    let on_error = entry.on_error;
-                    for ev in buf.drain(..) {
-                        let ev_for_invoke = ev.clone();
-                        let ev_for_skip = ev;
-                        let outcome =
-                            crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
-                                &plugin_name,
-                                &ctx,
-                                Hook::StreamEvent.as_str(),
-                                timeout,
-                                on_error,
-                                plugin.on_stream_event(&ctx, ev_for_invoke),
-                            )
-                            .await;
-                        match outcome {
-                            crate::invoke::InvokeOutcome::Success(events) => {
-                                next.extend(events);
-                            }
-                            crate::invoke::InvokeOutcome::Skipped => {
-                                // Treat as identity: a skipped plugin
-                                // must not drop the event wholesale.
-                                next.push(ev_for_skip);
-                            }
-                            crate::invoke::InvokeOutcome::Propagate(err) => {
-                                // Emit a single Error event then stop.
-                                // HTTP status was committed at first event
-                                // (200); failure surfaces as wire-level
-                                // `event: error` (spec §6.5).
-                                return vec![Ok(agent_shim_core::StreamEvent::Error {
-                                    message: err.to_string(),
-                                })];
+        let inner = upstream
+            .then(move |event_result| {
+                let plugins = plugins.clone();
+                let ctx = ctx.clone();
+                let event_count = Arc::clone(&event_count);
+                let failure_count = Arc::clone(&failure_count);
+                async move {
+                    // Upstream errors pass through unchanged (no plugin sees them).
+                    let event = match event_result {
+                        Ok(e) => e,
+                        Err(err) => return vec![Err(err)],
+                    };
+                    event_count.fetch_add(1, Ordering::Relaxed);
+
+                    let mut buf: Vec<agent_shim_core::StreamEvent> = vec![event];
+                    for entry in &plugins {
+                        if !entry.enabled {
+                            continue;
+                        }
+                        let mut next: Vec<agent_shim_core::StreamEvent> =
+                            Vec::with_capacity(buf.len());
+                        let plugin = entry.plugin.clone();
+                        for ev in buf.drain(..) {
+                            let ev_for_invoke = ev.clone();
+                            let ev_for_skip = ev;
+                            let outcome =
+                                crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
+                                    crate::invoke::InvokeArgs::from_entry(
+                                        entry,
+                                        Hook::StreamEvent,
+                                        crate::invoke::SpanMode::Aggregated,
+                                    ),
+                                    &ctx,
+                                    plugin.on_stream_event(&ctx, ev_for_invoke),
+                                )
+                                .await;
+                            match outcome {
+                                crate::invoke::InvokeOutcome::Success(events) => {
+                                    next.extend(events);
+                                }
+                                crate::invoke::InvokeOutcome::Skipped => {
+                                    next.push(ev_for_skip);
+                                }
+                                crate::invoke::InvokeOutcome::Propagate(err) => {
+                                    failure_count.fetch_add(1, Ordering::Relaxed);
+                                    return vec![Ok(agent_shim_core::StreamEvent::Error {
+                                        message: err.to_string(),
+                                    })];
+                                }
                             }
                         }
+                        buf = next;
                     }
-                    buf = next;
+                    buf.into_iter().map(Ok).collect::<Vec<_>>()
                 }
-                buf.into_iter().map(Ok).collect::<Vec<_>>()
-            }
-        });
-        Box::pin(wrapped.flat_map(futures::stream::iter))
+            })
+            .flat_map(futures::stream::iter);
+        // Box+pin into a uniformly `Unpin` stream so `GuardedH5Stream` can
+        // project to `&mut Self` without `pin-project` machinery. The
+        // `then(...).flat_map(...)` chain itself is `!Unpin`.
+        let inner = Box::pin(inner) as futures::stream::BoxStream<'static, _>;
+
+        Box::pin(GuardedH5Stream {
+            inner,
+            span,
+            _recorder: recorder,
+        })
     }
 
     /// H7 hook — fire-and-forget. Spec §6.2 / §6.7 / §6.8.
@@ -440,17 +535,24 @@ impl PluginRegistry {
             }
             let plugin = entry.plugin.clone();
             let plugin_name = entry.name.clone();
+            let plugin_kind: &'static str = entry.kind;
             let timeout_ms = entry.timeouts.for_hook(Hook::ResponseComplete);
             let on_error = entry.on_error;
             let summary = summary.clone();
             let ctx = ctx.clone();
-            tokio::spawn(async move {
+            // Route through supervisor instead of bare tokio::spawn so
+            // shutdown can bound the wait (P05 §6.8).
+            self.supervisor.spawn_h7(plugin_name.clone(), async move {
                 let _ = crate::invoke::invoke::<(), _>(
-                    &plugin_name,
+                    crate::invoke::InvokeArgs {
+                        plugin_name: &plugin_name,
+                        plugin_kind,
+                        hook: Hook::ResponseComplete.as_str(),
+                        timeout_ms,
+                        on_error,
+                        span_mode: crate::invoke::SpanMode::PerInvocation,
+                    },
                     &ctx,
-                    Hook::ResponseComplete.as_str(),
-                    timeout_ms,
-                    on_error,
                     plugin.on_response_complete(&ctx, &summary),
                 )
                 .await;
@@ -564,6 +666,7 @@ mod tests {
     ) -> PluginRegistry {
         let a = Arc::new(PluginEntry {
             name: "a".to_string(),
+            kind: "counter",
             plugin: Arc::new(CounterPlugin { n: counter_a }),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -571,6 +674,7 @@ mod tests {
         });
         let b = Arc::new(PluginEntry {
             name: "b".to_string(),
+            kind: "counter",
             plugin: Arc::new(CounterPlugin { n: counter_b }),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -596,7 +700,11 @@ mod tests {
         let mut plugins = HashMap::new();
         plugins.insert("a".to_string(), a);
         plugins.insert("b".to_string(), b);
-        PluginRegistry { plugins, plans }
+        PluginRegistry {
+            plugins,
+            plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
+        }
     }
 
     #[test]
@@ -719,6 +827,7 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let entry = Arc::new(PluginEntry {
             name: "rc".to_string(),
+            kind: "resolved_counter",
             plugin: Arc::new(ResolvedCounter(n.clone())),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -748,6 +857,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -849,6 +959,7 @@ mod tests {
         let n = Arc::new(AtomicUsize::new(0));
         let entry = Arc::new(PluginEntry {
             name: "d".to_string(),
+            kind: "drop_every_second",
             plugin: Arc::new(DropEverySecond { counter: n.clone() }),
             on_error: OnError::Skip,
             timeouts: HookTimeouts::default(),
@@ -878,6 +989,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -930,6 +1042,7 @@ mod tests {
 
         let entry = Arc::new(PluginEntry {
             name: "f".to_string(),
+            kind: "always_fail",
             plugin: Arc::new(AlwaysFail),
             on_error: OnError::Fail, // ensures the error propagates
             timeouts: HookTimeouts::default(),
@@ -959,6 +1072,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -1024,6 +1138,7 @@ mod tests {
         let captured = Arc::new(tokio::sync::Mutex::new(None));
         let entry = Arc::new(PluginEntry {
             name: "rs".to_string(),
+            kind: "record_summary",
             plugin: Arc::new(RecordSummary {
                 captured: captured.clone(),
             }),
@@ -1055,6 +1170,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -1100,5 +1216,90 @@ mod tests {
             },
         );
         // No assertion needed — just verify the call returns without panic.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_h7_drops_slow_h7_plugin() {
+        use crate::ResponseSummary;
+
+        struct SlowH7;
+        #[async_trait]
+        impl crate::Plugin for SlowH7 {
+            fn kind_name(&self) -> &'static str {
+                "slow_h7"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::RESPONSE_COMPLETE
+            }
+            async fn on_response_complete(
+                &self,
+                _ctx: &crate::PluginContext,
+                _summary: &ResponseSummary,
+            ) -> crate::PluginResult<()> {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(())
+            }
+        }
+
+        let entry = Arc::new(PluginEntry {
+            name: "slow".to_string(),
+            kind: "slow_h7",
+            plugin: Arc::new(SlowH7),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_response_complete: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("slow".to_string(), entry);
+                p
+            },
+            plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        registry.run_on_response_complete(
+            (FrontendKind::AnthropicMessages, "m"),
+            ctx,
+            ResponseSummary {
+                usage: None,
+                elapsed_ms: 0,
+                upstream_status: crate::UpstreamStatus::Success,
+            },
+        );
+
+        // Yield once so the spawn actually runs and registers in pending.
+        tokio::task::yield_now().await;
+
+        let dropped = registry
+            .flush_pending_h7(std::time::Duration::from_millis(10))
+            .await;
+        assert_eq!(
+            dropped,
+            vec![("slow".to_string(), 1)],
+            "slow H7 plugin dropped with attribution"
+        );
     }
 }

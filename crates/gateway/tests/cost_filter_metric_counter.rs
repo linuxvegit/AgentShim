@@ -117,6 +117,7 @@ fn make_config(a_url: &str, b_url: &str, public_port: u16, admin_port: u16) -> G
         }),
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

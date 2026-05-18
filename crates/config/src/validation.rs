@@ -199,6 +199,15 @@ pub fn validate(cfg: &GatewayConfig) -> Result<(), ValidationError> {
         }
     }
 
+    // P05 §8: bound H7 flush deadline to a sensible upper limit so
+    // misconfig can't stall shutdown forever.
+    if cfg.shutdown.plugin_flush_secs > 300 {
+        return Err(ValidationError::InvalidRoute(format!(
+            "shutdown.plugin_flush_secs {} must be <= 300 seconds",
+            cfg.shutdown.plugin_flush_secs
+        )));
+    }
+
     let mut seen = std::collections::HashSet::new();
     for route in &cfg.routes {
         if !VALID_FRONTENDS.contains(&route.frontend.as_str()) {
@@ -832,6 +841,7 @@ mod tests {
             admin: None,
             metrics: Default::default(),
             otel: None,
+            shutdown: Default::default(),
         }
     }
 
@@ -2000,6 +2010,7 @@ routes:
             admin: None,
             metrics: Default::default(),
             otel: None,
+            shutdown: Default::default(),
         }
     }
 
@@ -2187,5 +2198,45 @@ routes:
                 other => panic!("expected ZeroTimeoutMs for slot {expected_slot}, got {other:?}"),
             }
         }
+    }
+
+    // ── Phase 7 P05 T10: shutdown.plugin_flush_secs Layer A validation ──────
+
+    #[test]
+    fn validate_rejects_excessive_shutdown_flush_secs() {
+        use crate::schema::ShutdownConfig;
+        // Build a minimal valid config (port=8787, no upstreams, no routes).
+        // Use the test scaffold pattern already present in this mod.
+        let mut cfg: GatewayConfig = serde_yaml::from_str(
+            r#"
+upstreams: {}
+routes: []
+"#,
+        )
+        .unwrap();
+        cfg.shutdown = ShutdownConfig {
+            plugin_flush_secs: 301,
+        };
+        let err = validate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("plugin_flush_secs"),
+            "error message names the bad field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_max_shutdown_flush_secs() {
+        use crate::schema::ShutdownConfig;
+        let mut cfg: GatewayConfig = serde_yaml::from_str(
+            r#"
+upstreams: {}
+routes: []
+"#,
+        )
+        .unwrap();
+        cfg.shutdown = ShutdownConfig {
+            plugin_flush_secs: 300,
+        };
+        assert!(validate(&cfg).is_ok());
     }
 }
