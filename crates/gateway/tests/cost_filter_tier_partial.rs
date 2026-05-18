@@ -112,6 +112,7 @@ fn make_config(eco_url: &str, std_url: &str) -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

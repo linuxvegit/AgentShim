@@ -176,6 +176,7 @@ fn make_app_state(
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     };
 
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));

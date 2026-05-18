@@ -123,6 +123,7 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 

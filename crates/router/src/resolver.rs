@@ -133,6 +133,7 @@ mod tests {
             admin: None,
             metrics: Default::default(),
             otel: None,
+            shutdown: Default::default(),
         }
     }
 
@@ -237,6 +238,7 @@ mod tests {
             admin: None,
             metrics: Default::default(),
             otel: None,
+            shutdown: Default::default(),
         };
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
 

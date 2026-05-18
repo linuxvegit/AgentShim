@@ -52,6 +52,7 @@ fn make_config(api_key: String) -> GatewayConfig {
         admin: None,
         metrics: Default::default(),
         otel: None,
+        shutdown: Default::default(),
     }
 }
 
