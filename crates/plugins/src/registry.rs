@@ -9,6 +9,7 @@
 //! P05.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,6 +100,53 @@ impl RouteHookPlan {
             && self.on_resolved.is_empty()
             && self.on_stream_event.is_empty()
             && self.on_response_complete.is_empty()
+    }
+}
+
+// ── H5 span aggregation helpers (P05 §3) ─────────────────────────────
+
+/// Drop-time recorder that writes aggregated counters onto the
+/// `plugin.stream` span. `Span::record` after the span has been entered
+/// in `GuardedH5Stream::poll_next` populates the span's fields just
+/// before close, so trace backends see the final values.
+struct StreamSpanRecorder {
+    span: tracing::Span,
+    event_count: Arc<AtomicU64>,
+    failure_count: Arc<AtomicU64>,
+}
+
+impl Drop for StreamSpanRecorder {
+    fn drop(&mut self) {
+        self.span.record(
+            "plugin.event_count",
+            self.event_count.load(Ordering::Relaxed),
+        );
+        self.span.record(
+            "plugin.failure_count",
+            self.failure_count.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Stream wrapper that enters the `plugin.stream` span on every poll
+/// and owns the drop-guard recorder. `EnteredSpan<'_>` is `!Send` but
+/// scope-bounded inside `poll_next`, which is fine because poll runs
+/// synchronously on a single thread.
+struct GuardedH5Stream<S> {
+    inner: S,
+    span: tracing::Span,
+    _recorder: StreamSpanRecorder,
+}
+
+impl<S: futures::Stream + Unpin> futures::Stream for GuardedH5Stream<S> {
+    type Item = S::Item;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        let _enter = this.span.enter();
+        std::pin::Pin::new(&mut this.inner).poll_next(cx)
     }
 }
 
@@ -370,34 +418,57 @@ impl PluginRegistry {
             _ => return upstream,
         };
         let plugins: Vec<Arc<PluginEntry>> = plan.on_stream_event.clone();
+
+        // P05 §3: aggregated plugin.stream span. NO plugin.name field
+        // (covers all H5 plugins). Per-plugin attribution flows through
+        // per-event log lines on failure (§7.5 noise control + Q14).
+        let span = tracing::info_span!(
+            "plugin.stream",
+            "agent_shim.request_id" = ctx.request_id.0.as_str(),
+            "agent_shim.route" = ctx.route_label.as_str(),
+            "plugin.event_count" = tracing::field::Empty,
+            "plugin.failure_count" = tracing::field::Empty,
+        );
+        let event_count = Arc::new(AtomicU64::new(0));
+        let failure_count = Arc::new(AtomicU64::new(0));
+        let recorder = StreamSpanRecorder {
+            span: span.clone(),
+            event_count: Arc::clone(&event_count),
+            failure_count: Arc::clone(&failure_count),
+        };
+
         let ctx = Arc::new(ctx);
 
         use futures::StreamExt;
-        let wrapped = upstream.then(move |event_result| {
-            let plugins = plugins.clone();
-            let ctx = ctx.clone();
-            async move {
-                // Upstream errors pass through unchanged. Plugins do not
-                // see Err items.
-                let event = match event_result {
-                    Ok(e) => e,
-                    Err(err) => return vec![Err(err)],
-                };
-                // Walk the H5 chain; one in, N out per plugin. The
-                // intermediate "many out" state is kept as a Vec and
-                // re-fed through subsequent plugins one event at a time.
-                let mut buf: Vec<agent_shim_core::StreamEvent> = vec![event];
-                for entry in &plugins {
-                    if !entry.enabled {
-                        continue;
-                    }
-                    let mut next: Vec<agent_shim_core::StreamEvent> = Vec::with_capacity(buf.len());
-                    let plugin = entry.plugin.clone();
-                    for ev in buf.drain(..) {
-                        let ev_for_invoke = ev.clone();
-                        let ev_for_skip = ev;
-                        let outcome =
-                            crate::invoke::invoke::<Vec<agent_shim_core::StreamEvent>, _>(
+        let inner = upstream
+            .then(move |event_result| {
+                let plugins = plugins.clone();
+                let ctx = ctx.clone();
+                let event_count = Arc::clone(&event_count);
+                let failure_count = Arc::clone(&failure_count);
+                async move {
+                    // Upstream errors pass through unchanged (no plugin sees them).
+                    let event = match event_result {
+                        Ok(e) => e,
+                        Err(err) => return vec![Err(err)],
+                    };
+                    event_count.fetch_add(1, Ordering::Relaxed);
+
+                    let mut buf: Vec<agent_shim_core::StreamEvent> = vec![event];
+                    for entry in &plugins {
+                        if !entry.enabled {
+                            continue;
+                        }
+                        let mut next: Vec<agent_shim_core::StreamEvent> =
+                            Vec::with_capacity(buf.len());
+                        let plugin = entry.plugin.clone();
+                        for ev in buf.drain(..) {
+                            let ev_for_invoke = ev.clone();
+                            let ev_for_skip = ev;
+                            let outcome = crate::invoke::invoke::<
+                                Vec<agent_shim_core::StreamEvent>,
+                                _,
+                            >(
                                 crate::invoke::InvokeArgs::from_entry(
                                     entry,
                                     Hook::StreamEvent,
@@ -407,32 +478,37 @@ impl PluginRegistry {
                                 plugin.on_stream_event(&ctx, ev_for_invoke),
                             )
                             .await;
-                        match outcome {
-                            crate::invoke::InvokeOutcome::Success(events) => {
-                                next.extend(events);
-                            }
-                            crate::invoke::InvokeOutcome::Skipped => {
-                                // Treat as identity: a skipped plugin
-                                // must not drop the event wholesale.
-                                next.push(ev_for_skip);
-                            }
-                            crate::invoke::InvokeOutcome::Propagate(err) => {
-                                // Emit a single Error event then stop.
-                                // HTTP status was committed at first event
-                                // (200); failure surfaces as wire-level
-                                // `event: error` (spec §6.5).
-                                return vec![Ok(agent_shim_core::StreamEvent::Error {
-                                    message: err.to_string(),
-                                })];
+                            match outcome {
+                                crate::invoke::InvokeOutcome::Success(events) => {
+                                    next.extend(events);
+                                }
+                                crate::invoke::InvokeOutcome::Skipped => {
+                                    next.push(ev_for_skip);
+                                }
+                                crate::invoke::InvokeOutcome::Propagate(err) => {
+                                    failure_count.fetch_add(1, Ordering::Relaxed);
+                                    return vec![Ok(agent_shim_core::StreamEvent::Error {
+                                        message: err.to_string(),
+                                    })];
+                                }
                             }
                         }
+                        buf = next;
                     }
-                    buf = next;
+                    buf.into_iter().map(Ok).collect::<Vec<_>>()
                 }
-                buf.into_iter().map(Ok).collect::<Vec<_>>()
-            }
-        });
-        Box::pin(wrapped.flat_map(futures::stream::iter))
+            })
+            .flat_map(futures::stream::iter);
+        // Box+pin into a uniformly `Unpin` stream so `GuardedH5Stream` can
+        // project to `&mut Self` without `pin-project` machinery. The
+        // `then(...).flat_map(...)` chain itself is `!Unpin`.
+        let inner = Box::pin(inner) as futures::stream::BoxStream<'static, _>;
+
+        Box::pin(GuardedH5Stream {
+            inner,
+            span,
+            _recorder: recorder,
+        })
     }
 
     /// H7 hook — fire-and-forget. Spec §6.2 / §6.7 / §6.8.
