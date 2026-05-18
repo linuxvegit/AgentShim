@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_shim_core::FrontendKind;
 
@@ -107,6 +108,9 @@ pub struct PluginRegistry {
     #[allow(dead_code)] // populated by P06 from_specs; lookup goes via `plans`
     pub(crate) plugins: HashMap<String, Arc<PluginEntry>>,
     pub(crate) plans: HashMap<FrontendKind, FrontendRoutePlans>,
+    /// Owns H7 task lifecycle. Lives as long as the registry; gateway
+    /// shutdown calls `flush_pending_h7` to drain. P05 §6.8.
+    pub(crate) supervisor: Arc<crate::supervisor::PluginSupervisor>,
 }
 
 impl PluginRegistry {
@@ -117,7 +121,15 @@ impl PluginRegistry {
         Self {
             plugins: HashMap::new(),
             plans: HashMap::new(),
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         }
+    }
+
+    /// Flush pending H7 tasks during shutdown. Returns
+    /// `Vec<(plugin_name, dropped_count)>` — tasks that did not finish
+    /// within the deadline are aborted (JoinSet drops). P05 §6.8.
+    pub async fn flush_pending_h7(&self, deadline: Duration) -> Vec<(String, u64)> {
+        self.supervisor.flush_pending_h7(deadline).await
     }
 
     /// Plan 07 P04 T12: test-only constructor for integration tests in
@@ -167,7 +179,11 @@ impl PluginRegistry {
         );
         let mut plugins = HashMap::new();
         plugins.insert(name.to_string(), entry);
-        Self { plugins, plans }
+        Self {
+            plugins,
+            plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
+        }
     }
 
     /// Lookup helper used by P04's `run_*` methods. Returns the route
@@ -450,7 +466,9 @@ impl PluginRegistry {
             let on_error = entry.on_error;
             let summary = summary.clone();
             let ctx = ctx.clone();
-            tokio::spawn(async move {
+            // Route through supervisor instead of bare tokio::spawn so
+            // shutdown can bound the wait (P05 §6.8).
+            self.supervisor.spawn_h7(plugin_name.clone(), async move {
                 let _ = crate::invoke::invoke::<(), _>(
                     crate::invoke::InvokeArgs {
                         plugin_name: &plugin_name,
@@ -608,7 +626,11 @@ mod tests {
         let mut plugins = HashMap::new();
         plugins.insert("a".to_string(), a);
         plugins.insert("b".to_string(), b);
-        PluginRegistry { plugins, plans }
+        PluginRegistry {
+            plugins,
+            plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
+        }
     }
 
     #[test]
@@ -761,6 +783,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -892,6 +915,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -974,6 +998,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -1071,6 +1096,7 @@ mod tests {
                 p
             },
             plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
         let ctx = crate::PluginContext {
             request_id: RequestId::new(),
@@ -1116,5 +1142,90 @@ mod tests {
             },
         );
         // No assertion needed — just verify the call returns without panic.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_pending_h7_drops_slow_h7_plugin() {
+        use crate::ResponseSummary;
+
+        struct SlowH7;
+        #[async_trait]
+        impl crate::Plugin for SlowH7 {
+            fn kind_name(&self) -> &'static str {
+                "slow_h7"
+            }
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::RESPONSE_COMPLETE
+            }
+            async fn on_response_complete(
+                &self,
+                _ctx: &crate::PluginContext,
+                _summary: &ResponseSummary,
+            ) -> crate::PluginResult<()> {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(())
+            }
+        }
+
+        let entry = Arc::new(PluginEntry {
+            name: "slow".to_string(),
+            kind: "slow_h7",
+            plugin: Arc::new(SlowH7),
+            on_error: OnError::Skip,
+            timeouts: HookTimeouts::default(),
+            enabled: true,
+        });
+        let plan = RouteHookPlan {
+            on_response_complete: vec![entry.clone()],
+            ..Default::default()
+        };
+        let mut plans = HashMap::new();
+        plans.insert(
+            FrontendKind::AnthropicMessages,
+            FrontendRoutePlans {
+                specific: {
+                    let mut m = HashMap::new();
+                    m.insert("m".to_string(), plan);
+                    m
+                },
+                wildcard: None,
+                is_empty: false,
+            },
+        );
+        let registry = PluginRegistry {
+            plugins: {
+                let mut p = HashMap::new();
+                p.insert("slow".to_string(), entry);
+                p
+            },
+            plans,
+            supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
+        };
+        let ctx = crate::PluginContext {
+            request_id: RequestId::new(),
+            frontend: FrontendKind::AnthropicMessages,
+            route_label: "x".to_string(),
+        };
+        registry.run_on_response_complete(
+            (FrontendKind::AnthropicMessages, "m"),
+            ctx,
+            ResponseSummary {
+                usage: None,
+                elapsed_ms: 0,
+                upstream_status: crate::UpstreamStatus::Success,
+            },
+        );
+
+        // Yield once so the spawn actually runs and registers in pending.
+        tokio::task::yield_now().await;
+
+        let dropped = registry
+            .flush_pending_h7(std::time::Duration::from_millis(10))
+            .await;
+        assert_eq!(
+            dropped,
+            vec![("slow".to_string(), 1)],
+            "slow H7 plugin dropped with attribution"
+        );
     }
 }

@@ -25,4 +25,5 @@ pub mod builtin;
 pub use context::{PluginContext, ResponseSummary, UpstreamStatus};
 pub use error::{OnError, PluginConfigError, PluginError, PluginResult};
 pub use registry::{HookTimeouts, PluginEntry, PluginRegistry, RegistryBuildError};
+pub use supervisor::PluginSupervisor;
 pub use trait_def::{Hook, HookSet, Plugin, PluginFactory};
