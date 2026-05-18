@@ -12,9 +12,11 @@ path = "src/lib.rs"
 
 [dependencies]
 agent-shim-core = { path = "../core" }
+agent-shim-observability = { path = "../observability" }
 agent-shim-tokens = { path = "../tokens" }
 async-trait.workspace = true
 futures.workspace = true
+metrics.workspace = true
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -23,6 +25,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "ti
 tracing.workspace = true
 
 [dev-dependencies]
+metrics-util = "0.17"
 pretty_assertions.workspace = true
 serde_yaml = "0.9"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
