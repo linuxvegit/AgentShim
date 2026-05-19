@@ -93,7 +93,7 @@ impl PluginRegistry {
 
 For each `(name, entry_cfg)` in `cfg.plugins`:
 
-1. **Layer B rule 4** (unknown kind): lookup `factory_index.get(entry_cfg.kind.as_str())` — if `None`, return `Err(RegistryBuildError::UnknownKind { plugin: name, kind: entry_cfg.kind, known: <sorted list of factory_index keys> })`.
+1. **Layer B rule 4** (unknown kind): lookup `factory_index.get(entry_cfg.kind.as_str())` — if `None`, return `Err(RegistryBuildError::UnknownKind { plugin: name, kind: entry_cfg.kind, known: <alphabetically-sorted list of factory_index keys> })`. **Sort explicitly** (`let mut v: Vec<String> = ...; v.sort();`) because HashMap iteration order is non-deterministic; sorted output keeps error messages stable across runs and predictable in unit tests.
 2. **Layer B rule 5** (config deserialisation): call `factory.instantiate(&name, entry_cfg.config.clone())`. On `Err(PluginConfigError)`, wrap as `RegistryBuildError::Instantiation(err, name.clone())`.
 3. **Convert YAML mirror types to plugins-crate types**:
    - `entry_cfg.on_error: OnErrorYaml` → `OnError` (1:1 match)
@@ -310,26 +310,7 @@ impl Plugin for UsageRecorder {
         ctx: &PluginContext,
         summary: &ResponseSummary,
     ) -> PluginResult<()> {
-        // P06a grill Q13: emit tokens as Option<u64>. None → tracing renders
-        // "None" (via Debug) rather than the misleading "0" sentinel; Some(n)
-        // → "Some(n)". Operators distinguishing "unknown" from "real zero"
-        // can grep accordingly.
-        let input_tokens = summary.usage.as_ref().map(|u| u.input_tokens);
-        let output_tokens = summary.usage.as_ref().map(|u| u.output_tokens);
-        let status_str = match summary.upstream_status {
-            UpstreamStatus::Success => "success",
-            UpstreamStatus::Error => "error",
-            UpstreamStatus::Cancelled => "cancelled",
-        };
-        emit_usage!(
-            self.level,
-            "agent_shim.request_id" = ctx.request_id.0.as_str(),
-            "agent_shim.route" = ctx.route_label.as_str(),
-            "usage.input_tokens" = ?input_tokens,
-            "usage.output_tokens" = ?output_tokens,
-            "usage.elapsed_ms" = summary.elapsed_ms,
-            "usage.upstream_status" = status_str,
-        );
+        emit_usage!(self.level, ctx, summary);
         Ok(())
     }
 }
@@ -343,35 +324,64 @@ Field naming follows the P05 dotted-tracing convention:
 ### 5.6 `emit_usage!` macro
 
 ```rust
-// File-local: 3-branch level dispatch. Tracing event! requires
-// compile-time level paths, hence the match.
+// File-local: 3-branch level dispatch. tracing::event! requires
+// compile-time level paths, hence the match. Body is hardcoded
+// rather than taking fields as macro arguments because tracing's
+// `?value` Debug syntax doesn't fit `$val:expr` token parsing.
+// Each arm repeats the same field list — same trade-off as P05
+// emit_at_level!.
 macro_rules! emit_usage {
-    ($level:expr, $($field:tt = $val:expr),* $(,)?) => {
+    ($level:expr, $ctx:expr, $summary:expr) => {{
+        // Tokens emitted as Option<u64> via Debug — None vs Some(n)
+        // (P06a grill Q13). Operators distinguishing unknown vs
+        // real-zero can grep "= None" vs "= Some(0)".
+        let input_tokens = $summary.usage.as_ref().map(|u| u.input_tokens);
+        let output_tokens = $summary.usage.as_ref().map(|u| u.output_tokens);
+        let status_str = match $summary.upstream_status {
+            $crate::UpstreamStatus::Success => "success",
+            $crate::UpstreamStatus::Error => "error",
+            $crate::UpstreamStatus::Cancelled => "cancelled",
+        };
         match $level {
             LogLevel::Info => tracing::info!(
                 target: "agent_shim::usage_recorder",
                 "plugin.kind" = "usage_recorder",
-                $($field = $val),*,
+                "agent_shim.request_id" = $ctx.request_id.0.as_str(),
+                "agent_shim.route" = $ctx.route_label.as_str(),
+                "usage.input_tokens" = ?input_tokens,
+                "usage.output_tokens" = ?output_tokens,
+                "usage.elapsed_ms" = $summary.elapsed_ms,
+                "usage.upstream_status" = status_str,
                 "usage recorded",
             ),
             LogLevel::Warn => tracing::warn!(
                 target: "agent_shim::usage_recorder",
                 "plugin.kind" = "usage_recorder",
-                $($field = $val),*,
+                "agent_shim.request_id" = $ctx.request_id.0.as_str(),
+                "agent_shim.route" = $ctx.route_label.as_str(),
+                "usage.input_tokens" = ?input_tokens,
+                "usage.output_tokens" = ?output_tokens,
+                "usage.elapsed_ms" = $summary.elapsed_ms,
+                "usage.upstream_status" = status_str,
                 "usage recorded",
             ),
             LogLevel::Debug => tracing::debug!(
                 target: "agent_shim::usage_recorder",
                 "plugin.kind" = "usage_recorder",
-                $($field = $val),*,
+                "agent_shim.request_id" = $ctx.request_id.0.as_str(),
+                "agent_shim.route" = $ctx.route_label.as_str(),
+                "usage.input_tokens" = ?input_tokens,
+                "usage.output_tokens" = ?output_tokens,
+                "usage.elapsed_ms" = $summary.elapsed_ms,
+                "usage.upstream_status" = status_str,
                 "usage recorded",
             ),
         }
-    };
+    }};
 }
 ```
 
-The `target: "agent_shim::usage_recorder"` enables operator-level filtering via `RUST_LOG=agent_shim::usage_recorder=debug` without interfering with other plugin logs.
+`target: "agent_shim::usage_recorder"` (colon form — tracing canonical syntax) enables operator-level filtering via `RUST_LOG=agent_shim::usage_recorder=debug` independent of other plugin logs.
 
 ### 5.7 Factory
 
