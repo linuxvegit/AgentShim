@@ -15,7 +15,7 @@ P06a deliberately ships **only one** built-in (the simplest). The other two buil
 **In scope:**
 
 1. `PluginRegistry::build(cfg: &GatewayConfig, factories: Vec<Arc<dyn PluginFactory>>) -> Result<Self, RegistryBuildError>` — the real production constructor. Two-phase fail-fast.
-2. `register_builtin_plugins(factories: &mut Vec<Arc<dyn PluginFactory>>)` in `agent_shim_plugins::builtin`, feature-gated.
+2. `builtin_plugins() -> Vec<Arc<dyn PluginFactory>>` in `agent_shim_plugins::builtin`, feature-gated.
 3. `usage_recorder` built-in: H7-only, `sink: log` only, configurable level (info/debug/warn), field-name whitelist (validation-only — runtime always emits all 6 fields).
 4. `AppState::new` returns `Result<(Self, Receiver), anyhow::Error>` so registry build failure surfaces as gateway startup failure.
 5. Cargo feature flag `usage_recorder` (default-on) in `crates/plugins/Cargo.toml`.
@@ -51,7 +51,7 @@ GatewayConfig (config crate)
    ▼
 PluginRegistry::build(cfg, factories) ─── Vec<Arc<dyn PluginFactory>>
    │                                          ▲
-   │                                          │ register_builtin_plugins
+   │                                          │ builtin_plugins()
    │                                          │ (feature-gated)
    │                                          │
    ▼                                       UsageRecorderFactory
@@ -119,19 +119,21 @@ For each `(name, entry_cfg)` in `cfg.plugins`:
 For each `route` in `cfg.routes`:
 
 1. Skip if `route.plugins.is_none()` or all four hook lists are empty (fast path stays in `lookup()`).
-2. Parse `route.frontend: String` → `FrontendKind`. (Layer A validation guarantees this succeeds.)
+2. Parse `route.frontend: String` → `FrontendKind` via a 6-arm private `match` (same alias set as `StaticRouter::from_config`: `"anthropic_messages"|"anthropic" => AnthropicMessages`, `"openai_chat"|"openai" => OpenAiChat`, `"openai_responses"|"responses" => OpenAiResponses`). On unknown string, return `Err(RegistryBuildError::UnknownFrontend { frontend: route.frontend.clone() })`. (Production: Layer A's `VALID_FRONTENDS` check guarantees a match; build() is defensive so test/in-memory callers fail with a typed error instead of panicking.)
 3. For each `(hook_str, plugin_name)` in `block.iter_references()`:
-   - **Layer A invariant**: `plugins.get(plugin_name)` is `Some` (Layer A rejected undeclared references). Safe `.expect("Layer A invariant violated")`.
+   - **Undeclared reference defense**: if `plugins.get(plugin_name)` is `None`, return `Err(RegistryBuildError::UndeclaredPluginReference { route: format!("{frontend}/{model}"), hook: hook_str, plugin_name: plugin_name.to_string() })`. (Production: Layer A catches this earlier; build() is defensive against direct in-memory callers that skip Layer A.)
    - **Layer B rule 6** (hook subscription mismatch): if `entry.plugin.hooks().contains(hook)` is false, return `Err(RegistryBuildError::HookSubscriptionMismatch { frontend, model, plugin, hook, subscribed: <Plugin::hooks() rendered as strs> })`.
    - **Skip disabled** (Layer B rule 7): if `!entry.enabled`, continue (do not push to plan).
    - Push `Arc::clone(entry)` onto the appropriate hook list in `RouteHookPlan`.
 4. Insert `(model.clone(), plan)` into `plans[frontend].specific`. Set `plans[frontend].is_empty = false`.
 
+**Phase 1 defense — factory duplicate kind**: when populating `factory_index`, if a `factory.kind_name()` is already present in the map, return `Err(RegistryBuildError::DuplicateFactoryKind { kind: kind.to_string() })`. P06a built-ins are unique by construction; the check exists to catch test-author footgun (e.g. pushing the same factory twice).
+
 **Wildcard routes** (currently P03 only supports specific routes; wildcard support is implicit `FrontendRoutePlans::wildcard: None`). P06a does not introduce wildcard semantics.
 
 ### 4.3 Error types
 
-`RegistryBuildError` already exists from P02 with the three Layer B variants:
+`RegistryBuildError` already exists from P02 with three Layer B variants (`UnknownKind`, `Instantiation`, `HookSubscriptionMismatch`). P06a adds **three new variants** for defense-in-depth against in-memory callers that bypass Layer A:
 
 ```rust
 pub enum RegistryBuildError {
@@ -144,10 +146,21 @@ pub enum RegistryBuildError {
         hook: &'static str,
         subscribed: Vec<&'static str>,
     },
+    // P06a additions:
+    /// Two factories registered the same `kind_name()`. Catches test-author
+    /// footgun (pushing the same factory twice) and future P06c user-supplied
+    /// factory collisions.
+    DuplicateFactoryKind { kind: String },
+    /// Layer A normally rejects this; build() returns it when called from an
+    /// in-memory test path that skipped Layer A.
+    UndeclaredPluginReference { route: String, hook: &'static str, plugin_name: String },
+    /// `route.frontend` was not one of the six accepted aliases. Layer A's
+    /// `VALID_FRONTENDS` whitelist normally catches this earlier.
+    UnknownFrontend { frontend: String },
 }
 ```
 
-P06a only consumes this enum; no new variants are needed.
+`#[derive(thiserror::Error)]` impl strings are mechanical; defer to the implementation PR.
 
 ### 4.4 HookTimeouts conversion helper
 
@@ -194,7 +207,7 @@ This is `pub(crate)` because Layer A validation in `agent-shim-config` doesn't n
 ### 5.1 Files
 
 - `crates/plugins/src/builtin/usage_recorder.rs` — new file, ~150 LOC + ~120 LOC tests.
-- `crates/plugins/src/builtin/mod.rs` — add `#[cfg(feature = "usage_recorder")] pub mod usage_recorder;` and the `register_builtin_plugins` fn.
+- `crates/plugins/src/builtin/mod.rs` — add `#[cfg(feature = "usage_recorder")] pub mod usage_recorder;` and the `builtin_plugins()` fn.
 
 ### 5.2 YAML schema
 
@@ -229,6 +242,7 @@ struct UsageRecorderConfig {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 enum Sink { Log }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -274,6 +288,8 @@ The `fields` config exists for two purposes:
 
 **At runtime, all 6 fields are always emitted.** Tracing macros require compile-time-static field names, so dynamic selection is not feasible without 64 (= 2^6) emit branches. Spec/rustdoc on `UsageRecorderConfig.fields` makes this explicit.
 
+**Empty list (`fields: []`)** is accepted and treated identically to the default — `fields` does not gate runtime emission, so empty is a no-op same as full. The factory does NOT reject `fields: []`. Rustdoc on `UsageRecorderConfig.fields` calls this out.
+
 If future operators need per-field opt-out (P07 use case?), a follow-up plan can revisit. For v1, the 6 fields are small and predictable enough that always-emit is acceptable.
 
 ### 5.5 Plugin trait impl
@@ -294,11 +310,12 @@ impl Plugin for UsageRecorder {
         ctx: &PluginContext,
         summary: &ResponseSummary,
     ) -> PluginResult<()> {
-        let (input_tokens, output_tokens) = summary
-            .usage
-            .as_ref()
-            .map(|u| (u.input_tokens, u.output_tokens))
-            .unwrap_or((0, 0));
+        // P06a grill Q13: emit tokens as Option<u64>. None → tracing renders
+        // "None" (via Debug) rather than the misleading "0" sentinel; Some(n)
+        // → "Some(n)". Operators distinguishing "unknown" from "real zero"
+        // can grep accordingly.
+        let input_tokens = summary.usage.as_ref().map(|u| u.input_tokens);
+        let output_tokens = summary.usage.as_ref().map(|u| u.output_tokens);
         let status_str = match summary.upstream_status {
             UpstreamStatus::Success => "success",
             UpstreamStatus::Error => "error",
@@ -308,8 +325,8 @@ impl Plugin for UsageRecorder {
             self.level,
             "agent_shim.request_id" = ctx.request_id.0.as_str(),
             "agent_shim.route" = ctx.route_label.as_str(),
-            "usage.input_tokens" = input_tokens,
-            "usage.output_tokens" = output_tokens,
+            "usage.input_tokens" = ?input_tokens,
+            "usage.output_tokens" = ?output_tokens,
             "usage.elapsed_ms" = summary.elapsed_ms,
             "usage.upstream_status" = status_str,
         );
@@ -376,7 +393,7 @@ impl PluginFactory for UsageRecorderFactory {
 }
 ```
 
-## 6. `register_builtin_plugins` design
+## 6. `builtin_plugins` design
 
 Lives in `crates/plugins/src/builtin/mod.rs`:
 
@@ -387,22 +404,24 @@ pub mod usage_recorder;
 use std::sync::Arc;
 use crate::PluginFactory;
 
-/// Append every built-in plugin factory compiled into this binary.
+/// Return every built-in plugin factory compiled into this binary.
 /// Operators opt out via Cargo features at compile time.
 ///
-/// Order is alphabetical for predictable diagnostic output.
-pub fn register_builtin_plugins(factories: &mut Vec<Arc<dyn PluginFactory>>) {
+/// Order is alphabetical for predictable diagnostic output (e.g. the
+/// `known` list in `RegistryBuildError::UnknownKind`).
+pub fn builtin_plugins() -> Vec<Arc<dyn PluginFactory>> {
+    let mut factories: Vec<Arc<dyn PluginFactory>> = Vec::new();
     #[cfg(feature = "usage_recorder")]
     factories.push(Arc::new(usage_recorder::UsageRecorderFactory));
-    // P06b will add prompt_compressor, pii_scrubber here.
+    // P06b will push prompt_compressor, pii_scrubber here.
+    factories
 }
 ```
 
 Caller pattern (in `AppState::build`):
 
 ```rust
-let mut factories: Vec<Arc<dyn PluginFactory>> = Vec::new();
-agent_shim_plugins::builtin::register_builtin_plugins(&mut factories);
+let mut factories: Vec<Arc<dyn PluginFactory>> = agent_shim_plugins::builtin::builtin_plugins();
 // (Future P06c could push user-supplied factories here.)
 let plugins = Arc::new(
     agent_shim_plugins::PluginRegistry::build(&config, factories)?,
@@ -422,7 +441,7 @@ usage_recorder = []
 
 `usage_recorder = []` (no transitive dep activation) because the built-in uses only what plugins crate already imports (`tracing`, `serde`, `serde_json`).
 
-`default-features = false` builds of `agent-shim-plugins` still compile cleanly — `register_builtin_plugins` becomes a no-op.
+`default-features = false` builds of `agent-shim-plugins` still compile cleanly — `builtin_plugins()` returns an empty Vec.
 
 ## 8. `AppState::new` signature change
 
@@ -445,8 +464,7 @@ Prepend (before the existing `let keepalive = ...`):
 ```rust
 // P06a: build plugin registry from config + built-in factories.
 let plugins = {
-    let mut factories: Vec<Arc<dyn PluginFactory>> = Vec::new();
-    agent_shim_plugins::builtin::register_builtin_plugins(&mut factories);
+    let factories = agent_shim_plugins::builtin::builtin_plugins();
     Arc::new(
         agent_shim_plugins::PluginRegistry::build(&config, factories)
             .map_err(|e| anyhow::anyhow!("plugin registry build failed: {e}"))?,
@@ -456,7 +474,7 @@ let plugins = {
 
 Remove the existing `Arc::new(PluginRegistry::empty())` placeholder.
 
-`new_with_plugins` bypasses `register_builtin_plugins` (caller supplies the `plugins: Arc<PluginRegistry>` directly). It needs to convert to `Result` for signature parity but never returns `Err` from the registry-build path — the `?` is consumed elsewhere (or just `Ok(...)` wrapped).
+`new_with_plugins` bypasses `builtin_plugins()` (caller supplies the `plugins: Arc<PluginRegistry>` directly). It still converts to `Result` for signature parity — the build returns `Ok(...)` wrapped because no registry-build path is exercised. The Result preserves the option for future P07 hot-reload to surface additional errors through the same channel.
 
 ### 8.3 `run_core` change
 
@@ -468,11 +486,11 @@ The existing `anyhow::Result` return of `run_core` absorbs the `?`. No new error
 
 ### 8.4 Test-call-site fix-up
 
-`AppState::new(cfg).await` → `AppState::new(cfg).await.expect("test config builds")` (or `.unwrap()` for one-off shapes). Estimated ~20 call sites in `crates/gateway/tests/`. Mechanical change, no test logic touched.
+`AppState::new(cfg).await` → `AppState::new(cfg).await.expect("test config builds")` (or `.unwrap()` for one-off shapes). Verified ~35 call sites across `crates/gateway/src/admin/handlers.rs`, `crates/gateway/src/state.rs`, and ~30 files in `crates/gateway/tests/`. Mechanical change, no test logic touched.
 
 ## 9. Testing strategy
 
-### 9.1 plugins crate unit tests (~8 new in `crates/plugins/src/registry.rs`)
+### 9.1 plugins crate unit tests (~11 new in `crates/plugins/src/registry.rs`)
 
 | Test | Verifies |
 |---|---|
@@ -484,6 +502,9 @@ The existing `anyhow::Result` return of `run_core` absorbs the `?`. No new error
 | `build_disabled_plugin_instantiated_but_not_in_plan` | `enabled: false` plugin appears in `registry.plugins` HashMap but NOT in any `RouteHookPlan`. |
 | `build_timeout_yaml_uniform_converts_correctly` | YAML `timeout_ms: 50` produces `HookTimeouts::uniform(50)`. |
 | `build_timeout_yaml_per_hook_converts_correctly` | YAML `timeout_ms: { default: 100, on_stream_event: 5 }` produces `HookTimeouts { default-fallback, stream_event = 5 }`. |
+| `build_duplicate_factory_kind_returns_error` | Pushing two factories with same `kind_name()` returns `RegistryBuildError::DuplicateFactoryKind`. |
+| `build_undeclared_plugin_ref_returns_error` | `route.plugins` references a name not in `cfg.plugins` returns `RegistryBuildError::UndeclaredPluginReference`. (Layer A would normally catch this — test constructs `GatewayConfig` literal to bypass.) |
+| `build_unknown_frontend_returns_error` | `route.frontend = "weird_dialect"` returns `RegistryBuildError::UnknownFrontend`. |
 
 ### 9.2 usage_recorder unit tests (~8 new in `crates/plugins/src/builtin/usage_recorder.rs`)
 
@@ -500,7 +521,14 @@ The existing `anyhow::Result` return of `run_core` absorbs the `?`. No new error
 
 ### 9.3 Gateway integration test (~1 new in `crates/gateway/tests/usage_recorder_integration.rs`)
 
-End-to-end: hand-built `AppState` (clone P05 T12's `make_app_state` pattern) with a stub provider + a `PluginRegistry::build`-produced registry containing one `usage_recorder`. Drive one HTTP request. Use `#[tracing_test::traced_test]` to assert the H7 log line emerges with all 6 fields.
+End-to-end through the **real** build path (no `make_app_state` shortcut). The test parses a YAML literal into `GatewayConfig`, calls `AppState::new(cfg).await?` (which exercises `builtin_plugins()` + `PluginRegistry::build`), drives one HTTP request, and uses `#[tracing_test::traced_test]` to assert the H7 emission carries the expected fields.
+
+YAML uses an upstream pointing at an unreachable `base_url: "http://127.0.0.1:1"`. The provider call fails (`UpstreamStatus::Error`) but the H7Guard (P04 T7) still fires `run_on_response_complete` on drop — so `usage_recorder` emits its line regardless. This sidesteps the need for a mockito-driven upstream and proves H7-on-error path works end-to-end.
+
+Assertions:
+- HTTP response status (likely 502 from the resilience layer — exact code informational only)
+- `traced_test` log buffer contains a line at `target = "agent_shim::usage_recorder"` with `plugin.kind = "usage_recorder"` and `agent_shim.request_id = req_...` fields populated.
+- `usage.upstream_status = "error"` to confirm the H7-on-error path was hit.
 
 ### 9.4 Existing test fix-ups
 
@@ -509,19 +537,23 @@ Every `crates/gateway/tests/*.rs` call to `AppState::new(cfg).await` or `new_wit
 ### 9.5 Expected test count
 
 - Baseline (after P05): 824 passed
-- registry::build tests: +8
+- registry::build tests: +11
 - usage_recorder unit tests: +8
 - gateway integration: +1
-- **Expected total: ~841**
+- **Expected total: ~844**
 
 ## 10. Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
 | `agent-shim-plugins` depending on `agent-shim-config` reverses the historical "config is leaf" convention. | Verified no cycle (config does not import plugins). `OnErrorYaml` / `TimeoutMs` mirror types in config exist precisely to support this direction. Same pattern as router crate already uses. |
-| `fields` config doing nothing at runtime is confusing. | Rustdoc on `UsageRecorderConfig.fields` + spec §5.4 explicitly state validation-only semantics. Spec §5.4 also documents the 2^6-branch tradeoff. |
-| `AppState::new` signature change ripples across ~20 test files. | Mechanical fix-up — all call sites add `.unwrap()` / `.expect(...)`. Single commit. |
-| `register_builtin_plugins(&mut Vec)` couples factory registration to caller's Vec. | Acceptable for P06a; if user-supplied factories arrive in P06c, the same Vec accepts them. Alternative (linkme auto-registration) is over-engineering at this scale. |
+| `fields` config doing nothing at runtime is confusing. | Rustdoc on `UsageRecorderConfig.fields` + spec §5.4 explicitly state validation-only semantics. Spec §5.4 also documents the `fields: []` no-op behaviour. |
+| `AppState::new` signature change ripples across ~35 test files. | Mechanical fix-up — all call sites add `.unwrap()` / `.expect(...)`. Single commit. Verified count by grep. |
+| `builtin_plugins()` returns Vec and the caller may forget to use it. | Compile-time: `PluginRegistry::build(&cfg, vec![])` succeeds when `cfg.plugins` is empty, fails as `RegistryBuildError::UnknownKind` otherwise — so an unused or empty `builtin_plugins()` surface as a clear Layer B error, not silent skip. |
+| Test author pushes the same factory twice. | `RegistryBuildError::DuplicateFactoryKind` defends. Unit-tested. |
+| In-memory test path bypasses Layer A and produces a config with an undeclared plugin ref or unknown frontend. | `RegistryBuildError::UndeclaredPluginReference` and `RegistryBuildError::UnknownFrontend` defend. Unit-tested. |
+| `Option<u64>` token emit renders as "None"/"Some(1234)" via Debug, not as a plain integer. | Acceptable — operators distinguishing "unknown" from "zero" need exactly this distinction. Documented in §5.5. |
+| Integration test depends on the H7Guard firing in `UpstreamStatus::Error` path. | Already exercised by P05 T12 + P04 T11 wiring — H7Guard is a `Drop`-based guard and always fires regardless of upstream outcome. |
 | Spec § 5.4 default for per-hook `on_stream_event = 5` vs others = 50 — easy to mis-derive in `HookTimeouts::from_yaml`. | Unit test `build_timeout_yaml_per_hook_converts_correctly` checks the fallback chain explicitly. |
 
 ## 11. Spec acceptance criteria
@@ -529,23 +561,24 @@ Every `crates/gateway/tests/*.rs` call to `AppState::new(cfg).await` or `new_wit
 P06a is complete when:
 
 1. `PluginRegistry::build(&cfg, factories)` exists with the documented signature.
-2. Build returns first encountered `RegistryBuildError` on Layer B failures (unknown kind / instantiation / hook mismatch).
-3. Disabled plugins are instantiated but excluded from plans (§5.3 rule 7).
-4. `HookTimeouts::from_yaml` correctly applies the per-hook fallback chain.
-5. `register_builtin_plugins(&mut Vec<Arc<dyn PluginFactory>>)` exists in `agent_shim_plugins::builtin`.
-6. `usage_recorder` ships behind feature `usage_recorder`, default-on.
-7. `usage_recorder` accepts `sink: log`, `level: info|debug|warn`, `fields: [...]` (6-element whitelist).
-8. `usage_recorder` runtime always emits all 6 fields at the configured level on H7.
-9. Invalid `fields` (e.g. `[bogus]`), invalid `level`, or missing `sink` fail Layer B with `PluginConfigError::Deserialize`.
-10. `AppState::new` returns `Result<(Self, Receiver), anyhow::Error>` and surfaces registry-build errors as gateway-start errors.
-11. `crates/core/` diff is empty (frozen-core preserved).
-12. Test count climbs ~17 (registry + plugin + integration).
-13. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
-14. `cargo fmt --all -- --check` is clean.
+2. Build returns first encountered `RegistryBuildError` on Layer B failures.
+3. `RegistryBuildError` has 6 variants: `UnknownKind`, `Instantiation`, `HookSubscriptionMismatch`, `DuplicateFactoryKind`, `UndeclaredPluginReference`, `UnknownFrontend`.
+4. Disabled plugins are instantiated but excluded from plans (§5.3 rule 7).
+5. `HookTimeouts::from_yaml` correctly applies the per-hook fallback chain.
+6. `builtin_plugins() -> Vec<Arc<dyn PluginFactory>>` exists in `agent_shim_plugins::builtin`.
+7. `usage_recorder` ships behind feature `usage_recorder`, default-on.
+8. `usage_recorder` accepts `sink: log`, `level: info|debug|warn`, `fields: [...]` (6-element whitelist, empty list accepted as no-op).
+9. `usage_recorder` runtime always emits all 6 fields at the configured level on H7; tokens emit as `Option<u64>` (None when `summary.usage` is None).
+10. Invalid `fields` (e.g. `[bogus]`), invalid `level`, or missing `sink` fail Layer B with `PluginConfigError::Deserialize`.
+11. `AppState::new` returns `Result<(Self, Receiver), anyhow::Error>` and surfaces registry-build errors as gateway-start errors.
+12. `crates/core/` diff is empty (frozen-core preserved).
+13. Test count climbs ~20 (registry + plugin + integration).
+14. `cargo clippy --workspace --all-targets -- -D warnings` is clean.
+15. `cargo fmt --all -- --check` is clean.
 
 ## 12. YAGNI watch
 
-- **No factory storage on `PluginRegistry`** — P07 reload can re-call `register_builtin_plugins` + `build`. Storing factories adds memory + complexity for zero current value.
+- **No factory storage on `PluginRegistry`** — P07 reload can re-call `builtin_plugins()` + `build`. Storing factories adds memory + complexity for zero current value.
 - **No wildcard route plugins** — P03 schema doesn't expose them; P06a doesn't introduce them.
 - **No per-route plugin disable** — `enabled: false` at top-level disables globally. Per-route opt-out is fine to add later when a real use case emerges.
 - **No runtime-dynamic fields** — fields config is validation-only; 64-branch emit is over-engineering.
