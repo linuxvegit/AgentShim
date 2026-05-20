@@ -16,33 +16,23 @@ use crate::trait_def::{HookSet, Plugin, PluginFactory};
 
 /// Where to send the usage log. Currently only `log` is supported;
 /// future variants may include `file`, `kafka`, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Sink {
     /// Emit via `tracing` (structured log).
+    #[default]
     Log,
 }
 
-impl Default for Sink {
-    fn default() -> Self {
-        Sink::Log
-    }
-}
-
 /// Tracing level for the emitted event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
+    #[default]
     Info,
     Warn,
     Debug,
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        LogLevel::Info
-    }
 }
 
 /// Optional extra fields to include in the log event.
@@ -70,7 +60,7 @@ pub enum Field {
 ///       level: info
 ///       fields: [request_id, route]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageRecorderConfig {
     /// Destination sink (default: log).
@@ -88,16 +78,6 @@ pub struct UsageRecorderConfig {
     pub fields: Vec<Field>,
 }
 
-impl Default for UsageRecorderConfig {
-    fn default() -> Self {
-        Self {
-            sink: Sink::default(),
-            level: LogLevel::default(),
-            fields: Vec::new(),
-        }
-    }
-}
-
 // ─── Factory ─────────────────────────────────────────────────────────────────
 
 /// Factory for `usage_recorder`. Registered via `builtin_plugins()`.
@@ -113,8 +93,8 @@ impl PluginFactory for UsageRecorderFactory {
         plugin_name: &str,
         config: serde_json::Value,
     ) -> Result<Box<dyn Plugin>, PluginConfigError> {
-        let cfg: UsageRecorderConfig =
-            serde_json::from_value(config).map_err(|e| PluginConfigError::Deserialize(e, plugin_name.to_string()))?;
+        let cfg: UsageRecorderConfig = serde_json::from_value(config)
+            .map_err(|e| PluginConfigError::Deserialize(e, plugin_name.to_string()))?;
 
         // Validate: only Log sink is supported right now.
         if cfg.sink != Sink::Log {
@@ -125,9 +105,7 @@ impl PluginFactory for UsageRecorderFactory {
             });
         }
 
-        Ok(Box::new(UsageRecorder {
-            level: cfg.level,
-        }))
+        Ok(Box::new(UsageRecorder { level: cfg.level }))
     }
 }
 
@@ -235,8 +213,7 @@ mod tests {
 
     #[test]
     fn config_explicit_level_debug() {
-        let cfg: UsageRecorderConfig =
-            serde_json::from_value(json!({"level": "debug"})).unwrap();
+        let cfg: UsageRecorderConfig = serde_json::from_value(json!({"level": "debug"})).unwrap();
         assert_eq!(cfg.level, LogLevel::Debug);
     }
 
@@ -244,7 +221,10 @@ mod tests {
     fn config_unknown_field_rejected() {
         let result: Result<UsageRecorderConfig, _> =
             serde_json::from_value(json!({"unknown_key": true}));
-        assert!(result.is_err(), "deny_unknown_fields should reject unknown keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields should reject unknown keys"
+        );
     }
 
     #[test]
@@ -278,8 +258,8 @@ mod tests {
 
     // ── Runtime emission tests ─────────────────────────────────────────────
 
-    use agent_shim_core::{FrontendKind, RequestId, Usage};
     use crate::context::{PluginContext, ResponseSummary, UpstreamStatus};
+    use agent_shim_core::{FrontendKind, RequestId, Usage};
 
     fn make_ctx() -> PluginContext {
         PluginContext {
@@ -312,7 +292,9 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn on_response_complete_emits_at_info_level_with_all_fields() {
-        let plugin = UsageRecorder { level: LogLevel::Info };
+        let plugin = UsageRecorder {
+            level: LogLevel::Info,
+        };
         let ctx = make_ctx();
         let summary = make_summary_success();
         plugin.on_response_complete(&ctx, &summary).await.unwrap();
@@ -324,7 +306,9 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn on_response_complete_with_none_usage_emits_none_via_debug() {
-        let plugin = UsageRecorder { level: LogLevel::Info };
+        let plugin = UsageRecorder {
+            level: LogLevel::Info,
+        };
         let ctx = make_ctx();
         let summary = make_summary_no_usage();
         plugin.on_response_complete(&ctx, &summary).await.unwrap();
@@ -335,7 +319,9 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn on_response_complete_warn_level_emits_at_warn() {
-        let plugin = UsageRecorder { level: LogLevel::Warn };
+        let plugin = UsageRecorder {
+            level: LogLevel::Warn,
+        };
         let ctx = make_ctx();
         let summary = make_summary_success();
         plugin.on_response_complete(&ctx, &summary).await.unwrap();

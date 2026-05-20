@@ -51,6 +51,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tracing-test",
  "uuid",
  "windows",
  "windows-service",

@@ -82,9 +82,7 @@ impl HookTimeouts {
                         .or(*default)
                         .unwrap_or(sys.on_decoded_request),
                     on_resolved: on_resolved.or(*default).unwrap_or(sys.on_resolved),
-                    on_stream_event: on_stream_event
-                        .or(*default)
-                        .unwrap_or(sys.on_stream_event),
+                    on_stream_event: on_stream_event.or(*default).unwrap_or(sys.on_stream_event),
                     on_response_complete: on_response_complete
                         .or(*default)
                         .unwrap_or(sys.on_response_complete),
@@ -722,8 +720,7 @@ impl PluginRegistry {
         for (name, spec) in plugin_specs {
             // Resolve factory
             let factory = factory_map.get(spec.kind.as_str()).ok_or_else(|| {
-                let mut known: Vec<String> =
-                    factory_map.keys().map(|s| s.to_string()).collect();
+                let mut known: Vec<String> = factory_map.keys().map(|s| s.to_string()).collect();
                 known.sort();
                 RegistryBuildError::UnknownKind {
                     plugin: name.clone(),
@@ -787,13 +784,13 @@ impl PluginRegistry {
              -> Result<Vec<Arc<PluginEntry>>, RegistryBuildError> {
                 let mut out = Vec::new();
                 for pname in names {
-                    let entry = plugins
-                        .get(pname)
-                        .ok_or_else(|| RegistryBuildError::UndeclaredPluginReference {
+                    let entry = plugins.get(pname).ok_or_else(|| {
+                        RegistryBuildError::UndeclaredPluginReference {
                             route: route_label.clone(),
                             hook: hook.as_str(),
                             plugin_name: pname.clone(),
-                        })?;
+                        }
+                    })?;
                     // Check hook subscription
                     if !entry.plugin.hooks().contains(hook) {
                         return Err(RegistryBuildError::HookSubscriptionMismatch {
@@ -824,8 +821,9 @@ impl PluginRegistry {
                 on_response_complete: h7,
             };
 
-            let frontend_plans =
-                plans.entry(frontend_kind).or_insert_with(|| FrontendRoutePlans {
+            let frontend_plans = plans
+                .entry(frontend_kind)
+                .or_insert_with(|| FrontendRoutePlans {
                     specific: HashMap::new(),
                     wildcard: None,
                     is_empty: false,
@@ -839,7 +837,11 @@ impl PluginRegistry {
             frontend_plans.is_empty = false;
         }
 
-        Ok(PluginRegistry { plugins, plans, supervisor })
+        Ok(PluginRegistry {
+            plugins,
+            plans,
+            supervisor,
+        })
     }
 }
 
@@ -1670,7 +1672,9 @@ mod tests {
             _plugin_name: &str,
             _config: serde_json::Value,
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
-            Ok(Box::new(CounterPlugin { n: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }))
+            Ok(Box::new(CounterPlugin {
+                n: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }))
         }
     }
 
@@ -1694,6 +1698,7 @@ mod tests {
     }
 
     /// Plugin subscribing to H5 (stream_event) only.
+    #[allow(dead_code)] // used in suite of tests that may compile out under cfg
     struct H5Plugin;
     #[async_trait]
     impl crate::Plugin for H5Plugin {
@@ -1705,6 +1710,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)] // factory helper for tests
     struct H5Factory;
     impl crate::PluginFactory for H5Factory {
         fn kind_name(&self) -> &'static str {
@@ -1746,10 +1752,7 @@ mod tests {
         }
     }
 
-    fn make_plugin_spec(
-        kind: &str,
-        enabled: bool,
-    ) -> agent_shim_config::plugins::PluginEntry {
+    fn make_plugin_spec(kind: &str, enabled: bool) -> agent_shim_config::plugins::PluginEntry {
         agent_shim_config::plugins::PluginEntry {
             kind: kind.to_string(),
             config: serde_json::json!({}),
@@ -1783,12 +1786,8 @@ mod tests {
 
     #[test]
     fn build_duplicate_factory_kind_is_error() {
-        let err = PluginRegistry::build(
-            vec![Box::new(H2Factory), Box::new(H2Factory)],
-            &[],
-            &[],
-        )
-        .unwrap_err();
+        let err = PluginRegistry::build(vec![Box::new(H2Factory), Box::new(H2Factory)], &[], &[])
+            .unwrap_err();
         assert!(
             matches!(err, RegistryBuildError::DuplicateFactoryKind { ref kind } if kind == "h2_plugin"),
             "unexpected error: {err}"
@@ -1870,12 +1869,8 @@ mod tests {
 
     #[test]
     fn build_unknown_frontend_is_error() {
-        let err = PluginRegistry::build(
-            vec![],
-            &[],
-            &[make_route("bogus_frontend", "*", None)],
-        )
-        .unwrap_err();
+        let err = PluginRegistry::build(vec![], &[], &[make_route("bogus_frontend", "*", None)])
+            .unwrap_err();
         assert!(
             matches!(err, RegistryBuildError::UnknownFrontend { ref frontend } if frontend == "bogus_frontend"),
             "unexpected error: {err}"
@@ -1896,8 +1891,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, RegistryBuildError::HookSubscriptionMismatch { ref plugin, ref hook, .. }
-                if plugin == "p" && *hook == "on_stream_event"),
+            matches!(err, RegistryBuildError::HookSubscriptionMismatch { ref plugin, hook, .. }
+                if plugin == "p" && hook == "on_stream_event"),
             "unexpected error: {err}"
         );
     }
