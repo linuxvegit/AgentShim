@@ -1,8 +1,17 @@
-//! Built-in plugin kinds. P02 ships only this module declaration;
-//! P06 adds `prompt_compressor`, `pii_scrubber`, and `usage_recorder`
-//! behind individual Cargo features.
+//! Built-in plugin kinds. P06a ships `usage_recorder` behind a Cargo feature.
 
-// Placeholder. P06 adds:
-//   #[cfg(feature = "plugin-prompt-compressor")]
-//   pub mod prompt_compressor;
-// etc., and a `register_builtin_plugins(factories: &mut Vec<...>)` fn.
+#[cfg(feature = "usage_recorder")]
+pub mod usage_recorder;
+
+use std::sync::Arc;
+
+use crate::PluginFactory;
+
+/// Returns all built-in plugin factories that are compiled in.
+/// Called by `AppState::new` (gateway) to seed `PluginRegistry::build`.
+pub fn builtin_plugins() -> Vec<Arc<dyn PluginFactory>> {
+    let mut factories: Vec<Arc<dyn PluginFactory>> = Vec::new();
+    #[cfg(feature = "usage_recorder")]
+    factories.push(Arc::new(usage_recorder::UsageRecorderFactory));
+    factories
+}
