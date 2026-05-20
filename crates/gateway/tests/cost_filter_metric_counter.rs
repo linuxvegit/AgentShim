@@ -149,7 +149,7 @@ async fn cost_filter_emits_per_axis_metric_counter() {
 
     let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
-    let (state, _reload_rx) = AppState::new(cfg).await;
+    let (state, _reload_rx) = AppState::new(cfg).await.unwrap();
     let pl = TcpListener::bind(public_addr).await.unwrap();
     let al = TcpListener::bind(admin_addr).await.unwrap();
     let pa = server::build_router(state.clone());

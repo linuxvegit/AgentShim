@@ -35,7 +35,7 @@ where
     // configs or skip validation entirely (e.g. tests that bind port 0
     // via TcpListener and rely on the OS to pick a free port).
     let tracing_handles = agent_shim_observability::init(&cfg.logging, cfg.otel.as_ref());
-    let (mut state, mut reload_rx) = crate::state::AppState::new(cfg).await;
+    let (mut state, mut reload_rx) = crate::state::AppState::new(cfg).await?;
 
     // Plan 04 P04 T4: pin the `--config` path onto `AppCore` so the
     // SIGHUP listener and `POST /admin/reload` (with no body) can re-read

@@ -32,7 +32,7 @@ routes:
 "#
     );
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
-    let (state, mut reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, mut reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await.unwrap();
 
     // Compile-time check that `breaker_registry` is the expected type — pins
     // the assumption that the registry sits on `AppCore` and therefore

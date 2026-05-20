@@ -91,7 +91,7 @@ async fn rate_limit_reload_takes_effect_on_next_request() {
     let admin_addr: SocketAddr = format!("{}:{}", admin_cfg.bind, admin_cfg.port)
         .parse()
         .unwrap();
-    let (state, mut reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, mut reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await.unwrap();
 
     // Run the reload-applying task locally inside the test. This mirrors
     // `commands::serve::run`'s task body so the handler's mpsc send →

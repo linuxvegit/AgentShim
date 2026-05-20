@@ -90,6 +90,12 @@ impl PluginSupervisor {
     }
 }
 
+impl std::fmt::Debug for PluginSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginSupervisor").finish_non_exhaustive()
+    }
+}
+
 impl Default for PluginSupervisor {
     fn default() -> Self {
         Self::new()

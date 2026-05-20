@@ -51,6 +51,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tracing-test",
  "uuid",
  "windows",
  "windows-service",
@@ -148,6 +149,7 @@ dependencies = [
 name = "agent-shim-plugins"
 version = "0.6.1"
 dependencies = [
+ "agent-shim-config",
  "agent-shim-core",
  "agent-shim-observability",
  "agent-shim-tokens",
