@@ -16,7 +16,7 @@ use std::time::Duration;
 use agent_shim_core::FrontendKind;
 
 use crate::error::{OnError, PluginConfigError, PluginError};
-use crate::trait_def::{Hook, Plugin};
+use crate::trait_def::{Hook, HookSet, Plugin, PluginFactory};
 
 /// Per-hook timeouts for a single plugin. Defaults follow spec §5.4:
 /// 50 ms for H2/H3/H7, 5 ms for H5.
@@ -106,10 +106,22 @@ pub struct PluginEntry {
     pub enabled: bool,
 }
 
+impl std::fmt::Debug for PluginEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginEntry")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("on_error", &self.on_error)
+            .field("enabled", &self.enabled)
+            .finish_non_exhaustive()
+    }
+}
+
 /// All routes' per-hook ordered plugin lists, grouped by frontend.
 /// The fast-path lookup is `plans.get(&frontend)` — when the result
 /// is `None` or `is_empty == true`, the wrapper returns identity
 /// without examining the inner maps (Q5 option C).
+#[derive(Debug)]
 #[allow(dead_code)] // fields populated by P03 from_specs constructor
 pub(crate) struct FrontendRoutePlans {
     pub(crate) specific: HashMap<String, RouteHookPlan>,
@@ -117,7 +129,7 @@ pub(crate) struct FrontendRoutePlans {
     pub(crate) is_empty: bool,
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 #[allow(dead_code)] // fields populated by P03 from_specs constructor
 pub(crate) struct RouteHookPlan {
     pub(crate) on_decoded_request: Vec<Arc<PluginEntry>>,
@@ -185,6 +197,7 @@ impl<S: futures::Stream + Unpin> futures::Stream for GuardedH5Stream<S> {
 
 /// Top-level plugin registry. Constructed once at startup. Immutable
 /// thereafter; reload rebuilds the whole thing and arc-swaps (Q12).
+#[derive(Debug)]
 pub struct PluginRegistry {
     #[allow(dead_code)] // populated by P06 from_specs; lookup goes via `plans`
     pub(crate) plugins: HashMap<String, Arc<PluginEntry>>,
@@ -655,6 +668,180 @@ pub enum RegistryBuildError {
 // the config crate exposes parsed plugin/route entries. For P02 we ship
 // `empty()` plus the type machinery so that pipeline-integration tests
 // in P04 can use `PluginRegistry::empty()` as the no-plugins baseline.
+
+/// Returns the hook names (as `&'static str` slice) that `hs` contains.
+/// Used in `HookSubscriptionMismatch` error construction.
+fn hook_set_to_strs(hs: HookSet) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if hs.contains(Hook::DecodedRequest) {
+        v.push(Hook::DecodedRequest.as_str());
+    }
+    if hs.contains(Hook::Resolved) {
+        v.push(Hook::Resolved.as_str());
+    }
+    if hs.contains(Hook::StreamEvent) {
+        v.push(Hook::StreamEvent.as_str());
+    }
+    if hs.contains(Hook::ResponseComplete) {
+        v.push(Hook::ResponseComplete.as_str());
+    }
+    v
+}
+
+impl PluginRegistry {
+    /// Fail-fast constructor. Consumes a list of `(name, PluginEntry_config)`
+    /// plugin specs and a list of `RouteEntry` route specs, plus the set of
+    /// registered factories, and returns either a fully-wired `PluginRegistry`
+    /// or the first `RegistryBuildError` encountered.
+    ///
+    /// Three phases (all fail-fast):
+    /// 1. Index factories; detect duplicate kind names.
+    /// 2. Instantiate every declared plugin; build `plugins` map.
+    /// 3. For every route spec, parse the frontend, resolve per-hook plugin
+    ///    lists, verify hook subscriptions, build the `plans` map.
+    pub fn build(
+        factories: Vec<Box<dyn PluginFactory>>,
+        plugin_specs: &[(String, agent_shim_config::plugins::PluginEntry)],
+        route_specs: &[agent_shim_config::schema::RouteEntry],
+    ) -> Result<Self, RegistryBuildError> {
+        let supervisor = Arc::new(crate::supervisor::PluginSupervisor::default());
+        // ── Phase 1: index factories ──────────────────────────────────────
+        let mut factory_map: HashMap<&'static str, Box<dyn PluginFactory>> = HashMap::new();
+        for factory in factories {
+            let kind = factory.kind_name();
+            if factory_map.contains_key(kind) {
+                return Err(RegistryBuildError::DuplicateFactoryKind {
+                    kind: kind.to_string(),
+                });
+            }
+            factory_map.insert(kind, factory);
+        }
+
+        // ── Phase 2: instantiate plugins ──────────────────────────────────
+        let mut plugins: HashMap<String, Arc<PluginEntry>> = HashMap::new();
+        for (name, spec) in plugin_specs {
+            // Resolve factory
+            let factory = factory_map.get(spec.kind.as_str()).ok_or_else(|| {
+                let mut known: Vec<String> =
+                    factory_map.keys().map(|s| s.to_string()).collect();
+                known.sort();
+                RegistryBuildError::UnknownKind {
+                    plugin: name.clone(),
+                    kind: spec.kind.clone(),
+                    known,
+                }
+            })?;
+
+            // Instantiate (config validation)
+            let plugin_box = factory
+                .instantiate(name, spec.config.clone())
+                .map_err(|e| RegistryBuildError::Instantiation(e, name.clone()))?;
+
+            let timeouts = match &spec.timeout_ms {
+                Some(t) => HookTimeouts::from_yaml(t),
+                None => HookTimeouts::default(),
+            };
+
+            let on_error = match spec.on_error {
+                agent_shim_config::plugins::OnErrorYaml::Skip => OnError::Skip,
+                agent_shim_config::plugins::OnErrorYaml::Fail => OnError::Fail,
+            };
+
+            let entry = Arc::new(PluginEntry {
+                name: name.clone(),
+                kind: plugin_box.kind_name(),
+                plugin: Arc::from(plugin_box),
+                on_error,
+                timeouts,
+                enabled: spec.enabled,
+            });
+            plugins.insert(name.clone(), entry);
+        }
+
+        // ── Phase 3: build route plans ────────────────────────────────────
+        let mut plans: HashMap<FrontendKind, FrontendRoutePlans> = HashMap::new();
+
+        for route in route_specs {
+            // Parse frontend kind
+            let frontend_kind = match route.frontend.as_str() {
+                "anthropic" | "anthropic_messages" => FrontendKind::AnthropicMessages,
+                "openai" | "openai_chat" => FrontendKind::OpenAiChat,
+                "openai_responses" | "responses" => FrontendKind::OpenAiResponses,
+                other => {
+                    return Err(RegistryBuildError::UnknownFrontend {
+                        frontend: other.to_string(),
+                    });
+                }
+            };
+
+            let route_plugins = match &route.plugins {
+                None => continue,
+                Some(rp) if rp.is_empty() => continue,
+                Some(rp) => rp,
+            };
+
+            let route_label = format!("{}/{}", route.frontend, route.model);
+
+            let resolve_hook = |hook: Hook,
+                                names: &Vec<String>|
+             -> Result<Vec<Arc<PluginEntry>>, RegistryBuildError> {
+                let mut out = Vec::new();
+                for pname in names {
+                    let entry = plugins
+                        .get(pname)
+                        .ok_or_else(|| RegistryBuildError::UndeclaredPluginReference {
+                            route: route_label.clone(),
+                            hook: hook.as_str(),
+                            plugin_name: pname.clone(),
+                        })?;
+                    // Check hook subscription
+                    if !entry.plugin.hooks().contains(hook) {
+                        return Err(RegistryBuildError::HookSubscriptionMismatch {
+                            frontend: frontend_kind,
+                            model: route.model.clone(),
+                            plugin: pname.clone(),
+                            hook: hook.as_str(),
+                            subscribed: hook_set_to_strs(entry.plugin.hooks()),
+                        });
+                    }
+                    // Skip disabled plugins in plan (but validate above)
+                    if entry.enabled {
+                        out.push(Arc::clone(entry));
+                    }
+                }
+                Ok(out)
+            };
+
+            let h2 = resolve_hook(Hook::DecodedRequest, &route_plugins.on_decoded_request)?;
+            let h3 = resolve_hook(Hook::Resolved, &route_plugins.on_resolved)?;
+            let h5 = resolve_hook(Hook::StreamEvent, &route_plugins.on_stream_event)?;
+            let h7 = resolve_hook(Hook::ResponseComplete, &route_plugins.on_response_complete)?;
+
+            let plan = RouteHookPlan {
+                on_decoded_request: h2,
+                on_resolved: h3,
+                on_stream_event: h5,
+                on_response_complete: h7,
+            };
+
+            let frontend_plans =
+                plans.entry(frontend_kind).or_insert_with(|| FrontendRoutePlans {
+                    specific: HashMap::new(),
+                    wildcard: None,
+                    is_empty: false,
+                });
+
+            if route.model == "*" {
+                frontend_plans.wildcard = Some(plan);
+            } else {
+                frontend_plans.specific.insert(route.model.clone(), plan);
+            }
+            frontend_plans.is_empty = false;
+        }
+
+        Ok(PluginRegistry { plugins, plans, supervisor })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1468,5 +1655,320 @@ mod tests {
         assert_eq!(t.on_resolved, 77);
         assert_eq!(t.on_stream_event, 3);
         assert_eq!(t.on_response_complete, 77);
+    }
+
+    // ── build() tests (Task 4) ─────────────────────────────────────────────
+
+    /// Minimal factory that creates a plugin subscribing to H2 only.
+    struct H2Factory;
+    impl crate::PluginFactory for H2Factory {
+        fn kind_name(&self) -> &'static str {
+            "h2_plugin"
+        }
+        fn instantiate(
+            &self,
+            _plugin_name: &str,
+            _config: serde_json::Value,
+        ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
+            Ok(Box::new(CounterPlugin { n: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }))
+        }
+    }
+
+    /// Factory that always fails instantiation.
+    struct FailFactory;
+    impl crate::PluginFactory for FailFactory {
+        fn kind_name(&self) -> &'static str {
+            "fail_plugin"
+        }
+        fn instantiate(
+            &self,
+            plugin_name: &str,
+            _config: serde_json::Value,
+        ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
+            Err(crate::error::PluginConfigError::InvalidValue {
+                plugin: plugin_name.to_string(),
+                field: "strategy",
+                reason: "deliberate failure".to_string(),
+            })
+        }
+    }
+
+    /// Plugin subscribing to H5 (stream_event) only.
+    struct H5Plugin;
+    #[async_trait]
+    impl crate::Plugin for H5Plugin {
+        fn kind_name(&self) -> &'static str {
+            "h5_plugin"
+        }
+        fn hooks(&self) -> crate::trait_def::HookSet {
+            crate::trait_def::HookSet::STREAM_EVENT
+        }
+    }
+
+    struct H5Factory;
+    impl crate::PluginFactory for H5Factory {
+        fn kind_name(&self) -> &'static str {
+            "h5_plugin"
+        }
+        fn instantiate(
+            &self,
+            _plugin_name: &str,
+            _config: serde_json::Value,
+        ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
+            Ok(Box::new(H5Plugin))
+        }
+    }
+
+    /// Plugin subscribing to both H2 and H7.
+    struct H2H7Plugin;
+    #[async_trait]
+    impl crate::Plugin for H2H7Plugin {
+        fn kind_name(&self) -> &'static str {
+            "h2h7_plugin"
+        }
+        fn hooks(&self) -> crate::trait_def::HookSet {
+            crate::trait_def::HookSet::DECODED_REQUEST
+                | crate::trait_def::HookSet::RESPONSE_COMPLETE
+        }
+    }
+
+    struct H2H7Factory;
+    impl crate::PluginFactory for H2H7Factory {
+        fn kind_name(&self) -> &'static str {
+            "h2h7_plugin"
+        }
+        fn instantiate(
+            &self,
+            _plugin_name: &str,
+            _config: serde_json::Value,
+        ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
+            Ok(Box::new(H2H7Plugin))
+        }
+    }
+
+    fn make_plugin_spec(
+        kind: &str,
+        enabled: bool,
+    ) -> agent_shim_config::plugins::PluginEntry {
+        agent_shim_config::plugins::PluginEntry {
+            kind: kind.to_string(),
+            config: serde_json::json!({}),
+            on_error: agent_shim_config::plugins::OnErrorYaml::Skip,
+            timeout_ms: None,
+            enabled,
+        }
+    }
+
+    fn make_route(
+        frontend: &str,
+        model: &str,
+        plugins: Option<agent_shim_config::plugins::RoutePluginsBlock>,
+    ) -> agent_shim_config::schema::RouteEntry {
+        let mut r = agent_shim_config::schema::RouteEntry::singular(
+            frontend.to_string(),
+            model.to_string(),
+            "upstream".to_string(),
+            String::new(),
+        );
+        r.plugins = plugins;
+        r
+    }
+
+    #[test]
+    fn build_empty_returns_empty_registry() {
+        let reg = PluginRegistry::build(vec![], &[], &[]).unwrap();
+        assert!(reg.plugins.is_empty());
+        assert!(reg.plans.is_empty());
+    }
+
+    #[test]
+    fn build_duplicate_factory_kind_is_error() {
+        let err = PluginRegistry::build(
+            vec![Box::new(H2Factory), Box::new(H2Factory)],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryBuildError::DuplicateFactoryKind { ref kind } if kind == "h2_plugin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_unknown_kind_is_error() {
+        let err = PluginRegistry::build(
+            vec![],
+            &[("p".to_string(), make_plugin_spec("unknown_kind", true))],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryBuildError::UnknownKind { ref kind, .. } if kind == "unknown_kind"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_instantiation_error_propagates() {
+        let err = PluginRegistry::build(
+            vec![Box::new(FailFactory)],
+            &[("p".to_string(), make_plugin_spec("fail_plugin", true))],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryBuildError::Instantiation(_, ref name) if name == "p"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_disabled_plugin_excluded_from_plans() {
+        let route_block = agent_shim_config::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["p".to_string()],
+            ..Default::default()
+        };
+        // disabled=true but referenced in a route — build should succeed (disabled plugins
+        // are still instantiated for config validation, just excluded from plan lists)
+        let reg = PluginRegistry::build(
+            vec![Box::new(H2Factory)],
+            &[("p".to_string(), make_plugin_spec("h2_plugin", false))],
+            &[make_route("anthropic", "claude-3", Some(route_block))],
+        )
+        .unwrap();
+        // Plugin is in the registry map
+        assert!(reg.plugins.contains_key("p"));
+        assert!(!reg.plugins["p"].enabled);
+        // But the route plan list must be empty for the disabled plugin
+        let plan = reg
+            .plans
+            .get(&agent_shim_core::FrontendKind::AnthropicMessages)
+            .and_then(|frp| frp.specific.get("claude-3"));
+        let h2_len = plan.map_or(0, |p| p.on_decoded_request.len());
+        assert_eq!(h2_len, 0, "disabled plugin must not appear in plan");
+    }
+
+    #[test]
+    fn build_undeclared_plugin_reference_is_error() {
+        let route_block = agent_shim_config::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["ghost".to_string()],
+            ..Default::default()
+        };
+        let err = PluginRegistry::build(
+            vec![Box::new(H2Factory)],
+            &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
+            &[make_route("anthropic", "claude-3", Some(route_block))],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryBuildError::UndeclaredPluginReference { ref plugin_name, .. }
+                if plugin_name == "ghost"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_unknown_frontend_is_error() {
+        let err = PluginRegistry::build(
+            vec![],
+            &[],
+            &[make_route("bogus_frontend", "*", None)],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryBuildError::UnknownFrontend { ref frontend } if frontend == "bogus_frontend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_hook_subscription_mismatch_is_error() {
+        // "p" subscribes to H2 only; route asks for it on H5
+        let route_block = agent_shim_config::plugins::RoutePluginsBlock {
+            on_stream_event: vec!["p".to_string()],
+            ..Default::default()
+        };
+        let err = PluginRegistry::build(
+            vec![Box::new(H2Factory)],
+            &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
+            &[make_route("anthropic", "claude-3", Some(route_block))],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RegistryBuildError::HookSubscriptionMismatch { ref plugin, ref hook, .. }
+                if plugin == "p" && *hook == "on_stream_event"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_single_plugin_single_route_populates_plan() {
+        let route_block = agent_shim_config::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["p".to_string()],
+            ..Default::default()
+        };
+        let reg = PluginRegistry::build(
+            vec![Box::new(H2Factory)],
+            &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
+            &[make_route("anthropic", "claude-3", Some(route_block))],
+        )
+        .unwrap();
+        let frp = reg
+            .plans
+            .get(&agent_shim_core::FrontendKind::AnthropicMessages)
+            .expect("AnthropicMessages plan missing");
+        let plan = frp.specific.get("claude-3").expect("claude-3 plan missing");
+        assert_eq!(plan.on_decoded_request.len(), 1);
+        assert_eq!(plan.on_decoded_request[0].name, "p");
+        assert!(plan.on_resolved.is_empty());
+        assert!(plan.on_stream_event.is_empty());
+        assert!(plan.on_response_complete.is_empty());
+    }
+
+    #[test]
+    fn build_wildcard_model_populates_wildcard_plan() {
+        let route_block = agent_shim_config::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["p".to_string()],
+            ..Default::default()
+        };
+        let reg = PluginRegistry::build(
+            vec![Box::new(H2Factory)],
+            &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
+            &[make_route("anthropic", "*", Some(route_block))],
+        )
+        .unwrap();
+        let frp = reg
+            .plans
+            .get(&agent_shim_core::FrontendKind::AnthropicMessages)
+            .expect("AnthropicMessages plan missing");
+        assert!(frp.wildcard.is_some(), "wildcard plan should be populated");
+        let wc = frp.wildcard.as_ref().unwrap();
+        assert_eq!(wc.on_decoded_request.len(), 1);
+        assert_eq!(wc.on_decoded_request[0].name, "p");
+    }
+
+    #[test]
+    fn build_multiple_hooks_same_plugin() {
+        let route_block = agent_shim_config::plugins::RoutePluginsBlock {
+            on_decoded_request: vec!["p".to_string()],
+            on_response_complete: vec!["p".to_string()],
+            ..Default::default()
+        };
+        let reg = PluginRegistry::build(
+            vec![Box::new(H2H7Factory)],
+            &[("p".to_string(), make_plugin_spec("h2h7_plugin", true))],
+            &[make_route("anthropic", "claude-3", Some(route_block))],
+        )
+        .unwrap();
+        let frp = reg
+            .plans
+            .get(&agent_shim_core::FrontendKind::AnthropicMessages)
+            .unwrap();
+        let plan = frp.specific.get("claude-3").unwrap();
+        assert_eq!(plan.on_decoded_request.len(), 1);
+        assert_eq!(plan.on_response_complete.len(), 1);
+        assert!(plan.on_resolved.is_empty());
+        assert!(plan.on_stream_event.is_empty());
     }
 }
