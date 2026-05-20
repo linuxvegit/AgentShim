@@ -565,6 +565,14 @@ impl PluginRegistry {
 
 /// Errors the registry surfaces during construction. Wrapped by
 /// `gateway::main` into the boot-time error envelope.
+///
+/// Layer B (the gateway-side validation, see plugin design spec §5.3)
+/// surfaces three variants: `UnknownKind`, `Instantiation`,
+/// `HookSubscriptionMismatch`. P06a adds three defensive variants
+/// (`DuplicateFactoryKind`, `UndeclaredPluginReference`,
+/// `UnknownFrontend`) so `build()` is safe to call from in-memory test
+/// paths that bypass Layer A. Layer A normally rejects these cases
+/// earlier in production.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryBuildError {
     #[error("plugin `{plugin}` references unknown kind `{kind}` (known: {known:?})")]
@@ -586,6 +594,26 @@ pub enum RegistryBuildError {
         hook: &'static str,
         subscribed: Vec<&'static str>,
     },
+    /// Two factories registered the same `kind_name()`. Catches
+    /// test-author footgun (pushing the same factory twice) and future
+    /// P06c user-supplied factory collisions.
+    #[error("factory kind `{kind}` already registered (duplicate factory)")]
+    DuplicateFactoryKind { kind: String },
+    /// Layer A normally rejects this; build() returns it when called from
+    /// an in-memory test path that skipped Layer A.
+    #[error(
+        "route `{route}` on hook `{hook}` references undeclared plugin `{plugin_name}` \
+         (declare it under top-level `plugins:`)"
+    )]
+    UndeclaredPluginReference {
+        route: String,
+        hook: &'static str,
+        plugin_name: String,
+    },
+    /// `route.frontend` was not one of the six accepted aliases. Layer A's
+    /// `VALID_FRONTENDS` whitelist normally catches this earlier.
+    #[error("unknown frontend `{frontend}` in route plugins block")]
+    UnknownFrontend { frontend: String },
 }
 
 // ── Construction ────────────────────────────────────────────────────────────
@@ -1301,5 +1329,50 @@ mod tests {
             vec![("slow".to_string(), 1)],
             "slow H7 plugin dropped with attribution"
         );
+    }
+
+    // ── Plan 07 P06a T2: RegistryBuildError new variants ───────────────
+
+    #[test]
+    fn registry_build_error_unknown_kind_display_format() {
+        let err = RegistryBuildError::UnknownKind {
+            plugin: "foo".to_string(),
+            kind: "nonexistent".to_string(),
+            known: vec!["a".to_string(), "b".to_string()],
+        };
+        let s = err.to_string();
+        assert!(s.contains("foo"));
+        assert!(s.contains("nonexistent"));
+    }
+
+    #[test]
+    fn registry_build_error_duplicate_factory_kind_display_format() {
+        let err = RegistryBuildError::DuplicateFactoryKind {
+            kind: "usage_recorder".to_string(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("usage_recorder"));
+        assert!(s.to_lowercase().contains("duplicate") || s.to_lowercase().contains("registered"));
+    }
+
+    #[test]
+    fn registry_build_error_undeclared_plugin_reference_display_format() {
+        let err = RegistryBuildError::UndeclaredPluginReference {
+            route: "anthropic_messages/test-model".to_string(),
+            hook: "on_decoded_request",
+            plugin_name: "missing_plugin".to_string(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("missing_plugin"));
+        assert!(s.contains("anthropic_messages/test-model"));
+    }
+
+    #[test]
+    fn registry_build_error_unknown_frontend_display_format() {
+        let err = RegistryBuildError::UnknownFrontend {
+            frontend: "weird_dialect".to_string(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("weird_dialect"));
     }
 }
