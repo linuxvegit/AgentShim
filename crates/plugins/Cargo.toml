@@ -10,7 +10,16 @@ repository.workspace = true
 name = "agent_shim_plugins"
 path = "src/lib.rs"
 
+[features]
+default = ["usage_recorder"]
+# Each built-in lives behind its own Cargo feature. Disabling a
+# feature removes the factory from `builtin_plugins()` and the plugin
+# code from the binary. P06b will add prompt_compressor and
+# pii_scrubber here (with possible regex dep activation).
+usage_recorder = []
+
 [dependencies]
+agent-shim-config = { path = "../config" }
 agent-shim-core = { path = "../core" }
 agent-shim-observability = { path = "../observability" }
 agent-shim-tokens = { path = "../tokens" }
