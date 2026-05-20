@@ -169,7 +169,7 @@ async fn spawn_gateway(
     clock: Arc<dyn Clock>,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let cfg = make_config(oai_a_url, oai_b_url);
-    let (state, _reload_rx) = AppState::new_with_clock(cfg, clock).await;
+    let (state, _reload_rx) = AppState::new_with_clock(cfg, clock).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

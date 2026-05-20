@@ -98,7 +98,7 @@ routes:
         server.url()
     );
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
-    let (state, _reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, _reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await.unwrap();
     let public_addr: SocketAddr = format!("127.0.0.1:{public_port}").parse().unwrap();
     let listener = tokio::net::TcpListener::bind(public_addr).await.unwrap();
     let app = agent_shim_gateway::server::build_router(state);

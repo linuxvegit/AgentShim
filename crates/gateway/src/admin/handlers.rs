@@ -72,7 +72,7 @@ routes:
     async fn readyz_not_ready_without_routes() {
         let cfg: agent_shim_config::GatewayConfig =
             serde_yaml::from_str(yaml_with_providers_no_routes()).unwrap();
-        let (state, _reload_rx) = crate::state::AppState::new(cfg).await;
+        let (state, _reload_rx) = crate::state::AppState::new(cfg).await.expect("test AppState build");
         let response = readyz(axum::extract::State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -81,7 +81,7 @@ routes:
     async fn readyz_ready_with_routes_and_providers() {
         let cfg: agent_shim_config::GatewayConfig =
             serde_yaml::from_str(yaml_with_providers_and_routes()).unwrap();
-        let (state, _reload_rx) = crate::state::AppState::new(cfg).await;
+        let (state, _reload_rx) = crate::state::AppState::new(cfg).await.expect("test AppState build");
         let response = readyz(axum::extract::State(state)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }

@@ -34,7 +34,7 @@ routes:
     let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
     let public_addr: SocketAddr = format!("127.0.0.1:{public}").parse().unwrap();
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin}").parse().unwrap();
-    let (state, mut reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await;
+    let (state, mut reload_rx) = agent_shim_gateway::state::AppState::new(cfg).await.unwrap();
 
     // Drive the reload-applying task locally so POST /admin/reload's
     // mpsc send → oneshot reply round-trip completes inside the test.

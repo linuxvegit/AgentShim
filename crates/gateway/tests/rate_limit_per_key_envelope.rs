@@ -230,7 +230,7 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
 async fn spawn_with_config(
     config: GatewayConfig,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    let (state, _reload_rx) = AppState::new(config).await;
+    let (state, _reload_rx) = AppState::new(config).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

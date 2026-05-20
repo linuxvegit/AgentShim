@@ -160,16 +160,11 @@ pub struct AppState {
 impl AppState {
     pub async fn new(
         config: agent_shim_config::GatewayConfig,
-    ) -> (
+    ) -> anyhow::Result<(
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
-    ) {
-        Self::build(
-            config,
-            Arc::new(SystemClock),
-            Arc::new(agent_shim_plugins::PluginRegistry::empty()),
-        )
-        .await
+    )> {
+        Self::build(config, Arc::new(SystemClock), None).await
     }
 
     /// Test-only constructor that lets tests inject a custom `Clock` into
@@ -189,16 +184,11 @@ impl AppState {
     pub async fn new_with_clock(
         config: agent_shim_config::GatewayConfig,
         clock: Arc<dyn Clock>,
-    ) -> (
+    ) -> anyhow::Result<(
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
-    ) {
-        Self::build(
-            config,
-            clock,
-            Arc::new(agent_shim_plugins::PluginRegistry::empty()),
-        )
-        .await
+    )> {
+        Self::build(config, clock, None).await
     }
 
     /// Plan 07 P04 T12: integration-test-only constructor that lets tests
@@ -215,11 +205,11 @@ impl AppState {
     pub async fn new_with_plugins(
         config: agent_shim_config::GatewayConfig,
         plugins: Arc<agent_shim_plugins::PluginRegistry>,
-    ) -> (
+    ) -> anyhow::Result<(
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
-    ) {
-        Self::build(config, Arc::new(SystemClock), plugins).await
+    )> {
+        Self::build(config, Arc::new(SystemClock), Some(plugins)).await
     }
 
     /// Shared construction path for `new`, `new_with_clock`, and
@@ -231,11 +221,30 @@ impl AppState {
     async fn build(
         config: agent_shim_config::GatewayConfig,
         clock: Arc<dyn Clock>,
-        plugins: Arc<agent_shim_plugins::PluginRegistry>,
-    ) -> (
+        plugin_override: Option<Arc<agent_shim_plugins::PluginRegistry>>,
+    ) -> anyhow::Result<(
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
-    ) {
+    )> {
+        let plugins = match plugin_override {
+            Some(p) => p,
+            None => {
+                let factories = agent_shim_plugins::builtin::builtin_plugins();
+                let plugin_specs: Vec<(String, agent_shim_config::plugins::PluginEntry)> = config
+                    .plugins
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.clone()))
+                    .collect();
+                Arc::new(
+                    agent_shim_plugins::PluginRegistry::build(
+                        factories,
+                        &plugin_specs,
+                        &config.routes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("plugin registry build failed: {e}"))?,
+                )
+            }
+        };
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
         let anthropic = Arc::new(AnthropicMessages {
             keepalive: Some(keepalive),
@@ -400,13 +409,13 @@ impl AppState {
             plugins,
         };
 
-        (
+        Ok((
             Self {
                 core: Arc::new(core),
                 snapshot: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             },
             reload_rx,
-        )
+        ))
     }
 }
 
@@ -443,7 +452,7 @@ routes:
     #[tokio::test]
     async fn appstate_split_into_core_and_snapshot() {
         let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
-        let (state, _reload_rx) = AppState::new(cfg).await;
+        let (state, _reload_rx) = AppState::new(cfg).await.unwrap();
 
         // Compile-time assertions: each half holds the right type. Pinning
         // the types here ensures a future refactor can't quietly move a
@@ -476,7 +485,7 @@ routes:
         // The §2.2 invariant: in-flight requests use the snapshot at the
         // time of their start. Mid-request swap doesn't reach them.
         let cfg: agent_shim_config::GatewayConfig = serde_yaml::from_str(minimal_yaml()).unwrap();
-        let (state, _reload_rx) = AppState::new(cfg).await;
+        let (state, _reload_rx) = AppState::new(cfg).await.unwrap();
 
         // Simulate request capture (what pipeline::dispatch does at the top).
         let captured = state.snapshot.load_full();
