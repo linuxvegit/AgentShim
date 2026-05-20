@@ -59,6 +59,39 @@ impl HookTimeouts {
             Hook::ResponseComplete => self.on_response_complete,
         }
     }
+
+    /// Convert the YAML config representation (`TimeoutMs`) into a
+    /// runtime `HookTimeouts`.
+    ///
+    /// Fallback chain per hook (spec §5.4):
+    /// explicit per-hook override → `default` field → system default.
+    pub(crate) fn from_yaml(yaml: &agent_shim_config::plugins::TimeoutMs) -> Self {
+        use agent_shim_config::plugins::TimeoutMs;
+        match yaml {
+            TimeoutMs::Uniform(ms) => Self::uniform(*ms),
+            TimeoutMs::PerHook {
+                default,
+                on_decoded_request,
+                on_resolved,
+                on_stream_event,
+                on_response_complete,
+            } => {
+                let sys = Self::default();
+                Self {
+                    on_decoded_request: on_decoded_request
+                        .or(*default)
+                        .unwrap_or(sys.on_decoded_request),
+                    on_resolved: on_resolved.or(*default).unwrap_or(sys.on_resolved),
+                    on_stream_event: on_stream_event
+                        .or(*default)
+                        .unwrap_or(sys.on_stream_event),
+                    on_response_complete: on_response_complete
+                        .or(*default)
+                        .unwrap_or(sys.on_response_complete),
+                }
+            }
+        }
+    }
 }
 
 /// One entry in the registry, plus the policy knobs bound to it.
@@ -1374,5 +1407,66 @@ mod tests {
         };
         let s = err.to_string();
         assert!(s.contains("weird_dialect"));
+    }
+
+    // ── Plan 07 P06a T3: HookTimeouts::from_yaml ────────────────────────────
+
+    #[test]
+    fn hook_timeouts_from_yaml_uniform_applies_to_all_hooks() {
+        use agent_shim_config::plugins::TimeoutMs;
+        let t = HookTimeouts::from_yaml(&TimeoutMs::Uniform(99));
+        assert_eq!(t.on_decoded_request, 99);
+        assert_eq!(t.on_resolved, 99);
+        assert_eq!(t.on_stream_event, 99);
+        assert_eq!(t.on_response_complete, 99);
+    }
+
+    #[test]
+    fn hook_timeouts_from_yaml_per_hook_with_default_uses_default_for_missing() {
+        use agent_shim_config::plugins::TimeoutMs;
+        let t = HookTimeouts::from_yaml(&TimeoutMs::PerHook {
+            default: Some(77),
+            on_decoded_request: None,
+            on_resolved: None,
+            on_stream_event: None,
+            on_response_complete: None,
+        });
+        assert_eq!(t.on_decoded_request, 77);
+        assert_eq!(t.on_resolved, 77);
+        assert_eq!(t.on_stream_event, 77);
+        assert_eq!(t.on_response_complete, 77);
+    }
+
+    #[test]
+    fn hook_timeouts_from_yaml_per_hook_without_default_falls_back_to_system_defaults() {
+        use agent_shim_config::plugins::TimeoutMs;
+        let sys = HookTimeouts::default();
+        let t = HookTimeouts::from_yaml(&TimeoutMs::PerHook {
+            default: None,
+            on_decoded_request: None,
+            on_resolved: None,
+            on_stream_event: None,
+            on_response_complete: None,
+        });
+        assert_eq!(t.on_decoded_request, sys.on_decoded_request);
+        assert_eq!(t.on_resolved, sys.on_resolved);
+        assert_eq!(t.on_stream_event, sys.on_stream_event);
+        assert_eq!(t.on_response_complete, sys.on_response_complete);
+    }
+
+    #[test]
+    fn hook_timeouts_from_yaml_per_hook_explicit_field_wins_over_default() {
+        use agent_shim_config::plugins::TimeoutMs;
+        let t = HookTimeouts::from_yaml(&TimeoutMs::PerHook {
+            default: Some(77),
+            on_decoded_request: None,
+            on_resolved: None,
+            on_stream_event: Some(3),
+            on_response_complete: None,
+        });
+        assert_eq!(t.on_decoded_request, 77);
+        assert_eq!(t.on_resolved, 77);
+        assert_eq!(t.on_stream_event, 3);
+        assert_eq!(t.on_response_complete, 77);
     }
 }
