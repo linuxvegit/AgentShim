@@ -295,7 +295,7 @@ impl Plugin for EveryOtherEventSkipper {
     ) -> PluginResult<Vec<StreamEvent>> {
         // Snapshot then increment — index 0 is the first event.
         let idx = self.seen.fetch_add(1, Ordering::SeqCst);
-        if idx.is_multiple_of(2) {
+        if idx % 2 == 0 {
             Ok(vec![event])
         } else {
             // Drop the event entirely — see trait_def.rs: "empty Vec = drop".

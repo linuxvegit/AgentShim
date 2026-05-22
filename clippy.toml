@@ -1,1 +1,6 @@
 avoid-breaking-exported-api = false
+# Pin clippy's MSRV awareness to the workspace `rust-version`. Without this,
+# lints like `manual_is_multiple_of` (which suggests `<integer>::is_multiple_of`
+# stabilized in 1.87) trigger on code that needs to compile on 1.80. See
+# https://rust-lang.github.io/rust-clippy/master/index.html#msrv .
+msrv = "1.80"
