@@ -233,6 +233,114 @@ See [ADR-0006](adr/0006-cost-aware-routing.md) for the design
 context, the rejected alternatives, and the v0.6.1 / v0.7 deferred
 items.
 
+## Phase 7: Plugin system
+
+Phase 7 added a first-class plugin system between the protocol-translation
+edges and the chain walker. The design optimizes for two seemingly
+competing goals: **zero overhead when no plugins are configured** (the
+common case) and **strong observability when they are** (production
+operability).
+
+### Hook anchors
+
+Four hooks instrument the request lifecycle:
+
+```
+HTTP request ─► decode_request (frontend)
+                    │
+                    ▼
+                ┌─────────┐
+                │   H2    │  on_decoded_request: see CanonicalRequest after decode
+                └────┬────┘
+                     ▼
+                resolve route → BackendTarget
+                     │
+                ┌────┴────┐
+                │   H3    │  on_resolved: see resolved BackendTarget
+                └────┬────┘
+                     ▼
+                provider.complete() → CanonicalStream
+                     │
+                ┌────┴────┐
+                │   H5    │  on_stream_event: per-event filter (1-in-N-out)
+                └────┬────┘
+                     ▼
+                encode_stream → HTTP response
+                     │
+                ┌────┴────┐
+                │   H7    │  on_response_complete: spawned after response sent
+                └─────────┘
+```
+
+### Registry & dispatch
+
+`PluginRegistry` owns the parsed plugin instances + a per-route
+subscription plan. `PluginRegistry::build` is called at startup AND on
+config reload (see "Hot reload" below). Each hook anchor in
+`pipeline::dispatch` does a single hashmap lookup; empty subscription
+lists early-return without allocating. The empty-registry overhead is
+measured at < 1 µs / hook on commodity hardware
+(see `crates/plugins/benches/`).
+
+### Hot reload (P07)
+
+`PluginRegistry` is bundled into `AppSnapshot`, the policy-bearing struct
+managed by `arc-swap`. The reload flow is:
+
+```
+parse YAML
+   ↓
+validate_for_reload  (Layer A: immutable fields, upstream-set changes)
+   ↓
+PluginRegistry::build  (Layer B: kind lookup, factory parse, hook subscription)
+   ↓
+state.snapshot.store(new_snap)   ◄── commit point (atomic)
+   ↓
+limiter.store(new_limiter)
+```
+
+If Layer B fails, the entire reload is rejected and the old snapshot
+(with its old plugins) keeps running. There is no partial commit. The
+admin endpoint surfaces this as `400 Bad Request` with
+`{"ok": false, "errors": ["plugin validation error: ..."]}`.
+
+In-flight requests bind an `Arc<AppSnapshot>` at the top of `dispatch`.
+The arc-swap of the snapshot does not invalidate that bound Arc —
+refcount remains > 0 until the request completes. The result: a reload
+mid-request never changes plugin behavior for an in-flight request, only
+for the next request that enters `dispatch`. This property is
+regression-protected by
+`crates/gateway/tests/plugins_reload.rs::reload_swap_isolates_in_flight_requests`.
+
+### Failure semantics
+
+The `Plugin::on_*` trait methods return `PluginResult<T>`. `PluginError`
+is an enum whose primary variants are:
+- `PluginError::Failed { plugin, hook, message }` — plugin returned an
+  error from the hook. Routed through the per-plugin `on_error` policy.
+- `PluginError::Aborted { plugin, hook, message }` — the plugin asked the
+  request to be aborted. Always surfaces as `400 Bad Request`,
+  irrespective of `on_error`.
+
+The `on_error` policy lives in the YAML config:
+- `on_error: fail` (default) → plugin error short-circuits the chain
+  with HTTP 502 (Bad Gateway).
+- `on_error: skip` → plugin error is swallowed; the chain continues
+  with the un-modified request.
+
+Per-hook timeouts are configurable via the `timeout_ms` knob on each
+plugin entry; defaults are 50 ms for H2/H3/H7 and 5 ms for H5
+(one event tick).
+
+### v1 built-ins
+
+- `pii_scrubber` (P06b1): regex-based PII redaction, inbound (H2) and
+  outbound (H5). Per-rule match counter.
+- `prompt_compressor` (P06b2): token-aware conversation compression with
+  three strategies (`drop_old_turns`, `truncate_to_tokens`,
+  `summarize_old_turns` with upstream call + timeout + fallback).
+- `usage_recorder` (P06a): on-H7 Prometheus + log sinks for usage telemetry.
+
 ## Capability gate
 
 Plan 04 added a capability gate at the gateway boundary. It runs after route
