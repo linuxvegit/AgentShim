@@ -154,3 +154,117 @@ async fn reload_swaps_plugins_atomically() {
     mock_a.assert_async().await;
     mock_b.assert_async().await;
 }
+
+#[tokio::test]
+async fn reload_with_bad_plugin_config_rejected() {
+    let mut upstream = mockito::Server::new_async().await;
+
+    // Both requests (before AND after the bad reload) must show MARKER-A,
+    // proving the reload was atomically rejected and the OLD plugin is
+    // still active.
+    let mock_a = upstream
+        .mock("POST", "/v1/chat/completions")
+        .match_body(mockito::Matcher::Regex(r"MARKER-A".to_string()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(UPSTREAM_OAI_RESPONSE)
+        .expect(2)
+        .create_async()
+        .await;
+
+    let cfg_a: GatewayConfig =
+        serde_yaml::from_str(&yaml_v1(&upstream.url(), "MARKER-A")).expect("yaml parses");
+    let (state, _rx) = AppState::new(cfg_a).await.expect("AppState::new");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server_state = state.clone();
+    let _server = tokio::spawn(async move {
+        let _ = run_on_listener(listener, server_state, async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let url = format!("http://{}/v1/messages", addr);
+
+    // Request 1: hits MARKER-A mock.
+    let resp1 = reqwest::Client::new()
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(REQUEST_BODY)
+        .send()
+        .await
+        .expect("send 1");
+    assert_eq!(resp1.status(), 200);
+
+    // Build a bad YAML: same server/upstream as v1, but the route points
+    // at a plugin whose kind doesn't exist. PluginRegistry::build will
+    // fail with RegistryBuildError::UnknownKind.
+    //
+    // Must mirror v1's server.{bind,port} and upstream set (those are
+    // immutable across reload — see T7 notes).
+    let bad_yaml = format!(
+        r#"
+server:
+  bind: 127.0.0.1
+  port: 18080
+  keepalive_secs: 15
+upstreams:
+  mocked:
+    type: open_ai_compatible
+    base_url: "{}"
+    api_key: "k"
+    tier: standard
+routes:
+  - frontend: anthropic_messages
+    model: test-model
+    upstream: mocked
+    upstream_model: test-model
+    plugins:
+      on_decoded_request:
+        - bad
+plugins:
+  bad:
+    type: this_kind_does_not_exist
+    on_error: fail
+    config: {{}}
+"#,
+        upstream.url()
+    );
+
+    let outcome = agent_shim_gateway::commands::serve::handle_reload(
+        &state,
+        agent_shim_gateway::reload_trigger::ReloadSource::Yaml(bad_yaml),
+    )
+    .await;
+    match &outcome {
+        agent_shim_gateway::reload_trigger::ReloadOutcome::PluginValidation(msg) => {
+            assert!(
+                msg.contains("this_kind_does_not_exist"),
+                "expected error to mention the unknown kind, got: {msg}"
+            );
+        }
+        other => panic!("expected PluginValidation, got {other:?}"),
+    }
+
+    // Request 2: after the rejected reload, still uses the OLD plugin
+    // (MARKER-A injection still active).
+    let resp2 = reqwest::Client::new()
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(REQUEST_BODY)
+        .send()
+        .await
+        .expect("send 2");
+    assert_eq!(resp2.status(), 200);
+
+    let _ = tx.send(());
+
+    // mock_a.expect(2) requires both requests reach this mock with MARKER-A —
+    // i.e. NEITHER ever saw a MARKER-B (which doesn't exist) AND the bad
+    // reload didn't partially install some other behavior.
+    mock_a.assert_async().await;
+}
