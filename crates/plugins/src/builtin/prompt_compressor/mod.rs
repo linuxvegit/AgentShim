@@ -1,6 +1,7 @@
 #![cfg(feature = "prompt_compressor")]
 
 pub mod config;
+pub(super) mod drop_old_turns;
 pub(super) mod groups;
 
 use std::sync::Arc;
@@ -18,6 +19,14 @@ use crate::{
 use crate::context::PluginContext;
 use crate::error::PluginResult;
 use config::{PromptCompressorConfig, Strategy};
+
+/// Result of applying a single strategy. `action` becomes a metric label.
+#[allow(dead_code)] // filled in by T10 dispatcher
+pub(super) struct CompressionResult {
+    pub new_messages: Vec<agent_shim_core::Message>,
+    pub dropped: usize,
+    pub action: &'static str,
+}
 
 // ─── Compiled strategy ───────────────────────────────────────────────────────
 
