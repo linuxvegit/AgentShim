@@ -442,3 +442,201 @@ async fn h5_drops_alternate_stream_events() {
         "MessageStop being dropped also suppresses the trailing message_delta"
     );
 }
+
+// ── T5: mid-stream plugin failure → SSE error frame ─────────────────────
+
+/// H5 plugin: forwards the first three events (indices 0, 1, 2) and then
+/// returns `Err(PluginError::Failed { .. })` for every subsequent event.
+/// Combined with `on_error: Fail`, this triggers `wrap_stream`'s
+/// `Propagate` arm (see `crates/plugins/src/registry.rs` ~line 530), which
+/// replaces the offending upstream event with a synthetic
+/// `StreamEvent::Error { message }`. The Anthropic encoder maps that
+/// canonical Error to an `event: error` SSE frame
+/// (`crates/frontends/src/anthropic_messages/encode_stream.rs` ~line 279)
+/// with payload `{"type":"error","error":{"type":"api_error","message":<err.to_string()>}}`.
+///
+/// Note: `PluginError::Failed` (NOT `Aborted`) is the right variant here.
+/// `Aborted` is "the plugin actively rejected the request" and maps to
+/// HTTP 400 at the request-decode boundary; it is not the path we want
+/// to verify for mid-stream surfacing. `Failed` is the normal "the
+/// plugin hit a runtime error" variant, and `on_error: Fail` is the
+/// knob that promotes it from "log and continue" to "surface to wire".
+struct FailAfterThreePlugin {
+    seen: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for FailAfterThreePlugin {
+    fn kind_name(&self) -> &'static str {
+        "fail_after_three"
+    }
+
+    fn hooks(&self) -> HookSet {
+        HookSet::STREAM_EVENT
+    }
+
+    async fn on_stream_event(
+        &self,
+        _ctx: &PluginContext,
+        event: StreamEvent,
+    ) -> PluginResult<Vec<StreamEvent>> {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if n < 3 {
+            // Forward the first three events (indices 0, 1, 2) untouched.
+            Ok(vec![event])
+        } else {
+            // The 4th and any later events synthesise a failure. The
+            // string fields match the actual `PluginError::Failed`
+            // shape in crates/plugins/src/error.rs.
+            Err(agent_shim_plugins::PluginError::Failed {
+                plugin: "fail_after_three".to_string(),
+                hook: "on_stream_event",
+                message: "synthetic".to_string(),
+            })
+        }
+    }
+}
+
+/// T5 §1: when an H5 plugin returns `Err(PluginError::Failed)` partway
+/// through a stream and `on_error` is `Fail`, the wrapper surfaces the
+/// error as a canonical `StreamEvent::Error`, the Anthropic encoder
+/// renders it as an `event: error` SSE frame, and the wire stream
+/// terminates (no `message_stop` ever reaches the client because the
+/// trailing upstream events are also caught by the same plugin and
+/// replaced with more error frames rather than the normal terminal
+/// sequence).
+///
+/// Why we tolerate >1 error frame: `wrap_stream` does NOT short-circuit
+/// the upstream stream on first failure — each upstream event runs
+/// through the plugin chain independently. With our 6-event upstream
+/// (ResponseStart, MessageStart, ContentBlockStart, TextDelta,
+/// ContentBlockStop, MessageStop), the first three forward cleanly,
+/// then idx 3, 4, and 5 each independently trip the failure branch and
+/// each produces its own `StreamEvent::Error`. The test breaks out of
+/// the collection loop on the first `error` SSE frame, so this is
+/// observationally indistinguishable from "stream terminates after one
+/// error" from the client's perspective.
+#[tokio::test]
+async fn h5_failure_emits_sse_error_frame_and_closes() {
+    let seen = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(FailAfterThreePlugin {
+        seen: Arc::clone(&seen),
+    });
+    let registry = registry_with_one_plugin(
+        "fail_after_three",
+        plugin,
+        OnError::Fail, // promotes Failed → Propagate → wire error frame
+        agent_shim_plugins::Hook::StreamEvent,
+    );
+    let captured = Arc::new(tokio::sync::Mutex::new(None));
+    let state = make_app_state(registry, captured);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_handle = tokio::spawn(async move {
+        let _ = run_on_listener(listener, state, async {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let reconnect = ReconnectOptions::reconnect(false)
+        .retry_initial(false)
+        .build();
+    let url = format!("http://{}/v1/messages", addr);
+    let client = ClientBuilder::for_url(&url)
+        .expect("valid URL")
+        .method("POST".to_string())
+        .body(ANTHROPIC_STREAMING_BODY.to_string())
+        .header("content-type", "application/json")
+        .expect("set content-type")
+        .header("accept", "text/event-stream")
+        .expect("set accept")
+        .reconnect(reconnect)
+        .build_http();
+
+    // Collect (event_type, data) tuples so we can both verify shape AND
+    // inspect the JSON payload of the error frame.
+    let mut events: Vec<(String, String)> = Vec::new();
+    let mut stream = client.stream();
+    let collection_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = collection_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(SSE::Event(ev)))) => {
+                let stop = ev.event_type == "error" || ev.event_type == "message_stop";
+                events.push((ev.event_type, ev.data));
+                if stop {
+                    break;
+                }
+            }
+            Ok(Some(Ok(SSE::Comment(_)))) => {}
+            Ok(Some(Ok(SSE::Connected(_)))) => {}
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = server_handle.await;
+
+    // Plugin was invoked once per upstream event. Three successes (idx 0/1/2)
+    // followed by failures on every later event (3/4/5) → 6 invocations.
+    let observed = seen.load(Ordering::SeqCst);
+    assert_eq!(
+        observed, 6,
+        "plugin should be invoked once per upstream event (3 successes + 3 failures); got {observed}"
+    );
+
+    // The first three forwarded events flow through to the wire as their
+    // normal SSE encodings — message_start + ping (from ResponseStart) and
+    // content_block_start (from ContentBlockStart). MessageStart at idx 1
+    // is dropped by the encoder by design (it's synthesised from
+    // ResponseStart; see encode_stream.rs ~line 291). Then the error frame
+    // appears.
+    let names: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        names.contains(&"error"),
+        "expected an `error` SSE frame; got events: {events:?}"
+    );
+    // Once `error` is observed, no `message_stop` should appear because the
+    // collection loop breaks on `error`. But also: even without the break,
+    // MessageStop (upstream idx 5) trips the failure branch and is replaced
+    // with another error frame — so `message_stop` should never reach the
+    // wire under this configuration.
+    assert!(
+        !names.contains(&"message_stop"),
+        "MessageStop is intercepted by the failing plugin; no message_stop should reach the wire. \
+         Got: {events:?}"
+    );
+
+    let (_, error_data) = events
+        .iter()
+        .find(|(k, _)| k == "error")
+        .expect("at least one error event must be present (asserted above)");
+    // The Anthropic encoder wraps StreamEvent::Error into
+    // {"type":"error","error":{"type":"api_error","message":<err.to_string()>}}.
+    // `err.to_string()` for `PluginError::Failed { plugin, hook, message }`
+    // is `"plugin {plugin} failed in {hook}: {message}"` — so we expect
+    // both `api_error` (envelope) and `synthetic` (plugin's message) to
+    // appear in the JSON.
+    assert!(
+        error_data.contains("api_error"),
+        "error frame data should contain Anthropic-style `api_error` type; got: {error_data}"
+    );
+    assert!(
+        error_data.contains("synthetic"),
+        "error frame data should carry through the plugin's failure message; got: {error_data}"
+    );
+    assert!(
+        error_data.contains("fail_after_three"),
+        "error frame data should name the originating plugin; got: {error_data}"
+    );
+}
