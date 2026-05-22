@@ -159,6 +159,7 @@ dependencies = [
  "metrics-util",
  "parking_lot",
  "pretty_assertions",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -11,12 +11,12 @@ name = "agent_shim_plugins"
 path = "src/lib.rs"
 
 [features]
-default = ["usage_recorder"]
+default = ["usage_recorder", "pii_scrubber"]
 # Each built-in lives behind its own Cargo feature. Disabling a
 # feature removes the factory from `builtin_plugins()` and the plugin
-# code from the binary. P06b will add prompt_compressor and
-# pii_scrubber here (with possible regex dep activation).
+# code from the binary.
 usage_recorder = []
+pii_scrubber = ["dep:regex"]
 
 [dependencies]
 agent-shim-config = { path = "../config" }
@@ -27,6 +27,7 @@ async-trait.workspace = true
 futures.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
+regex = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
