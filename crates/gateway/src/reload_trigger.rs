@@ -32,6 +32,7 @@ pub enum ReloadSource {
     Sighup,
 }
 
+#[derive(Debug)]
 pub enum ReloadOutcome {
     Ok(agent_shim_config::ReloadDiff),
     ValidationError(String),
