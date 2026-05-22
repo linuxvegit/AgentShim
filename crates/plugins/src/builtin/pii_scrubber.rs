@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashSet;
 
-use agent_shim_core::{CanonicalRequest, StreamEvent};
+use agent_shim_core::{CanonicalRequest, ContentBlock, StreamEvent};
+use agent_shim_observability::metrics::catalog::PluginPiiScrubberMatchesTotal;
 
 use crate::context::PluginContext;
 use crate::error::{PluginConfigError, PluginResult};
@@ -40,16 +41,12 @@ pub struct RuleConfig {
 // ─── Compiled internal state ─────────────────────────────────────────────
 
 struct CompiledRule {
-    #[allow(dead_code)] // used by T8 (apply_rules)
     name: String,
-    #[allow(dead_code)] // used by T8/T9
     regex: regex::Regex,
-    #[allow(dead_code)] // used by T8/T9
     replacement: String,
 }
 
 pub struct PiiScrubber {
-    #[allow(dead_code)] // used by T8
     inbound: Vec<CompiledRule>,
     #[allow(dead_code)] // used by T9
     outbound: Vec<CompiledRule>,
@@ -157,6 +154,41 @@ fn is_valid_rule_name(s: &str) -> bool {
 
 // ─── Plugin trait impl (stubs filled in by T8/T9) ────────────────────────
 
+/// Apply each rule in order to `text`, returning the scrubbed string and
+/// emitting the per-rule match counter. `direction` is the static label
+/// used for the metric ("inbound" | "outbound").
+///
+/// Rules are applied sequentially over the running result so that earlier
+/// replacements feed into later ones. Counter increments use the
+/// pre-replacement match count, which is the natural metric semantics:
+/// "how many times did rule R fire?". A rule that produces no matches
+/// emits no counter sample.
+fn apply_rules(
+    rules: &[CompiledRule],
+    text: &str,
+    _ctx: &PluginContext,
+    direction: &'static str,
+) -> String {
+    let mut current = std::borrow::Cow::Borrowed(text);
+    for rule in rules {
+        let match_count = rule.regex.find_iter(&current).count() as u64;
+        if match_count > 0 {
+            metrics::counter!(
+                PluginPiiScrubberMatchesTotal::NAME,
+                "rule" => rule.name.clone(),
+                "direction" => direction,
+            )
+            .increment(match_count);
+            let replaced = rule
+                .regex
+                .replace_all(&current, rule.replacement.as_str())
+                .into_owned();
+            current = std::borrow::Cow::Owned(replaced);
+        }
+    }
+    current.into_owned()
+}
+
 #[async_trait]
 impl Plugin for PiiScrubber {
     fn kind_name(&self) -> &'static str {
@@ -176,10 +208,22 @@ impl Plugin for PiiScrubber {
 
     async fn on_decoded_request(
         &self,
-        _ctx: &PluginContext,
-        req: CanonicalRequest,
+        ctx: &PluginContext,
+        mut req: CanonicalRequest,
     ) -> PluginResult<CanonicalRequest> {
-        // Filled in by T8.
+        for msg in &mut req.messages {
+            for block in &mut msg.content {
+                match block {
+                    ContentBlock::Text(t) => {
+                        t.text = apply_rules(&self.inbound, &t.text, ctx, "inbound");
+                    }
+                    ContentBlock::Reasoning(r) => {
+                        r.text = apply_rules(&self.inbound, &r.text, ctx, "inbound");
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(req)
     }
 
@@ -322,5 +366,181 @@ mod tests {
     fn hooks_empty_subscription_on_empty_config() {
         let plugin = PiiScrubberFactory.instantiate("p", json!({})).unwrap();
         assert_eq!(plugin.hooks(), HookSet::empty());
+    }
+
+    // ── H2 hook ────────────────────────────────────────────────────────
+
+    use agent_shim_core::message::Message;
+    use agent_shim_core::request::RequestMetadata;
+    use agent_shim_core::{
+        BinarySource, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel, GenerationOptions,
+        ImageBlock, MessageRole, ReasoningBlock, RequestId, ResolvedPolicy, TextBlock,
+    };
+
+    fn make_ctx() -> PluginContext {
+        PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "anthropic_messages/test".to_string(),
+        )
+    }
+
+    fn make_base_request() -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::AnthropicMessages,
+                requested_model: FrontendModel::from("test-model"),
+            },
+            model: FrontendModel::from("test-model"),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: RequestMetadata::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: ResolvedPolicy::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
+
+    fn make_request_with_text(text: &str) -> CanonicalRequest {
+        let block = ContentBlock::Text(TextBlock {
+            text: text.to_string(),
+            extensions: ExtensionMap::new(),
+        });
+        let msg = Message {
+            role: MessageRole::User,
+            content: vec![block],
+            name: None,
+            extensions: ExtensionMap::new(),
+        };
+        let mut req = make_base_request();
+        req.messages = vec![msg];
+        req
+    }
+
+    fn make_request_with_reasoning(text: &str) -> CanonicalRequest {
+        let block = ContentBlock::Reasoning(ReasoningBlock {
+            text: text.to_string(),
+            extensions: ExtensionMap::new(),
+        });
+        let msg = Message {
+            role: MessageRole::Assistant,
+            content: vec![block],
+            name: None,
+            extensions: ExtensionMap::new(),
+        };
+        let mut req = make_base_request();
+        req.messages = vec![msg];
+        req
+    }
+
+    #[tokio::test]
+    async fn h2_scrubs_text_blocks() {
+        let cfg = json!({
+            "inbound": [
+                { "name": "email", "pattern": r"\w+@\w+\.\w+", "replacement": "[EMAIL]" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let req = make_request_with_text("Contact me at alice@example.com please.");
+        let out = plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
+        let text = match &out.messages[0].content[0] {
+            ContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert_eq!(text, "Contact me at [EMAIL] please.");
+    }
+
+    #[tokio::test]
+    async fn h2_scrubs_reasoning_blocks() {
+        let cfg = json!({
+            "inbound": [
+                { "name": "ssn", "pattern": r"\b\d{3}-\d{2}-\d{4}\b", "replacement": "[SSN]" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let req = make_request_with_reasoning("User mentioned SSN 123-45-6789 earlier.");
+        let out = plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
+        let text = match &out.messages[0].content[0] {
+            ContentBlock::Reasoning(r) => r.text.clone(),
+            _ => panic!("expected Reasoning block"),
+        };
+        assert_eq!(text, "User mentioned SSN [SSN] earlier.");
+    }
+
+    #[tokio::test]
+    async fn h2_skips_other_blocks() {
+        let cfg = json!({
+            "inbound": [
+                { "name": "email", "pattern": r"\w+@\w+", "replacement": "[X]" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let image_block = ContentBlock::Image(ImageBlock {
+            source: BinarySource::Url {
+                url: "https://example.com/cat@home.png".to_string(),
+            },
+            extensions: ExtensionMap::new(),
+        });
+        let mut req = make_base_request();
+        req.messages = vec![Message {
+            role: MessageRole::User,
+            content: vec![image_block.clone()],
+            name: None,
+            extensions: ExtensionMap::new(),
+        }];
+
+        let out = plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
+        match &out.messages[0].content[0] {
+            ContentBlock::Image(img) => {
+                // Source URL must be unchanged even though it contains '@'.
+                match &img.source {
+                    BinarySource::Url { url } => {
+                        assert_eq!(url, "https://example.com/cat@home.png");
+                    }
+                    other => panic!("expected Url source, got {other:?}"),
+                }
+            }
+            other => panic!("expected unmodified Image, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_counter_increments_per_match() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let cfg = json!({
+            "inbound": [
+                { "name": "email", "pattern": r"\w+@\w+\.\w+", "replacement": "[E]" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let req = make_request_with_text("a@b.com c@d.com");
+        plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let matches: u64 = snapshot
+            .iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == "agent_shim_plugin_pii_scrubber_matches_total" {
+                    match value {
+                        DebugValue::Counter(v) => Some(*v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(matches, 2, "two emails should produce two counter increments");
     }
 }
