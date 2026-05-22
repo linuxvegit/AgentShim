@@ -3,6 +3,7 @@
 pub mod config;
 pub(super) mod drop_old_turns;
 pub(super) mod groups;
+pub(super) mod summarize;
 pub(super) mod truncate;
 
 use std::sync::Arc;
