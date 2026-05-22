@@ -133,8 +133,9 @@ where
     // moving `state` into axum. After axum drain, no new H7 spawns occur
     // (no requests in flight) so flush can run safely on this clone.
     // P07: plugins now live on AppSnapshot; capture the current snapshot once.
-    let plugins = state.snapshot.load_full().plugins.clone();
-    let flush_secs = state.snapshot.load_full().config.shutdown.plugin_flush_secs;
+    let snap = state.snapshot.load_full();
+    let plugins = snap.plugins.clone();
+    let flush_secs = snap.config.shutdown.plugin_flush_secs;
 
     let result = if let Some(admin_listener) = admin_listener_opt {
         crate::server::run_with_admin_on_listeners(

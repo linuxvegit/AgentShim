@@ -191,8 +191,9 @@ impl AppState {
 
     /// Plan 07 P04 T12: integration-test-only constructor that lets tests
     /// inject a custom `PluginRegistry` (instead of the default
-    /// `empty()`). Same shape as `new_with_clock`. Production callers
-    /// MUST use `AppState::new`.
+    /// `empty()`) (in P07, the injected plugins end up on `AppSnapshot`
+    /// rather than `AppCore`). Same shape as `new_with_clock`.
+    /// Production callers MUST use `AppState::new`.
     ///
     /// `#[allow(dead_code)]` because integration tests in
     /// `crates/gateway/tests/` are a separate compilation unit; the
@@ -213,7 +214,8 @@ impl AppState {
     /// Shared construction path for `new`, `new_with_clock`, and
     /// `new_with_plugins`. The callers parameterize the `Clock` handed to
     /// `BreakerRegistry::new` and the `PluginRegistry` placed on
-    /// `AppCore`; everything else (provider registry, resolver, frontend
+    /// `AppSnapshot` (so reload-time hot-swap honors §2.2 atomicity);
+    /// everything else (provider registry, resolver, frontend
     /// handlers) is identical, so extracting this helper keeps the
     /// public constructors as one-liners.
     async fn build(
