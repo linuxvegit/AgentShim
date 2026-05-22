@@ -701,6 +701,7 @@ impl PluginRegistry {
         factories: Vec<Box<dyn PluginFactory>>,
         plugin_specs: &[(String, agent_shim_config::plugins::PluginEntry)],
         route_specs: &[agent_shim_config::schema::RouteEntry],
+        deps: crate::FactoryDependencies<'_>,
     ) -> Result<Self, RegistryBuildError> {
         let supervisor = Arc::new(crate::supervisor::PluginSupervisor::default());
         // ── Phase 1: index factories ──────────────────────────────────────
@@ -730,9 +731,8 @@ impl PluginRegistry {
             })?;
 
             // Instantiate (config validation)
-            let deps_for_this_task = crate::FactoryDependencies::empty();
             let plugin_box = factory
-                .instantiate(name, spec.config.clone(), &deps_for_this_task)
+                .instantiate(name, spec.config.clone(), &deps)
                 .map_err(|e| RegistryBuildError::Instantiation(e, name.clone()))?;
 
             let timeouts = match &spec.timeout_ms {
@@ -1784,14 +1784,14 @@ mod tests {
 
     #[test]
     fn build_empty_returns_empty_registry() {
-        let reg = PluginRegistry::build(vec![], &[], &[]).unwrap();
+        let reg = PluginRegistry::build(vec![], &[], &[], crate::FactoryDependencies::empty()).unwrap();
         assert!(reg.plugins.is_empty());
         assert!(reg.plans.is_empty());
     }
 
     #[test]
     fn build_duplicate_factory_kind_is_error() {
-        let err = PluginRegistry::build(vec![Box::new(H2Factory), Box::new(H2Factory)], &[], &[])
+        let err = PluginRegistry::build(vec![Box::new(H2Factory), Box::new(H2Factory)], &[], &[], crate::FactoryDependencies::empty())
             .unwrap_err();
         assert!(
             matches!(err, RegistryBuildError::DuplicateFactoryKind { ref kind } if kind == "h2_plugin"),
@@ -1805,6 +1805,7 @@ mod tests {
             vec![],
             &[("p".to_string(), make_plugin_spec("unknown_kind", true))],
             &[],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap_err();
         assert!(
@@ -1819,6 +1820,7 @@ mod tests {
             vec![Box::new(FailFactory)],
             &[("p".to_string(), make_plugin_spec("fail_plugin", true))],
             &[],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap_err();
         assert!(
@@ -1839,6 +1841,7 @@ mod tests {
             vec![Box::new(H2Factory)],
             &[("p".to_string(), make_plugin_spec("h2_plugin", false))],
             &[make_route("anthropic", "claude-3", Some(route_block))],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap();
         // Plugin is in the registry map
@@ -1863,6 +1866,7 @@ mod tests {
             vec![Box::new(H2Factory)],
             &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
             &[make_route("anthropic", "claude-3", Some(route_block))],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap_err();
         assert!(
@@ -1874,7 +1878,7 @@ mod tests {
 
     #[test]
     fn build_unknown_frontend_is_error() {
-        let err = PluginRegistry::build(vec![], &[], &[make_route("bogus_frontend", "*", None)])
+        let err = PluginRegistry::build(vec![], &[], &[make_route("bogus_frontend", "*", None)], crate::FactoryDependencies::empty())
             .unwrap_err();
         assert!(
             matches!(err, RegistryBuildError::UnknownFrontend { ref frontend } if frontend == "bogus_frontend"),
@@ -1893,6 +1897,7 @@ mod tests {
             vec![Box::new(H2Factory)],
             &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
             &[make_route("anthropic", "claude-3", Some(route_block))],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap_err();
         assert!(
@@ -1912,6 +1917,7 @@ mod tests {
             vec![Box::new(H2Factory)],
             &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
             &[make_route("anthropic", "claude-3", Some(route_block))],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap();
         let frp = reg
@@ -1936,6 +1942,7 @@ mod tests {
             vec![Box::new(H2Factory)],
             &[("p".to_string(), make_plugin_spec("h2_plugin", true))],
             &[make_route("anthropic", "*", Some(route_block))],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap();
         let frp = reg
@@ -1959,6 +1966,7 @@ mod tests {
             vec![Box::new(H2H7Factory)],
             &[("p".to_string(), make_plugin_spec("h2h7_plugin", true))],
             &[make_route("anthropic", "claude-3", Some(route_block))],
+            crate::FactoryDependencies::empty(),
         )
         .unwrap();
         let frp = reg

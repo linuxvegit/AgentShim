@@ -122,6 +122,13 @@ impl ProviderRegistry {
             .ok_or_else(|| ProviderError::UnknownProvider(target.provider.clone()))?;
         Ok((provider, req, target))
     }
+
+    /// Borrow the underlying provider map. Plan 07 P06b2: needed for
+    /// `agent_shim_plugins::FactoryDependencies` so plugin factories
+    /// can validate upstream references at startup.
+    pub fn inner_map(&self) -> &BTreeMap<String, Arc<dyn BackendProvider>> {
+        &self.providers
+    }
 }
 
 #[cfg(test)]
