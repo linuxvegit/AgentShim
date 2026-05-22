@@ -132,7 +132,8 @@ where
     // P05 T11: clone the plugin Arc + shutdown.plugin_flush_secs BEFORE
     // moving `state` into axum. After axum drain, no new H7 spawns occur
     // (no requests in flight) so flush can run safely on this clone.
-    let plugins = state.core.plugins.clone();
+    // P07: plugins now live on AppSnapshot; capture the current snapshot once.
+    let plugins = state.snapshot.load_full().plugins.clone();
     let flush_secs = state.snapshot.load_full().config.shutdown.plugin_flush_secs;
 
     let result = if let Some(admin_listener) = admin_listener_opt {
@@ -252,11 +253,16 @@ pub async fn handle_reload(
             // at the top of `pipeline::dispatch` and stay on it (spec
             // §2.2); new requests after this store() see the new one.
             let build = agent_shim_observability::reload::build(candidate);
+            // P07 T1: plugins now live on AppSnapshot. T1 is a pure
+            // refactor — the reload path preserves the current plugin
+            // Arc byte-for-byte; actual hot-swapping lands in T3.
+            let current_plugins = state.snapshot.load_full().plugins.clone();
             let new_snap = Arc::new(crate::state::AppSnapshot {
                 config: build.config,
                 auth_enabled: build.auth_enabled,
                 auth_required: build.auth_required,
                 configured_key_hashes: build.configured_key_hashes,
+                plugins: current_plugins,
             });
             state.snapshot.store(new_snap);
 

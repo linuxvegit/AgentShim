@@ -575,8 +575,7 @@ async fn dispatch_inner(
         frontend_kind_for_hooks,
         format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
     );
-    canonical = state
-        .core
+    canonical = snapshot
         .plugins
         .run_on_decoded_request(
             (frontend_kind_for_hooks, model_alias.as_str()),
@@ -599,8 +598,7 @@ async fn dispatch_inner(
     // can adapt to per-upstream context (e.g., target-specific prompt
     // shaping). Failure semantics identical to H2 (PluginFailed → 502;
     // Aborted → 400).
-    canonical = state
-        .core
+    canonical = snapshot
         .plugins
         .run_on_resolved(
             (frontend_kind_for_hooks, model_alias.as_str()),
@@ -835,7 +833,7 @@ async fn run_stream(
     // ── Plan 07 P04 spec §6.6 anchor 3 (streaming): H5 (on_stream_event) ──
     // Per-event plugin chain. Fast path: zero-allocation identity when
     // no `on_stream_event` subscribers exist for this route.
-    let upstream_stream = state.core.plugins.wrap_stream(
+    let upstream_stream = snapshot.plugins.wrap_stream(
         (frontend_kind, model_alias.as_str()),
         plugin_ctx_for_run.clone(),
         upstream_stream,
@@ -851,7 +849,7 @@ async fn run_stream(
             usage: usage_capture.clone(),
             started,
             // Plan 07 P04 T7: universal H7 firing.
-            registry: Some(state.core.plugins.clone()),
+            registry: Some(snapshot.plugins.clone()),
             route: Some((frontend_kind, model_alias.clone())),
             ctx: Some(plugin_ctx_for_run.clone()),
         };
@@ -913,7 +911,7 @@ async fn run_stream(
             upstream_model: upstream_model.clone(),
             usage: usage_capture.clone(),
             started,
-            registry: Some(state.core.plugins.clone()),
+            registry: Some(snapshot.plugins.clone()),
             route: Some((frontend_kind, model_alias.clone())),
             ctx: Some(plugin_ctx_for_run.clone()),
         };
@@ -1051,7 +1049,7 @@ async fn run_unary(
     // plugins observe the intermediate stream events even though the
     // caller eventually sees a flat `CanonicalResponse`. Fast path:
     // identity when no `on_stream_event` subscribers exist.
-    let stream = state.core.plugins.wrap_stream(
+    let stream = snapshot.plugins.wrap_stream(
         (frontend_kind, model_alias.as_str()),
         plugin_ctx_for_unary.clone(),
         stream,
@@ -1075,7 +1073,7 @@ async fn run_unary(
             elapsed_ms: started.elapsed().as_millis() as u64,
             upstream_status: agent_shim_plugins::UpstreamStatus::Success,
         };
-        state.core.plugins.run_on_response_complete(
+        snapshot.plugins.run_on_response_complete(
             (frontend_kind, model_alias.as_str()),
             plugin_ctx_for_unary,
             summary,

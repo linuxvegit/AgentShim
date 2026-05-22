@@ -218,13 +218,13 @@ fn make_app_state(
             limiter_registry,
             metrics: agent_shim_observability::install_metrics(&Default::default()),
             reload_tx: tokio::sync::mpsc::channel(1).0,
-            plugins,
         }),
         snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
             config: Arc::new(cfg),
             auth_enabled: false,
             auth_required: false,
             configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+            plugins,
         }))),
     }
 }
