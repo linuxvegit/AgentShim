@@ -233,7 +233,7 @@ See [ADR-0006](adr/0006-cost-aware-routing.md) for the design
 context, the rejected alternatives, and the v0.6.1 / v0.7 deferred
 items.
 
-## Phase 7: Plugin system
+## Plugin system (v0.7)
 
 Phase 7 added a first-class plugin system between the protocol-translation
 edges and the chain walker. The design optimizes for two seemingly
