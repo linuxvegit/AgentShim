@@ -236,6 +236,16 @@ pub struct PluginDurationSeconds;
 )]
 pub struct PluginH7DroppedTotal;
 
+// --- Built-in plugins (Phase 7 P06b) ---
+
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_pii_scrubber_matches_total",
+    kind = "counter",
+    help = "Total PII scrub rule matches by rule and direction (inbound|outbound) (Plan 07 P06b1)"
+)]
+pub struct PluginPiiScrubberMatchesTotal;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,8 +259,8 @@ mod tests {
         let descriptors = iter_descriptors();
         assert_eq!(
             descriptors.len(),
-            18,
-            "expected 18 metric descriptors in catalog, got {}",
+            19,
+            "expected 19 metric descriptors in catalog, got {}",
             descriptors.len()
         );
     }

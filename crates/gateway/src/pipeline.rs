@@ -570,11 +570,11 @@ async fn dispatch_inner(
     // registry walks the route's H2 chain; protected-field violations
     // and `on_error: fail` propagate as `HandlerError::PluginFailed`.
     let frontend_kind_for_hooks = spec.frontend.kind();
-    let plugin_ctx = agent_shim_plugins::PluginContext {
-        request_id: canonical.id.clone(),
-        frontend: frontend_kind_for_hooks,
-        route_label: format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
-    };
+    let plugin_ctx = agent_shim_plugins::PluginContext::new(
+        canonical.id.clone(),
+        frontend_kind_for_hooks,
+        format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
+    );
     canonical = state
         .core
         .plugins
@@ -769,11 +769,11 @@ async fn run_stream(
     //     here from the canonical request because this instance is
     //     scoped to `run_stream`. We clone the id because `canonical` is
     //     consumed later by the chain walk and `RequestId` is not Copy.
-    let plugin_ctx_for_run = agent_shim_plugins::PluginContext {
-        request_id: canonical.id.clone(),
-        frontend: frontend_kind,
-        route_label: format!("{:?}/{}", frontend_kind, model_alias),
-    };
+    let plugin_ctx_for_run = agent_shim_plugins::PluginContext::new(
+        canonical.id.clone(),
+        frontend_kind,
+        format!("{:?}/{}", frontend_kind, model_alias),
+    );
 
     // Plan 06 P04 T4: dispatch through the cost-filter-aware entry
     // point when we can locate the matching `RouteEntry`. Wildcard
@@ -989,11 +989,11 @@ async fn run_unary(
     // `PluginContext` and `ResponseSummary` after the response is
     // collected. `RequestId` is not Copy, so clone explicitly.
     let canonical_id = canonical.id.clone();
-    let plugin_ctx_for_unary = agent_shim_plugins::PluginContext {
-        request_id: canonical_id.clone(),
-        frontend: frontend_kind,
-        route_label: format!("{:?}/{}", frontend_kind, model_alias),
-    };
+    let plugin_ctx_for_unary = agent_shim_plugins::PluginContext::new(
+        canonical_id.clone(),
+        frontend_kind,
+        format!("{:?}/{}", frontend_kind, model_alias),
+    );
 
     // Plan 06 P04 T4: see `run_stream` — cost filter pre-pass via
     // `complete_with_cost_filter` when a route entry is locatable.

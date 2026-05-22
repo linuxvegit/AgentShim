@@ -1008,11 +1008,11 @@ mod tests {
         let a = Arc::new(AtomicUsize::new(0));
         let b = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_two_h2_plugins(a.clone(), b.clone());
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "anthropic_messages/test-model".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "anthropic_messages/test-model".to_string(),
+        );
         let out = registry
             .run_on_decoded_request((FrontendKind::AnthropicMessages, "test-model"), &ctx, req())
             .await
@@ -1030,11 +1030,11 @@ mod tests {
     #[tokio::test]
     async fn run_on_decoded_request_empty_registry_is_identity() {
         let registry = PluginRegistry::empty();
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x/y".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x/y".to_string(),
+        );
         let original = req();
         let original_len = original.messages.len();
         let out = registry
@@ -1109,11 +1109,11 @@ mod tests {
             plans,
             supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "anthropic_messages/m".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "anthropic_messages/m".to_string(),
+        );
         let target = BackendTarget {
             provider: "test".to_string(),
             model: "u".to_string(),
@@ -1130,11 +1130,11 @@ mod tests {
     async fn run_on_resolved_empty_registry_is_identity() {
         use agent_shim_core::BackendTarget;
         let registry = PluginRegistry::empty();
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x".to_string(),
+        );
         let target = BackendTarget {
             provider: "test".to_string(),
             model: "u".to_string(),
@@ -1159,11 +1159,11 @@ mod tests {
         use agent_shim_core::{CanonicalStream, StopReason, StreamEvent};
         use futures::stream::StreamExt;
         let registry = PluginRegistry::empty();
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x/y".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x/y".to_string(),
+        );
         let upstream: CanonicalStream =
             Box::pin(futures::stream::iter(vec![Ok(StreamEvent::MessageStop {
                 stop_reason: StopReason::EndTurn,
@@ -1241,11 +1241,11 @@ mod tests {
             plans,
             supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x".to_string(),
+        );
         // 4 input events; 2 should survive.
         let events: Vec<_> = (0..4)
             .map(|i| {
@@ -1324,11 +1324,11 @@ mod tests {
             plans,
             supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x".to_string(),
+        );
         let upstream: CanonicalStream = Box::pin(futures::stream::iter(vec![
             Ok(StreamEvent::TextDelta {
                 index: 0,
@@ -1422,11 +1422,11 @@ mod tests {
             plans,
             supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x".to_string(),
+        );
         registry.run_on_response_complete(
             (FrontendKind::AnthropicMessages, "m"),
             ctx,
@@ -1451,11 +1451,11 @@ mod tests {
     async fn run_on_response_complete_empty_registry_is_noop() {
         use crate::ResponseSummary;
         let registry = PluginRegistry::empty();
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x".to_string(),
+        );
         registry.run_on_response_complete(
             (FrontendKind::AnthropicMessages, "anything"),
             ctx,
@@ -1525,11 +1525,11 @@ mod tests {
             plans,
             supervisor: Arc::new(crate::supervisor::PluginSupervisor::new()),
         };
-        let ctx = crate::PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "x".to_string(),
-        };
+        let ctx = crate::PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "x".to_string(),
+        );
         registry.run_on_response_complete(
             (FrontendKind::AnthropicMessages, "m"),
             ctx,
@@ -1691,7 +1691,7 @@ mod tests {
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
             Err(crate::error::PluginConfigError::InvalidValue {
                 plugin: plugin_name.to_string(),
-                field: "strategy",
+                field: "strategy".to_string(),
                 reason: "deliberate failure".to_string(),
             })
         }

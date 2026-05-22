@@ -77,7 +77,7 @@ pub enum PluginConfigError {
     #[error("plugin `{plugin}` config: invalid value for `{field}`: {reason}")]
     InvalidValue {
         plugin: String,
-        field: &'static str,
+        field: String,
         reason: String,
     },
     #[error("plugin `{1}` config: deserialization failed: {0}")]

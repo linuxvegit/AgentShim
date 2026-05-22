@@ -7,6 +7,7 @@
   {"name": "agent_shim_plugin_duration_seconds", "kind": "histogram", "help": "Plugin hook duration by kind, name, hook (Plan 07 P05)"},
   {"name": "agent_shim_plugin_h7_dropped_at_shutdown_total", "kind": "counter", "help": "H7 plugin tasks dropped at shutdown by plugin_name (Plan 07 P05)"},
   {"name": "agent_shim_plugin_invocations_total", "kind": "counter", "help": "Plugin hook invocations by kind, name, hook, outcome (Plan 07 P05)"},
+  {"name": "agent_shim_plugin_pii_scrubber_matches_total", "kind": "counter", "help": "Total PII scrub rule matches by rule and direction (inbound|outbound) (Plan 07 P06b1)"},
   {"name": "agent_shim_rate_limit_rejected_total", "kind": "counter", "help": "Rate-limit rejections by dimension"},
   {"name": "agent_shim_request_body_bytes", "kind": "histogram", "help": "Inbound request body size"},
   {"name": "agent_shim_request_duration_seconds", "kind": "histogram", "help": "End-to-end request duration"},

@@ -219,11 +219,11 @@ mod tests {
         assert!(p.hooks().is_empty());
 
         // Defaults return Ok(input)
-        let ctx = PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "test/test".to_string(),
-        };
+        let ctx = PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "test/test".to_string(),
+        );
         // Cheap stub: just verify the default impls compile & don't err.
         let event = StreamEvent::MessageStop {
             stop_reason: agent_shim_core::StopReason::EndTurn,

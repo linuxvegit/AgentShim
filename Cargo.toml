@@ -50,3 +50,4 @@ opentelemetry_sdk = "0.24"
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.25"
 prometheus-parse = "0.2"
+regex = "1"

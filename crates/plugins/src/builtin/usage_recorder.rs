@@ -100,7 +100,7 @@ impl PluginFactory for UsageRecorderFactory {
         if cfg.sink != Sink::Log {
             return Err(PluginConfigError::InvalidValue {
                 plugin: plugin_name.to_string(),
-                field: "sink",
+                field: "sink".to_string(),
                 reason: "only `log` sink is supported".to_string(),
             });
         }
@@ -262,11 +262,11 @@ mod tests {
     use agent_shim_core::{FrontendKind, RequestId, Usage};
 
     fn make_ctx() -> PluginContext {
-        PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "anthropic_messages/test-model".to_string(),
-        }
+        PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "anthropic_messages/test-model".to_string(),
+        )
     }
 
     fn make_summary_success() -> ResponseSummary {
