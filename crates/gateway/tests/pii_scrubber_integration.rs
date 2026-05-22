@@ -97,8 +97,7 @@ async fn pii_scrubber_end_to_end_scrubs_prompt() {
         .create_async()
         .await;
 
-    let cfg: GatewayConfig =
-        serde_yaml::from_str(&yaml_for(&upstream.url())).expect("yaml parses");
+    let cfg: GatewayConfig = serde_yaml::from_str(&yaml_for(&upstream.url())).expect("yaml parses");
     let (state, _reload_rx) = AppState::new(cfg).await.expect("AppState::new");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

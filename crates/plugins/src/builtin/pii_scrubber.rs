@@ -125,13 +125,12 @@ fn compile_rules(
         } else {
             format!("(?{flag}){}", r.pattern)
         };
-        let regex = regex::Regex::new(&final_pattern).map_err(|e| {
-            PluginConfigError::InvalidValue {
+        let regex =
+            regex::Regex::new(&final_pattern).map_err(|e| PluginConfigError::InvalidValue {
                 plugin: plugin_name.to_string(),
                 field: format!("{direction}[{i}].pattern"),
                 reason: format!("invalid regex `{}`: {e}", r.pattern),
-            }
-        })?;
+            })?;
         out.push(CompiledRule {
             name: r.name.clone(),
             regex,
@@ -367,7 +366,10 @@ mod tests {
     #[test]
     fn config_deny_unknown_field() {
         let result: Result<PiiScrubberConfig, _> = serde_json::from_value(json!({"extra": 1}));
-        assert!(result.is_err(), "deny_unknown_fields must reject unknown keys");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject unknown keys"
+        );
     }
 
     // ── Factory ────────────────────────────────────────────────────────
@@ -384,7 +386,9 @@ mod tests {
                 { "name": "email", "pattern": r"[\w.]+@[\w.]+", "replacement": "[X]" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).expect("should compile");
+        let plugin = PiiScrubberFactory
+            .instantiate("p", cfg)
+            .expect("should compile");
         assert_eq!(plugin.kind_name(), "pii_scrubber");
         assert!(plugin.hooks().contains(crate::Hook::DecodedRequest));
         assert!(!plugin.hooks().contains(crate::Hook::StreamEvent));
@@ -652,7 +656,10 @@ mod tests {
                 }
             })
             .sum();
-        assert_eq!(matches, 2, "two emails should produce two counter increments");
+        assert_eq!(
+            matches, 2,
+            "two emails should produce two counter increments"
+        );
     }
 
     // ── H5 hook ────────────────────────────────────────────────────────
@@ -700,7 +707,13 @@ mod tests {
         // Large delta pushes buffer over 256B.
         let big = "secret ".repeat(50); // 350 bytes
         let out = plugin
-            .on_stream_event(&ctx, StreamEvent::TextDelta { index: 0, text: big })
+            .on_stream_event(
+                &ctx,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: big,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);

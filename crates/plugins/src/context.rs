@@ -181,9 +181,11 @@ mod tests {
             *guard = "mutated".to_string();
         }
         {
-            let guard =
-                ctx.scratch_get_or_init::<String, _>("plugin_a", || "default".to_string());
-            assert_eq!(&*guard, "mutated", "second call returns prior value, not re-init");
+            let guard = ctx.scratch_get_or_init::<String, _>("plugin_a", || "default".to_string());
+            assert_eq!(
+                &*guard, "mutated",
+                "second call returns prior value, not re-init"
+            );
         }
     }
 
@@ -200,6 +202,9 @@ mod tests {
         }
         let cloned = ctx.clone();
         let guard = cloned.scratch_get_or_init::<u32, _>("counter", || 0u32);
-        assert_eq!(*guard, 42, "Arc-clone semantics: scratch is shared with original");
+        assert_eq!(
+            *guard, 42,
+            "Arc-clone semantics: scratch is shared with original"
+        );
     }
 }
