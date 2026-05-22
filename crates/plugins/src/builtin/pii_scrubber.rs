@@ -48,15 +48,12 @@ struct CompiledRule {
 
 pub struct PiiScrubber {
     inbound: Vec<CompiledRule>,
-    #[allow(dead_code)] // used by T9
     outbound: Vec<CompiledRule>,
 }
 
-// ─── Constants for H5 buffering (used in T9) ─────────────────────────────
+// ─── Constants for H5 buffering ──────────────────────────────────────────
 
-#[allow(dead_code)] // used by T9
 const MAX_PATTERN_TAIL: usize = 64;
-#[allow(dead_code)] // used by T9
 const FLUSH_THRESHOLD: usize = 256;
 
 // ─── Factory ────────────────────────────────────────────────────────────
@@ -154,6 +151,61 @@ fn is_valid_rule_name(s: &str) -> bool {
 
 // ─── Plugin trait impl (stubs filled in by T8/T9) ────────────────────────
 
+/// Per-request scratch state for outbound stream buffering. One entry
+/// per kind (`"pii_scrubber"`) is stored in `PluginContext::scratch`.
+/// `text` and `reasoning` are kept separately so that interleaved
+/// `TextDelta` + `ReasoningDelta` events don't bleed into each other.
+#[derive(Default)]
+struct PiiBuffer {
+    text: String,
+    reasoning: String,
+}
+
+/// Drain the safe-to-emit prefix of `buf` (everything except the last
+/// `MAX_PATTERN_TAIL` bytes, snapped to a UTF-8 char boundary), apply
+/// outbound rules to it, and return the scrubbed result. The tail is
+/// retained in `buf` so cross-delta patterns are still detectable on
+/// the next call.
+fn flush_safe_prefix(buf: &mut String, rules: &[CompiledRule], ctx: &PluginContext) -> String {
+    let split_at = floor_char_boundary(buf, buf.len().saturating_sub(MAX_PATTERN_TAIL));
+    let prefix: String = buf.drain(..split_at).collect();
+    apply_rules(rules, &prefix, ctx, "outbound")
+}
+
+/// Apply outbound rules to a whole buffer (end-of-stream / non-text event
+/// flush). Caller is responsible for clearing the source buffer.
+fn scrub_full(buf: &str, rules: &[CompiledRule], ctx: &PluginContext) -> String {
+    apply_rules(rules, buf, ctx, "outbound")
+}
+
+/// Find the largest UTF-8 char boundary ≤ `idx`. Std's
+/// `floor_char_boundary` is unstable as of Rust 1.85; polyfill here.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let bytes = s.as_bytes();
+    let mut i = idx;
+    while i > 0 && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
+        i -= 1;
+    }
+    i
+}
+
+/// Extract the `index` field from a stream event when present. Used to
+/// label flushed buffered text with a sensible index when forced to
+/// emit during a non-text event.
+fn index_from_event(e: &StreamEvent) -> Option<u32> {
+    match e {
+        StreamEvent::ContentBlockStart { index, .. }
+        | StreamEvent::ContentBlockStop { index }
+        | StreamEvent::ToolCallStart { index, .. }
+        | StreamEvent::ToolCallArgumentsDelta { index, .. }
+        | StreamEvent::ToolCallStop { index } => Some(*index),
+        _ => None,
+    }
+}
+
 /// Apply each rule in order to `text`, returning the scrubbed string and
 /// emitting the per-rule match counter. `direction` is the static label
 /// used for the metric ("inbound" | "outbound").
@@ -229,11 +281,70 @@ impl Plugin for PiiScrubber {
 
     async fn on_stream_event(
         &self,
-        _ctx: &PluginContext,
+        ctx: &PluginContext,
         event: StreamEvent,
     ) -> PluginResult<Vec<StreamEvent>> {
-        // Filled in by T9.
-        Ok(vec![event])
+        let mut buf = ctx.scratch_get_or_init::<PiiBuffer, _>("pii_scrubber", PiiBuffer::default);
+
+        match event {
+            StreamEvent::TextDelta { index, text } => {
+                buf.text.push_str(&text);
+                if buf.text.len() > FLUSH_THRESHOLD {
+                    let emitted = flush_safe_prefix(&mut buf.text, &self.outbound, ctx);
+                    Ok(if emitted.is_empty() {
+                        vec![]
+                    } else {
+                        vec![StreamEvent::TextDelta {
+                            index,
+                            text: emitted,
+                        }]
+                    })
+                } else {
+                    Ok(vec![])
+                }
+            }
+            StreamEvent::ReasoningDelta { index, text } => {
+                buf.reasoning.push_str(&text);
+                if buf.reasoning.len() > FLUSH_THRESHOLD {
+                    let emitted = flush_safe_prefix(&mut buf.reasoning, &self.outbound, ctx);
+                    Ok(if emitted.is_empty() {
+                        vec![]
+                    } else {
+                        vec![StreamEvent::ReasoningDelta {
+                            index,
+                            text: emitted,
+                        }]
+                    })
+                } else {
+                    Ok(vec![])
+                }
+            }
+            other => {
+                let mut out = Vec::with_capacity(3);
+                if !buf.text.is_empty() {
+                    let scrubbed = scrub_full(&buf.text, &self.outbound, ctx);
+                    buf.text.clear();
+                    if !scrubbed.is_empty() {
+                        out.push(StreamEvent::TextDelta {
+                            index: index_from_event(&other).unwrap_or(0),
+                            text: scrubbed,
+                        });
+                    }
+                }
+                if !buf.reasoning.is_empty() {
+                    let scrubbed = scrub_full(&buf.reasoning, &self.outbound, ctx);
+                    buf.reasoning.clear();
+                    if !scrubbed.is_empty() {
+                        out.push(StreamEvent::ReasoningDelta {
+                            index: index_from_event(&other).unwrap_or(0),
+                            text: scrubbed,
+                        });
+                    }
+                }
+                out.push(other);
+                Ok(out)
+            }
+        }
     }
 }
 
@@ -542,5 +653,185 @@ mod tests {
             })
             .sum();
         assert_eq!(matches, 2, "two emails should produce two counter increments");
+    }
+
+    // ── H5 hook ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn h5_buffer_below_threshold_returns_empty() {
+        let cfg = json!({
+            "outbound": [
+                { "name": "n", "pattern": "x", "replacement": "y" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let ctx = make_ctx();
+        let event = StreamEvent::TextDelta {
+            index: 0,
+            text: "hello".to_string(),
+        };
+        let out = plugin.on_stream_event(&ctx, event).await.unwrap();
+        assert!(
+            out.is_empty(),
+            "below FLUSH_THRESHOLD must buffer (return empty vec)"
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_buffer_above_threshold_emits_scrubbed_prefix() {
+        let cfg = json!({
+            "outbound": [
+                { "name": "n", "pattern": "secret", "replacement": "REDACTED" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let ctx = make_ctx();
+        // First small delta: buffer.
+        let _ = plugin
+            .on_stream_event(
+                &ctx,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "small ".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        // Large delta pushes buffer over 256B.
+        let big = "secret ".repeat(50); // 350 bytes
+        let out = plugin
+            .on_stream_event(&ctx, StreamEvent::TextDelta { index: 0, text: big })
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            StreamEvent::TextDelta { text, .. } => {
+                assert!(
+                    text.contains("REDACTED"),
+                    "scrubbed prefix must replace 'secret'"
+                );
+            }
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn h5_pattern_spans_deltas_caught() {
+        let cfg = json!({
+            "outbound": [
+                { "name": "cc", "pattern": r"\b\d{4}-\d{4}-\d{4}-\d{4}\b", "replacement": "[CC]" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let ctx = make_ctx();
+        // Split a credit card across two deltas.
+        let _ = plugin
+            .on_stream_event(
+                &ctx,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "card 1234-5678-".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let _ = plugin
+            .on_stream_event(
+                &ctx,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "9012-3456 end".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        // Trigger flush via MessageStop.
+        let out = plugin
+            .on_stream_event(
+                &ctx,
+                StreamEvent::MessageStop {
+                    stop_reason: agent_shim_core::usage::StopReason::EndTurn,
+                    stop_sequence: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // out should be [TextDelta with scrubbed text, MessageStop].
+        assert!(out.len() >= 2, "expected scrubbed-text + MessageStop");
+        let combined: String = out
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            combined.contains("[CC]"),
+            "spanning credit card must be redacted; got: {combined}"
+        );
+        assert!(
+            !combined.contains("1234-5678-9012-3456"),
+            "raw card must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn h5_non_text_event_flushes_buffer() {
+        let cfg = json!({
+            "outbound": [
+                { "name": "x", "pattern": "x", "replacement": "y" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let ctx = make_ctx();
+        let _ = plugin
+            .on_stream_event(
+                &ctx,
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "buffered".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let out = plugin
+            .on_stream_event(
+                &ctx,
+                StreamEvent::MessageStop {
+                    stop_reason: agent_shim_core::usage::StopReason::EndTurn,
+                    stop_sequence: None,
+                },
+            )
+            .await
+            .unwrap();
+        // First emission is the flushed text, second is the MessageStop.
+        assert!(out.len() >= 2);
+        assert!(matches!(out[0], StreamEvent::TextDelta { .. }));
+        assert!(matches!(out.last(), Some(StreamEvent::MessageStop { .. })));
+    }
+
+    #[tokio::test]
+    async fn h5_utf8_boundary_safe() {
+        let cfg = json!({
+            "outbound": [
+                { "name": "n", "pattern": "x", "replacement": "y" }
+            ]
+        });
+        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let ctx = make_ctx();
+        // Build a >256-byte buffer of multi-byte UTF-8 chars so the flush
+        // split point lands inside a 3-byte char. Chinese characters are
+        // 3 bytes each in UTF-8.
+        let mut text = String::with_capacity(300);
+        while text.len() < 300 {
+            text.push('中'); // 3 bytes per push
+        }
+        let out = plugin
+            .on_stream_event(&ctx, StreamEvent::TextDelta { index: 0, text })
+            .await
+            .unwrap();
+        // No panic = pass. Output must be valid UTF-8 (Rust String invariant ensures this).
+        assert!(!out.is_empty(), "expected at least one emission");
     }
 }
