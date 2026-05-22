@@ -156,6 +156,7 @@ dependencies = [
  "agent-shim-providers",
  "agent-shim-tokens",
  "async-trait",
+ "criterion",
  "futures",
  "metrics",
  "metrics-util",
@@ -926,6 +927,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
+ "futures",
  "is-terminal",
  "itertools 0.10.5",
  "num-traits",
@@ -938,6 +940,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 

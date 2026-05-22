@@ -84,7 +84,3 @@ tracing-subscriber.workspace = true
 # pairs on a real socket so the test exercises the full axum+hyper SSE
 # encoding path the gateway's H5 chain feeds into.
 eventsource-client = "0.13"
-
-[[bench]]
-name = "gateway_overhead"
-harness = false
