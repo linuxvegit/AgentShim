@@ -7,8 +7,8 @@
 //! request before each plugin call (clone-then-swap, §6.4) so that an
 //! `Err`-returning plugin never leaks a half-modified state.
 
-use std::fmt;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, StreamEvent};

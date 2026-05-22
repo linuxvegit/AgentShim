@@ -1784,15 +1784,21 @@ mod tests {
 
     #[test]
     fn build_empty_returns_empty_registry() {
-        let reg = PluginRegistry::build(vec![], &[], &[], crate::FactoryDependencies::empty()).unwrap();
+        let reg =
+            PluginRegistry::build(vec![], &[], &[], crate::FactoryDependencies::empty()).unwrap();
         assert!(reg.plugins.is_empty());
         assert!(reg.plans.is_empty());
     }
 
     #[test]
     fn build_duplicate_factory_kind_is_error() {
-        let err = PluginRegistry::build(vec![Box::new(H2Factory), Box::new(H2Factory)], &[], &[], crate::FactoryDependencies::empty())
-            .unwrap_err();
+        let err = PluginRegistry::build(
+            vec![Box::new(H2Factory), Box::new(H2Factory)],
+            &[],
+            &[],
+            crate::FactoryDependencies::empty(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, RegistryBuildError::DuplicateFactoryKind { ref kind } if kind == "h2_plugin"),
             "unexpected error: {err}"
@@ -1878,8 +1884,13 @@ mod tests {
 
     #[test]
     fn build_unknown_frontend_is_error() {
-        let err = PluginRegistry::build(vec![], &[], &[make_route("bogus_frontend", "*", None)], crate::FactoryDependencies::empty())
-            .unwrap_err();
+        let err = PluginRegistry::build(
+            vec![],
+            &[],
+            &[make_route("bogus_frontend", "*", None)],
+            crate::FactoryDependencies::empty(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, RegistryBuildError::UnknownFrontend { ref frontend } if frontend == "bogus_frontend"),
             "unexpected error: {err}"

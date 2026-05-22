@@ -15,11 +15,9 @@ use serde_json::Value;
 use agent_shim_core::{BackendTarget, CanonicalRequest};
 use agent_shim_providers::BackendProvider;
 
-use crate::{
-    FactoryDependencies, HookSet, Plugin, PluginConfigError, PluginFactory,
-};
 use crate::context::PluginContext;
 use crate::error::PluginResult;
+use crate::{FactoryDependencies, HookSet, Plugin, PluginConfigError, PluginFactory};
 use config::{PromptCompressorConfig, Strategy};
 
 /// Result of applying a single strategy. `action` becomes a metric label.
@@ -161,7 +159,9 @@ fn compile_strategy(
                     reason: "must be greater than 0".to_string(),
                 });
             }
-            Ok(CompiledStrategy::DropOldTurns { keep_last_n: c.keep_last_n })
+            Ok(CompiledStrategy::DropOldTurns {
+                keep_last_n: c.keep_last_n,
+            })
         }
 
         Strategy::TruncateToTokens(c) => {
@@ -228,7 +228,9 @@ mod tests {
             "strategy": { "type": "drop_old_turns", "keep_last_n": 5 }
         });
         let deps = FactoryDependencies::empty();
-        let plugin = PromptCompressorFactory.instantiate("test", raw, &deps).unwrap();
+        let plugin = PromptCompressorFactory
+            .instantiate("test", raw, &deps)
+            .unwrap();
         assert_eq!(plugin.kind_name(), "prompt_compressor");
     }
 
@@ -238,8 +240,10 @@ mod tests {
             "strategy": { "type": "drop_old_turns", "keep_last_n": 0 }
         });
         let deps = FactoryDependencies::empty();
-        let err = PromptCompressorFactory.instantiate("test", raw, &deps)
-            .err().expect("expected error");
+        let err = PromptCompressorFactory
+            .instantiate("test", raw, &deps)
+            .err()
+            .expect("expected error");
         assert!(
             matches!(err, PluginConfigError::InvalidValue { .. }),
             "expected InvalidValue, got {err:?}"
@@ -259,8 +263,10 @@ mod tests {
             }
         });
         let deps = FactoryDependencies::empty();
-        let err = PromptCompressorFactory.instantiate("test", raw, &deps)
-            .err().expect("expected error");
+        let err = PromptCompressorFactory
+            .instantiate("test", raw, &deps)
+            .err()
+            .expect("expected error");
         assert!(
             matches!(err, PluginConfigError::InvalidValue { .. }),
             "expected InvalidValue, got {err:?}"
@@ -269,11 +275,11 @@ mod tests {
 
     // ─── H2 dispatch integration tests ───────────────────────────────────
 
-    use agent_shim_core::{
-        ContentBlock, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
-        GenerationOptions, Message, RequestId, ResolvedPolicy, TextBlock,
-    };
     use agent_shim_core::request::RequestMetadata;
+    use agent_shim_core::{
+        ContentBlock, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel, GenerationOptions,
+        Message, RequestId, ResolvedPolicy, TextBlock,
+    };
     use serde_json::json;
 
     fn req_with(messages: Vec<Message>) -> CanonicalRequest {
@@ -373,8 +379,10 @@ mod tests {
             .instantiate("p", cfg, &deps)
             .unwrap();
         let messages = vec![
-            user_t("old-u"), assistant_t("old-a"),
-            user_t("kept-u"), assistant_t("kept-a"),
+            user_t("old-u"),
+            assistant_t("old-a"),
+            user_t("kept-u"),
+            assistant_t("kept-a"),
         ];
         let req = req_with(messages);
         let out = plugin.on_decoded_request(&ctx(), req).await.unwrap();

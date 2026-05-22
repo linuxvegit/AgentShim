@@ -60,21 +60,35 @@ mod tests {
     fn drop_keeps_exactly_n_groups() {
         // 5 groups, keep_last_n=2 -> drop oldest 3 groups (6 messages).
         let messages = vec![
-            user("g1u"), assistant("g1a"),
-            user("g2u"), assistant("g2a"),
-            user("g3u"), assistant("g3a"),
-            user("g4u"), assistant("g4a"),
-            user("g5u"), assistant("g5a"),
+            user("g1u"),
+            assistant("g1a"),
+            user("g2u"),
+            assistant("g2a"),
+            user("g3u"),
+            assistant("g3a"),
+            user("g4u"),
+            assistant("g4a"),
+            user("g5u"),
+            assistant("g5a"),
         ];
         let result = apply(&messages, 2);
         assert_eq!(result.action, "compressed");
         assert_eq!(result.dropped, 6, "3 groups × 2 messages = 6 dropped");
-        assert_eq!(result.new_messages.len(), 4, "2 groups × 2 messages = 4 kept");
+        assert_eq!(
+            result.new_messages.len(),
+            4,
+            "2 groups × 2 messages = 4 kept"
+        );
     }
 
     #[test]
     fn drop_preserves_kept_messages_verbatim() {
-        let messages = vec![user("old"), assistant("old"), user("kept"), assistant("kept")];
+        let messages = vec![
+            user("old"),
+            assistant("old"),
+            user("kept"),
+            assistant("kept"),
+        ];
         let result = apply(&messages, 1);
         assert_eq!(result.action, "compressed");
         match &result.new_messages[0].content[0] {

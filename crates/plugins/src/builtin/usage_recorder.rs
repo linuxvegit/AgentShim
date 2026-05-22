@@ -245,7 +245,11 @@ mod tests {
     #[test]
     fn factory_instantiate_ok() {
         let plugin = make_factory()
-            .instantiate("my_usage_log", json!({"level": "info"}), &crate::FactoryDependencies::empty())
+            .instantiate(
+                "my_usage_log",
+                json!({"level": "info"}),
+                &crate::FactoryDependencies::empty(),
+            )
             .expect("should instantiate");
         assert_eq!(plugin.kind_name(), "usage_recorder");
         assert!(plugin.hooks().contains(crate::Hook::ResponseComplete));
@@ -253,7 +257,11 @@ mod tests {
 
     #[test]
     fn factory_instantiate_bad_json_errors() {
-        let result = make_factory().instantiate("bad", json!({"level": 42}), &crate::FactoryDependencies::empty());
+        let result = make_factory().instantiate(
+            "bad",
+            json!({"level": 42}),
+            &crate::FactoryDependencies::empty(),
+        );
         assert!(result.is_err());
     }
 

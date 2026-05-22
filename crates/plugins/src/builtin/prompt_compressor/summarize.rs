@@ -120,8 +120,10 @@ fn build_summary_request(
         "{}\n\nConversation:\n{serialized_conversation}",
         SUMMARY_PROMPT_PREFIX.replace("{N}", &max_tokens.to_string())
     );
-    let mut generation = GenerationOptions::default();
-    generation.max_tokens = Some(max_tokens);
+    let generation = GenerationOptions {
+        max_tokens: Some(max_tokens),
+        ..Default::default()
+    };
     CanonicalRequest {
         id: RequestId::new(),
         frontend: FrontendInfo {
@@ -318,11 +320,16 @@ mod tests {
 
     fn five_groups() -> Vec<Message> {
         vec![
-            user("g1u"), assistant("g1a"),
-            user("g2u"), assistant("g2a"),
-            user("g3u"), assistant("g3a"),
-            user("g4u"), assistant("g4a"),
-            user("g5u"), assistant("g5a"),
+            user("g1u"),
+            assistant("g1a"),
+            user("g2u"),
+            assistant("g2a"),
+            user("g3u"),
+            assistant("g3a"),
+            user("g4u"),
+            assistant("g4a"),
+            user("g5u"),
+            assistant("g5a"),
         ]
     }
 
