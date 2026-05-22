@@ -130,6 +130,10 @@ Filename convention: `docs/superpowers/plans/2026-05-XX-phase-7-pNN-<short-slug>
 
 ## P07 — Hot-reload + integration tests + benchmark
 
+**Status:** ✅ Promoted to full plan: [`2026-05-22-phase-7-p07-hot-reload-and-tests.md`](2026-05-22-phase-7-p07-hot-reload-and-tests.md) (full spec at [`../specs/2026-05-22-phase-7-p07-hot-reload-and-tests-design.md`](../specs/2026-05-22-phase-7-p07-hot-reload-and-tests-design.md)).
+
+(Outline below preserved for context but superseded by the full plan.)
+
 **Source spec:** §3.5 (hot reload), §6.8 (shutdown flush — completes the JoinSet wiring), §9 (testing strategy), §11 risks.
 
 **Goal:** Make `PluginRegistry` part of the `AppSnapshot` arc-swap path. Ship `tests/plugins_integration.rs` covering the end-to-end spec §9 matrix. Add a benchmark proving the no-plugin fast path matches the v0.6 baseline.

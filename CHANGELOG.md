@@ -7,11 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+(no unreleased changes yet)
 
-- **Windows Service support.** New `agent-shim service install|uninstall|start|stop|restart|status` subcommands on Windows. Run agent-shim as a long-lived background service with SCM state visibility (port-bind-then-Running semantics) and graceful shutdown via the existing axum drain path. See `docs/deployment.md`.
-- **Cross-platform file logging.** New optional `logging.file` config block (path, format, rotation, max_files). Backed by `tracing-appender` with daily/hourly rotation and async writes. See `docs/observability.md#file-logging`.
-- **Linux systemd example** at `deploy/agent-shim.service`. Reuses the existing SIGHUP reload handler for `systemctl reload`.
+## [0.7.0] — 2026-05-22
+
+Phase 7 complete. The plugin system goes live, and the cross-platform
+operations work (Windows Service, file logging) that landed during the
+Phase 7 cycle ships alongside it.
+
+This is the first release where AgentShim has an extensible plugin
+surface for cross-cutting request shaping. Three built-in plugins ship
+in v0.7.0 (`pii_scrubber`, `prompt_compressor`, `usage_recorder`), each
+behind its own Cargo feature (all default-on). Plugin configuration is
+hot-reloadable via SIGHUP / `POST /admin/reload`; reload validation is
+all-or-nothing (no partial commit). The empty-registry hot path has a
+measured overhead of < 1 µs / hook on commodity hardware.
+
+`crates/core/` is unchanged across the entire Phase 7 cycle (frozen-core
+invariant honored — diff against the v0.6.1 baseline is empty).
+
+### Added (plugin system — Phase 7)
+
+- **Plugin trait + registry** (P01-P02): `Plugin` trait with four hooks
+  (`on_decoded_request`, `on_resolved`, `on_stream_event`,
+  `on_response_complete`). `PluginRegistry` with per-route subscription
+  plans and per-hook timeouts. Built atop a new `agent-shim-tokens`
+  crate (cl100k token counting via tiktoken-rs).
+- **Config integration** (P03): `plugins:` top-level YAML block and
+  `routes[].plugins:` per-hook lists. Layer-A validation (undeclared
+  references, `timeout_ms == 0`, duplicate names).
+- **Pipeline integration** (P04): four anchor points in
+  `pipeline::dispatch` wire the hooks at the correct moments. Universal
+  `H7Guard` covers all three streaming frontends. `HandlerError::PluginFailed`
+  with 400/502 envelope mapping.
+- **Observability** (P05): `plugin.invoke` tracing spans,
+  `agent_shim_plugin_invocations_total` and
+  `agent_shim_plugin_duration_seconds` metrics. Shutdown flush of
+  in-flight H7 spawns with `agent_shim_plugin_h7_dropped_at_shutdown_total`
+  counter.
+- **Registry builder** (P06a): `PluginRegistry::build` constructor
+  performing Layer-B validation (kind lookup, factory parse, hook
+  subscription mismatch). `FactoryDependencies` lets factories validate
+  upstream references at startup.
+- **`pii_scrubber`** (P06b1): regex-based PII redaction on H2 (inbound)
+  and H5 (outbound). Behind the `pii_scrubber` Cargo feature
+  (default-on). Per-rule match counter.
+- **`prompt_compressor`** (P06b2): token-aware conversation compression
+  with three strategies — `drop_old_turns`, `truncate_to_tokens`,
+  `summarize_old_turns` (with upstream call + timeout + fallback).
+  Behind the `prompt_compressor` Cargo feature (default-on).
+- **`usage_recorder`** (P06a): on-H7 Prometheus + log sinks for usage
+  telemetry. Behind the `usage_recorder` Cargo feature (default-on).
+- **Hot reload** (P07): `PluginRegistry` is bundled into `AppSnapshot`;
+  reload-time rebuild via Layer-B validation. Failure rejects the entire
+  reload atomically (no partial commit) → HTTP 400 from `/admin/reload`
+  with `{"ok": false, "errors": ["plugin validation error: ..."]}`.
+  In-flight requests observe the snapshot bound at the top of
+  `dispatch`; subsequent reloads do not affect them. Protected by
+  `crates/gateway/tests/plugins_reload.rs::reload_swap_isolates_in_flight_requests`.
+- **Integration tests** (P07): H5 alternate-drop, H5 mid-stream error
+  frame, `on_error: skip`, reload happy path, reload bad-config
+  rejection, in-flight isolation under reload.
+- **Microbench** (P07): `crates/plugins/benches/empty_registry_overhead.rs`
+  protects the zero-overhead-empty-registry property. Observed median
+  ~827 ns on commodity hardware.
+
+### Added (operations)
+
+- **Windows Service support.** New
+  `agent-shim service install|uninstall|start|stop|restart|status`
+  subcommands on Windows. Run agent-shim as a long-lived background
+  service with SCM state visibility (port-bind-then-Running semantics)
+  and graceful shutdown via the existing axum drain path. See
+  `docs/deployment.md`.
+- **Cross-platform file logging.** New optional `logging.file` config
+  block (path, format, rotation, max_files). Backed by `tracing-appender`
+  with daily/hourly rotation and async writes. See
+  `docs/observability.md#file-logging`.
+- **Linux systemd example** at `deploy/agent-shim.service`. Reuses the
+  existing SIGHUP reload handler for `systemctl reload`.
+
+### Changed
+
+- `crates/gateway/src/state.rs`: `plugins` field moved from `AppCore`
+  (immutable) to `AppSnapshot` (hot-swappable). All pipeline read-sites
+  updated to read through the snapshot.
+- `crates/gateway/src/reload_trigger.rs`: `ReloadOutcome` gains a
+  `PluginValidation(String)` variant. `crates/gateway/src/admin/reload_handler.rs`
+  maps it to HTTP 400.
+- `agent_shim_config_reloads_total` counter gains a new `result` label
+  value: `"plugin_validation_error"`.
+
+### Internal
+
+- New crates: `agent-shim-tokens`, `agent-shim-plugins`.
+- `crates/core/` unchanged across all of Phase 7 (frozen-core invariant
+  preserved against the v0.6.1 baseline).
+- New dev-dependency: `eventsource-client` (P07 test-only).
+- New dev-dependency: `criterion` for `agent-shim-plugins` bench-only.
+- `clippy.toml` now pins `msrv = "1.80"` so clippy lints respect the
+  workspace's MSRV.
+- New plugin docs in `README.md` and `docs/architecture.md` (P07 T11).
+
+### Migration notes
+
+- v0.6.x → v0.7.0: no required config changes for deployments without
+  plugins. The empty `PluginRegistry` is a zero-overhead identity path.
+- To opt into plugins, add a top-level `plugins:` block and reference
+  plugin names from `routes[].plugins.on_{hook}:` lists. See the README
+  "Plugins" section.
+- Plugin section reload semantics: a Layer-B failure (unknown kind,
+  factory parse error, hook subscription mismatch) atomically rejects
+  the entire reload; the previous configuration continues running.
 
 ## [0.6.1] — 2026-05-13
 
