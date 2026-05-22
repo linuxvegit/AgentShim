@@ -1691,7 +1691,7 @@ mod tests {
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
             Err(crate::error::PluginConfigError::InvalidValue {
                 plugin: plugin_name.to_string(),
-                field: "strategy",
+                field: "strategy".to_string(),
                 reason: "deliberate failure".to_string(),
             })
         }

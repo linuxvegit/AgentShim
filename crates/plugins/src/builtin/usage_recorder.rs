@@ -100,7 +100,7 @@ impl PluginFactory for UsageRecorderFactory {
         if cfg.sink != Sink::Log {
             return Err(PluginConfigError::InvalidValue {
                 plugin: plugin_name.to_string(),
-                field: "sink",
+                field: "sink".to_string(),
                 reason: "only `log` sink is supported".to_string(),
             });
         }
