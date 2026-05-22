@@ -23,7 +23,6 @@ use crate::error::PluginResult;
 use config::{PromptCompressorConfig, Strategy};
 
 /// Result of applying a single strategy. `action` becomes a metric label.
-#[allow(dead_code)] // filled in by T10 dispatcher
 pub(super) struct CompressionResult {
     pub new_messages: Vec<agent_shim_core::Message>,
     pub dropped: usize,
@@ -68,8 +67,57 @@ impl Plugin for PromptCompressor {
     async fn on_decoded_request(
         &self,
         _ctx: &PluginContext,
-        req: CanonicalRequest,
+        mut req: CanonicalRequest,
     ) -> PluginResult<CanonicalRequest> {
+        let (result, strategy_label) = match &self.strategy {
+            CompiledStrategy::DropOldTurns { keep_last_n } => (
+                drop_old_turns::apply(&req.messages, *keep_last_n),
+                "drop_old_turns",
+            ),
+            CompiledStrategy::TruncateToTokens {
+                target_tokens,
+                keep_last_n,
+            } => (
+                truncate::apply(&req.messages, *target_tokens, *keep_last_n),
+                "truncate_to_tokens",
+            ),
+            CompiledStrategy::SummarizeOldTurns {
+                keep_last_n,
+                provider,
+                target,
+                max_summary_tokens,
+                timeout,
+            } => (
+                summarize::apply(
+                    &req.messages,
+                    *keep_last_n,
+                    provider,
+                    target,
+                    *max_summary_tokens,
+                    *timeout,
+                )
+                .await,
+                "summarize_old_turns",
+            ),
+        };
+
+        metrics::counter!(
+            agent_shim_observability::metrics::catalog::PluginPromptCompressorActionsTotal::NAME,
+            "strategy" => strategy_label,
+            "action" => result.action,
+        )
+        .increment(1);
+
+        if result.action != "skipped" {
+            if result.dropped > 0 {
+                metrics::counter!(
+                    agent_shim_observability::metrics::catalog::PluginPromptCompressorMessagesDroppedTotal::NAME,
+                    "strategy" => strategy_label,
+                )
+                .increment(result.dropped as u64);
+            }
+            req.messages = result.new_messages;
+        }
         Ok(req)
     }
 }
@@ -217,5 +265,151 @@ mod tests {
             matches!(err, PluginConfigError::InvalidValue { .. }),
             "expected InvalidValue, got {err:?}"
         );
+    }
+
+    // ─── H2 dispatch integration tests ───────────────────────────────────
+
+    use agent_shim_core::{
+        ContentBlock, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
+        GenerationOptions, Message, RequestId, ResolvedPolicy, TextBlock,
+    };
+    use agent_shim_core::request::RequestMetadata;
+    use serde_json::json;
+
+    fn req_with(messages: Vec<Message>) -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::AnthropicMessages,
+                requested_model: FrontendModel::from("test-model"),
+            },
+            model: FrontendModel::from("test-model"),
+            system: vec![],
+            messages,
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: RequestMetadata::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: ResolvedPolicy::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
+
+    fn user_t(s: &str) -> Message {
+        Message::user(vec![ContentBlock::Text(TextBlock {
+            text: s.to_string(),
+            extensions: Default::default(),
+        })])
+    }
+    fn assistant_t(s: &str) -> Message {
+        Message::assistant(vec![ContentBlock::Text(TextBlock {
+            text: s.to_string(),
+            extensions: Default::default(),
+        })])
+    }
+
+    fn ctx() -> PluginContext {
+        PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "anthropic_messages/test-model".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn h2_skipped_no_metric_emission() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let cfg = json!({
+            "strategy": { "type": "drop_old_turns", "keep_last_n": 5 }
+        });
+        let deps = FactoryDependencies::empty();
+        let plugin = PromptCompressorFactory
+            .instantiate("p", cfg, &deps)
+            .unwrap();
+        let req = req_with(vec![user_t("a"), assistant_t("b")]);
+        let out = plugin.on_decoded_request(&ctx(), req).await.unwrap();
+        // Skipped: returned unchanged.
+        assert_eq!(out.messages.len(), 2);
+
+        // Metric was emitted (action=skipped is still counted), but messages_dropped_total
+        // must NOT have been incremented.
+        let snapshot = snapshotter.snapshot().into_vec();
+        let dropped_count: u64 = snapshot
+            .iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == "agent_shim_plugin_prompt_compressor_messages_dropped_total"
+                {
+                    match value {
+                        DebugValue::Counter(v) => Some(*v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(dropped_count, 0);
+    }
+
+    #[tokio::test]
+    async fn h2_compressed_emits_metrics() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let cfg = json!({
+            "strategy": { "type": "drop_old_turns", "keep_last_n": 1 }
+        });
+        let deps = FactoryDependencies::empty();
+        let plugin = PromptCompressorFactory
+            .instantiate("p", cfg, &deps)
+            .unwrap();
+        let messages = vec![
+            user_t("old-u"), assistant_t("old-a"),
+            user_t("kept-u"), assistant_t("kept-a"),
+        ];
+        let req = req_with(messages);
+        let out = plugin.on_decoded_request(&ctx(), req).await.unwrap();
+        assert_eq!(out.messages.len(), 2);
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let actions: u64 = snapshot
+            .iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == "agent_shim_plugin_prompt_compressor_actions_total" {
+                    match value {
+                        DebugValue::Counter(v) => Some(*v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(actions, 1, "one action total");
+
+        let dropped: u64 = snapshot
+            .iter()
+            .filter_map(|(key, _, _, value)| {
+                if key.key().name() == "agent_shim_plugin_prompt_compressor_messages_dropped_total"
+                {
+                    match value {
+                        DebugValue::Counter(v) => Some(*v),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .sum();
+        assert_eq!(dropped, 2, "two messages dropped (1 group × 2 msgs)");
     }
 }
