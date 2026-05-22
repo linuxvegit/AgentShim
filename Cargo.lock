@@ -152,6 +152,7 @@ dependencies = [
  "agent-shim-config",
  "agent-shim-core",
  "agent-shim-observability",
+ "agent-shim-providers",
  "agent-shim-tokens",
  "async-trait",
  "futures",

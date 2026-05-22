@@ -730,8 +730,9 @@ impl PluginRegistry {
             })?;
 
             // Instantiate (config validation)
+            let deps_for_this_task = crate::FactoryDependencies::empty();
             let plugin_box = factory
-                .instantiate(name, spec.config.clone())
+                .instantiate(name, spec.config.clone(), &deps_for_this_task)
                 .map_err(|e| RegistryBuildError::Instantiation(e, name.clone()))?;
 
             let timeouts = match &spec.timeout_ms {
@@ -1671,6 +1672,7 @@ mod tests {
             &self,
             _plugin_name: &str,
             _config: serde_json::Value,
+            _deps: &crate::FactoryDependencies,
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
             Ok(Box::new(CounterPlugin {
                 n: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1688,6 +1690,7 @@ mod tests {
             &self,
             plugin_name: &str,
             _config: serde_json::Value,
+            _deps: &crate::FactoryDependencies,
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
             Err(crate::error::PluginConfigError::InvalidValue {
                 plugin: plugin_name.to_string(),
@@ -1720,6 +1723,7 @@ mod tests {
             &self,
             _plugin_name: &str,
             _config: serde_json::Value,
+            _deps: &crate::FactoryDependencies,
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
             Ok(Box::new(H5Plugin))
         }
@@ -1747,6 +1751,7 @@ mod tests {
             &self,
             _plugin_name: &str,
             _config: serde_json::Value,
+            _deps: &crate::FactoryDependencies,
         ) -> Result<Box<dyn crate::Plugin>, crate::error::PluginConfigError> {
             Ok(Box::new(H2H7Plugin))
         }

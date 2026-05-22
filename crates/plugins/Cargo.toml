@@ -23,6 +23,7 @@ prompt_compressor = ["dep:agent-shim-tokens"]
 agent-shim-config = { path = "../config" }
 agent-shim-core = { path = "../core" }
 agent-shim-observability = { path = "../observability" }
+agent-shim-providers = { path = "../providers" }
 agent-shim-tokens = { path = "../tokens", optional = true }
 async-trait.workspace = true
 futures.workspace = true

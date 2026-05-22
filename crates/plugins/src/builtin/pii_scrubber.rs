@@ -69,6 +69,7 @@ impl PluginFactory for PiiScrubberFactory {
         &self,
         plugin_name: &str,
         config: serde_json::Value,
+        _deps: &crate::FactoryDependencies,
     ) -> Result<Box<dyn Plugin>, PluginConfigError> {
         let cfg: PiiScrubberConfig = serde_json::from_value(config)
             .map_err(|e| PluginConfigError::Deserialize(e, plugin_name.to_string()))?;
@@ -387,7 +388,7 @@ mod tests {
             ]
         });
         let plugin = PiiScrubberFactory
-            .instantiate("p", cfg)
+            .instantiate("p", cfg, &crate::FactoryDependencies::empty())
             .expect("should compile");
         assert_eq!(plugin.kind_name(), "pii_scrubber");
         assert!(plugin.hooks().contains(crate::Hook::DecodedRequest));
@@ -401,7 +402,7 @@ mod tests {
                 { "name": "bad", "pattern": "[unclosed", "replacement": "X" }
             ]
         });
-        let err = match PiiScrubberFactory.instantiate("p", cfg) {
+        let err = match PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()) {
             Ok(_) => panic!("expected InvalidValue error"),
             Err(e) => e,
         };
@@ -422,7 +423,7 @@ mod tests {
                 { "name": "email", "pattern": "b", "replacement": "y" }
             ]
         });
-        let err = match PiiScrubberFactory.instantiate("p", cfg) {
+        let err = match PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()) {
             Ok(_) => panic!("expected InvalidValue error"),
             Err(e) => e,
         };
@@ -442,7 +443,7 @@ mod tests {
                 { "name": "my rule", "pattern": "a", "replacement": "x" }
             ]
         });
-        let err = match PiiScrubberFactory.instantiate("p", cfg) {
+        let err = match PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()) {
             Ok(_) => panic!("expected InvalidValue error"),
             Err(e) => e,
         };
@@ -457,7 +458,7 @@ mod tests {
                 { "name": long_name, "pattern": "a", "replacement": "x" }
             ]
         });
-        let err = match PiiScrubberFactory.instantiate("p", cfg) {
+        let err = match PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()) {
             Ok(_) => panic!("expected InvalidValue error"),
             Err(e) => e,
         };
@@ -471,7 +472,7 @@ mod tests {
                 { "name": "x", "pattern": "a", "replacement": "y" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let h = plugin.hooks();
         assert!(!h.contains(crate::Hook::DecodedRequest));
         assert!(h.contains(crate::Hook::StreamEvent));
@@ -479,7 +480,7 @@ mod tests {
 
     #[test]
     fn hooks_empty_subscription_on_empty_config() {
-        let plugin = PiiScrubberFactory.instantiate("p", json!({})).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", json!({}), &crate::FactoryDependencies::empty()).unwrap();
         assert_eq!(plugin.hooks(), HookSet::empty());
     }
 
@@ -561,7 +562,7 @@ mod tests {
                 { "name": "email", "pattern": r"\w+@\w+\.\w+", "replacement": "[EMAIL]" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let req = make_request_with_text("Contact me at alice@example.com please.");
         let out = plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
         let text = match &out.messages[0].content[0] {
@@ -578,7 +579,7 @@ mod tests {
                 { "name": "ssn", "pattern": r"\b\d{3}-\d{2}-\d{4}\b", "replacement": "[SSN]" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let req = make_request_with_reasoning("User mentioned SSN 123-45-6789 earlier.");
         let out = plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
         let text = match &out.messages[0].content[0] {
@@ -595,7 +596,7 @@ mod tests {
                 { "name": "email", "pattern": r"\w+@\w+", "replacement": "[X]" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let image_block = ContentBlock::Image(ImageBlock {
             source: BinarySource::Url {
                 url: "https://example.com/cat@home.png".to_string(),
@@ -638,7 +639,7 @@ mod tests {
                 { "name": "email", "pattern": r"\w+@\w+\.\w+", "replacement": "[E]" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let req = make_request_with_text("a@b.com c@d.com");
         plugin.on_decoded_request(&make_ctx(), req).await.unwrap();
 
@@ -671,7 +672,7 @@ mod tests {
                 { "name": "n", "pattern": "x", "replacement": "y" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let ctx = make_ctx();
         let event = StreamEvent::TextDelta {
             index: 0,
@@ -691,7 +692,7 @@ mod tests {
                 { "name": "n", "pattern": "secret", "replacement": "REDACTED" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let ctx = make_ctx();
         // First small delta: buffer.
         let _ = plugin
@@ -735,7 +736,7 @@ mod tests {
                 { "name": "cc", "pattern": r"\b\d{4}-\d{4}-\d{4}-\d{4}\b", "replacement": "[CC]" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let ctx = make_ctx();
         // Split a credit card across two deltas.
         let _ = plugin
@@ -796,7 +797,7 @@ mod tests {
                 { "name": "x", "pattern": "x", "replacement": "y" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let ctx = make_ctx();
         let _ = plugin
             .on_stream_event(
@@ -831,7 +832,7 @@ mod tests {
                 { "name": "n", "pattern": "x", "replacement": "y" }
             ]
         });
-        let plugin = PiiScrubberFactory.instantiate("p", cfg).unwrap();
+        let plugin = PiiScrubberFactory.instantiate("p", cfg, &crate::FactoryDependencies::empty()).unwrap();
         let ctx = make_ctx();
         // Build a >256-byte buffer of multi-byte UTF-8 chars so the flush
         // split point lands inside a 3-byte char. Chinese characters are

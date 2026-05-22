@@ -92,6 +92,7 @@ impl PluginFactory for UsageRecorderFactory {
         &self,
         plugin_name: &str,
         config: serde_json::Value,
+        _deps: &crate::FactoryDependencies,
     ) -> Result<Box<dyn Plugin>, PluginConfigError> {
         let cfg: UsageRecorderConfig = serde_json::from_value(config)
             .map_err(|e| PluginConfigError::Deserialize(e, plugin_name.to_string()))?;
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn factory_instantiate_ok() {
         let plugin = make_factory()
-            .instantiate("my_usage_log", json!({"level": "info"}))
+            .instantiate("my_usage_log", json!({"level": "info"}), &crate::FactoryDependencies::empty())
             .expect("should instantiate");
         assert_eq!(plugin.kind_name(), "usage_recorder");
         assert!(plugin.hooks().contains(crate::Hook::ResponseComplete));
@@ -252,7 +253,7 @@ mod tests {
 
     #[test]
     fn factory_instantiate_bad_json_errors() {
-        let result = make_factory().instantiate("bad", json!({"level": 42}));
+        let result = make_factory().instantiate("bad", json!({"level": 42}), &crate::FactoryDependencies::empty());
         assert!(result.is_err());
     }
 

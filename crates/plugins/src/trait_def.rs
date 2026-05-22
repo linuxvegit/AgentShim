@@ -8,8 +8,11 @@
 //! `Err`-returning plugin never leaks a half-modified state.
 
 use std::fmt;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use agent_shim_core::{BackendTarget, CanonicalRequest, StreamEvent};
+use agent_shim_providers::BackendProvider;
 use async_trait::async_trait;
 
 use crate::context::{PluginContext, ResponseSummary};
@@ -149,6 +152,27 @@ pub trait Plugin: Send + Sync + 'static {
     }
 }
 
+/// Runtime dependencies injected into every `PluginFactory::instantiate`
+/// call. Plugins that don't need any deps ignore this; plugins that need
+/// access to the configured backend providers (e.g. prompt_compressor)
+/// use `deps.providers`.
+pub struct FactoryDependencies<'a> {
+    pub providers: &'a BTreeMap<String, Arc<dyn BackendProvider>>,
+}
+
+impl<'a> FactoryDependencies<'a> {
+    /// Returns a `FactoryDependencies` backed by a static empty map.
+    /// Useful in tests and in `PluginRegistry::build()` before T3 wires
+    /// real providers in.
+    pub fn empty() -> FactoryDependencies<'static> {
+        static EMPTY: std::sync::OnceLock<BTreeMap<String, Arc<dyn BackendProvider>>> =
+            std::sync::OnceLock::new();
+        FactoryDependencies {
+            providers: EMPTY.get_or_init(BTreeMap::new),
+        }
+    }
+}
+
 /// Factory for constructing `Plugin` instances from a parsed YAML
 /// config block. One factory per plugin kind. Registered into
 /// `PluginRegistry` at startup.
@@ -168,6 +192,7 @@ pub trait PluginFactory: Send + Sync + 'static {
         &self,
         plugin_name: &str,
         config: serde_json::Value,
+        deps: &FactoryDependencies,
     ) -> Result<Box<dyn Plugin>, PluginConfigError>;
 }
 
