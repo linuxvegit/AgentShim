@@ -249,21 +249,57 @@ pub async fn handle_reload(
 
     match agent_shim_config::validate_for_reload(&candidate, &baseline) {
         Ok(diff) => {
+            // ── P07 §4.3: Layer B (plugin registry rebuild) ───────────
+            // Must happen BEFORE snapshot.store so a failure rejects the
+            // entire reload (no partial commit). Provider set is
+            // guaranteed immutable across reload (UpstreamSetChanged is
+            // upstream of this branch), so borrowing the current
+            // ProviderRegistry is safe.
+            let plugin_specs: Vec<(String, agent_shim_config::plugins::PluginEntry)> = candidate
+                .plugins
+                .iter()
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect();
+            let new_plugins = {
+                let factories = agent_shim_plugins::builtin::builtin_plugins();
+                let deps = agent_shim_plugins::FactoryDependencies {
+                    providers: state.core.providers.inner_map(),
+                };
+                match agent_shim_plugins::PluginRegistry::build(
+                    factories,
+                    &plugin_specs,
+                    &candidate.routes,
+                    deps,
+                ) {
+                    Ok(r) => Arc::new(r),
+                    Err(e) => {
+                        metrics::counter!(
+                            agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
+                            "result" => "plugin_validation_error",
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            target = "agent_shim::reload",
+                            error = %e,
+                            "config reload rejected: plugin validation"
+                        );
+                        return ReloadOutcome::PluginValidation(e.to_string());
+                    }
+                }
+            };
+
             // Build a fresh snapshot from the candidate config and
             // atomic-swap. In-flight requests captured the OLD snapshot
             // at the top of `pipeline::dispatch` and stay on it (spec
-            // §2.2); new requests after this store() see the new one.
+            // §2.2); new requests after this store() see the new one,
+            // INCLUDING the new PluginRegistry.
             let build = agent_shim_observability::reload::build(candidate);
-            // P07 T1: plugins now live on AppSnapshot. T1 is a pure
-            // refactor — the reload path preserves the current plugin
-            // Arc byte-for-byte; actual hot-swapping lands in T3.
-            let current_plugins = state.snapshot.load_full().plugins.clone();
             let new_snap = Arc::new(crate::state::AppSnapshot {
                 config: build.config,
                 auth_enabled: build.auth_enabled,
                 auth_required: build.auth_required,
                 configured_key_hashes: build.configured_key_hashes,
-                plugins: current_plugins,
+                plugins: new_plugins,
             });
             state.snapshot.store(new_snap);
 
