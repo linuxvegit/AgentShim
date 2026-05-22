@@ -38,4 +38,8 @@ pub enum ReloadOutcome {
     ImmutableField(String),
     Io(String),
     Parse(String),
+    /// Plan 07 P07: plugin section failed Layer-B validation (unknown
+    /// kind / factory parse error / hook subscription mismatch). The
+    /// entire reload is rejected; old plugin registry remains active.
+    PluginValidation(String),
 }

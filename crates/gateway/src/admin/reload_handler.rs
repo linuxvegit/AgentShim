@@ -120,6 +120,11 @@ pub async fn reload(
             Json(json!({"ok": false, "errors": [format!("YAML parse error: {msg}")]})),
         )
             .into_response(),
+        Ok(ReloadOutcome::PluginValidation(msg)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "errors": [format!("plugin validation error: {msg}")]})),
+        )
+            .into_response(),
         Ok(ReloadOutcome::Io(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"ok": false, "errors": [format!("IO error: {msg}")]})),
