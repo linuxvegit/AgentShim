@@ -242,13 +242,41 @@ impl PluginRegistry {
         frontend: FrontendKind,
         model: &str,
     ) -> Self {
+        Self::for_testing_single_plugin_with_timeouts(
+            name,
+            plugin,
+            on_error,
+            hook,
+            frontend,
+            model,
+            HookTimeouts::default(),
+        )
+    }
+
+    /// Plan 07 P07 T9: same as `for_testing_single_plugin`, but lets the
+    /// caller supply an explicit `HookTimeouts`. The in-flight isolation
+    /// test (`reload_swap_isolates_in_flight_requests`) deliberately
+    /// blocks inside `on_decoded_request` on a `tokio::sync::Barrier` so
+    /// the test thread can swap the snapshot mid-flight, which trivially
+    /// exceeds the default 50 ms H2 timeout. Tests that need to hold the
+    /// plugin past the default timeout reach for this helper.
+    #[doc(hidden)]
+    pub fn for_testing_single_plugin_with_timeouts(
+        name: &str,
+        plugin: Arc<dyn crate::Plugin>,
+        on_error: OnError,
+        hook: Hook,
+        frontend: FrontendKind,
+        model: &str,
+        timeouts: HookTimeouts,
+    ) -> Self {
         let kind = plugin.kind_name();
         let entry = Arc::new(PluginEntry {
             name: name.to_string(),
             kind,
             plugin,
             on_error,
-            timeouts: HookTimeouts::default(),
+            timeouts,
             enabled: true,
         });
         let mut plan = RouteHookPlan::default();
