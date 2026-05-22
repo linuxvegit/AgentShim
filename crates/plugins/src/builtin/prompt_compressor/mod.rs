@@ -1,6 +1,7 @@
 #![cfg(feature = "prompt_compressor")]
 
 pub mod config;
+pub(super) mod groups;
 
 use std::sync::Arc;
 use std::time::Duration;
