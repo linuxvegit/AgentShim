@@ -246,6 +246,30 @@ pub struct PluginH7DroppedTotal;
 )]
 pub struct PluginPiiScrubberMatchesTotal;
 
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_prompt_compressor_actions_total",
+    kind = "counter",
+    help = "prompt_compressor actions by strategy and outcome (Plan 07 P06b2)"
+)]
+pub struct PluginPromptCompressorActionsTotal;
+
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_prompt_compressor_messages_dropped_total",
+    kind = "counter",
+    help = "Total messages dropped by prompt_compressor by strategy (Plan 07 P06b2)"
+)]
+pub struct PluginPromptCompressorMessagesDroppedTotal;
+
+#[derive(Metric)]
+#[metric(
+    name = "agent_shim_plugin_prompt_compressor_summary_duration_seconds",
+    kind = "histogram",
+    help = "summarize_old_turns provider call duration by outcome (Plan 07 P06b2)"
+)]
+pub struct PluginPromptCompressorSummaryDurationSeconds;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,8 +283,8 @@ mod tests {
         let descriptors = iter_descriptors();
         assert_eq!(
             descriptors.len(),
-            19,
-            "expected 19 metric descriptors in catalog, got {}",
+            22,
+            "expected 22 metric descriptors in catalog, got {}",
             descriptors.len()
         );
     }

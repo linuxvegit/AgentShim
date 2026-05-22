@@ -226,25 +226,6 @@ impl AppState {
         Self,
         tokio::sync::mpsc::Receiver<crate::reload_trigger::ReloadRequest>,
     )> {
-        let plugins = match plugin_override {
-            Some(p) => p,
-            None => {
-                let factories = agent_shim_plugins::builtin::builtin_plugins();
-                let plugin_specs: Vec<(String, agent_shim_config::plugins::PluginEntry)> = config
-                    .plugins
-                    .iter()
-                    .map(|(name, entry)| (name.clone(), entry.clone()))
-                    .collect();
-                Arc::new(
-                    agent_shim_plugins::PluginRegistry::build(
-                        factories,
-                        &plugin_specs,
-                        &config.routes,
-                    )
-                    .map_err(|e| anyhow::anyhow!("plugin registry build failed: {e}"))?,
-                )
-            }
-        };
         let keepalive = Duration::from_secs(config.server.keepalive_secs);
         let anthropic = Arc::new(AnthropicMessages {
             keepalive: Some(keepalive),
@@ -296,6 +277,30 @@ impl AppState {
                 },
             }
         }
+
+        let plugins = match plugin_override {
+            Some(p) => p,
+            None => {
+                let factories = agent_shim_plugins::builtin::builtin_plugins();
+                let plugin_specs: Vec<(String, agent_shim_config::plugins::PluginEntry)> = config
+                    .plugins
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.clone()))
+                    .collect();
+                let deps = agent_shim_plugins::FactoryDependencies {
+                    providers: registry.inner_map(),
+                };
+                Arc::new(
+                    agent_shim_plugins::PluginRegistry::build(
+                        factories,
+                        &plugin_specs,
+                        &config.routes,
+                        deps,
+                    )
+                    .map_err(|e| anyhow::anyhow!("plugin registry build failed: {e}"))?,
+                )
+            }
+        };
 
         let static_router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&config));
 
