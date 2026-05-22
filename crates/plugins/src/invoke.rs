@@ -270,11 +270,11 @@ mod tests {
     // ── invoke() — InvokeArgs shape (P05) ──────────────────────────────
 
     fn ctx() -> PluginContext {
-        PluginContext {
-            request_id: RequestId::new(),
-            frontend: FrontendKind::AnthropicMessages,
-            route_label: "anthropic_messages/m".to_string(),
-        }
+        PluginContext::new(
+            RequestId::new(),
+            FrontendKind::AnthropicMessages,
+            "anthropic_messages/m".to_string(),
+        )
     }
 
     fn args_for<'a>(name: &'a str, hook: &'static str) -> InvokeArgs<'a> {
