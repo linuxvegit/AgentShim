@@ -79,6 +79,11 @@ opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+# Plan 07 P07 T4: SSE client for H5 stream-event integration tests. Sends
+# a POST with a custom JSON body and parses incoming `event:`/`data:`
+# pairs on a real socket so the test exercises the full axum+hyper SSE
+# encoding path the gateway's H5 chain feeds into.
+eventsource-client = "0.13"
 
 [[bench]]
 name = "gateway_overhead"
