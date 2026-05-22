@@ -6,6 +6,8 @@
 
 #[cfg(feature = "pii_scrubber")]
 pub mod pii_scrubber;
+#[cfg(feature = "prompt_compressor")]
+pub mod prompt_compressor;
 #[cfg(feature = "usage_recorder")]
 pub mod usage_recorder;
 
@@ -22,6 +24,8 @@ pub fn builtin_plugins() -> Vec<Box<dyn PluginFactory>> {
     let mut factories: Vec<Box<dyn PluginFactory>> = Vec::new();
     #[cfg(feature = "pii_scrubber")]
     factories.push(Box::new(pii_scrubber::PiiScrubberFactory));
+    #[cfg(feature = "prompt_compressor")]
+    factories.push(Box::new(prompt_compressor::PromptCompressorFactory));
     #[cfg(feature = "usage_recorder")]
     factories.push(Box::new(usage_recorder::UsageRecorderFactory));
     factories
