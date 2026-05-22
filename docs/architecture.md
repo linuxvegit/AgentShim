@@ -323,10 +323,10 @@ is an enum whose primary variants are:
   irrespective of `on_error`.
 
 The `on_error` policy lives in the YAML config:
-- `on_error: fail` (default) → plugin error short-circuits the chain
-  with HTTP 502 (Bad Gateway).
-- `on_error: skip` → plugin error is swallowed; the chain continues
-  with the un-modified request.
+- `on_error: skip` (default) → plugin error is swallowed; the chain
+  continues with the un-modified request.
+- `on_error: fail` → plugin error short-circuits the chain with HTTP
+  502 (Bad Gateway).
 
 Per-hook timeouts are configurable via the `timeout_ms` knob on each
 plugin entry; defaults are 50 ms for H2/H3/H7 and 5 ms for H5
