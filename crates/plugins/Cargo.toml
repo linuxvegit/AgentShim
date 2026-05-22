@@ -11,18 +11,19 @@ name = "agent_shim_plugins"
 path = "src/lib.rs"
 
 [features]
-default = ["usage_recorder", "pii_scrubber"]
+default = ["usage_recorder", "pii_scrubber", "prompt_compressor"]
 # Each built-in lives behind its own Cargo feature. Disabling a
 # feature removes the factory from `builtin_plugins()` and the plugin
 # code from the binary.
 usage_recorder = []
 pii_scrubber = ["dep:regex"]
+prompt_compressor = ["dep:agent-shim-tokens"]
 
 [dependencies]
 agent-shim-config = { path = "../config" }
 agent-shim-core = { path = "../core" }
 agent-shim-observability = { path = "../observability" }
-agent-shim-tokens = { path = "../tokens" }
+agent-shim-tokens = { path = "../tokens", optional = true }
 async-trait.workspace = true
 futures.workspace = true
 metrics.workspace = true
