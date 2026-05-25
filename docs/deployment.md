@@ -156,6 +156,21 @@ On Linux, agent-shim runs cleanly under systemd. A sample unit is shipped at [`d
 
 ### Install
 
+For the default layout below, you can use the repository installer:
+
+```bash
+./scripts/install-linux-service.sh --start
+# or install a prepared config file:
+./scripts/install-linux-service.sh --config ./gateway.yaml --start
+```
+
+The script builds the release binary if needed, creates the service user,
+installs the binary/config/unit, validates the installed config, runs
+`systemctl daemon-reload`, and enables the service. Existing
+`/etc/agent-shim/gateway.yaml` is preserved unless `--force-config` is passed.
+
+Manual equivalent:
+
 ```bash
 # 1. System user (no login shell, no home).
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin agent-shim
