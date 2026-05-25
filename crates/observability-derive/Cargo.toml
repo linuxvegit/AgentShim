@@ -1,6 +1,6 @@
 [package]
 name = "agent-shim-observability-derive"
-version = "0.6.1"
+version.workspace = true
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Internal proc-macro crate for the agent-shim observability layer."

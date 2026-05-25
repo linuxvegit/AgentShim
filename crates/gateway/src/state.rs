@@ -113,12 +113,6 @@ pub struct AppCore {
     /// `/admin/reload` clones this sender.
     #[allow(dead_code)]
     pub reload_tx: tokio::sync::mpsc::Sender<crate::reload_trigger::ReloadRequest>,
-    /// Plan 07 P04: plugin registry. Built once at startup; reload-time
-    /// hot-swapping lands in P07. For now `PluginRegistry::empty()` is
-    /// the always-true default (no config crate path wires plugins
-    /// through yet — that's P06). Consumed by the H2/H3/H5/H7 anchor
-    /// points in `pipeline::dispatch_inner` / `run_stream` / `run_unary`.
-    pub plugins: Arc<agent_shim_plugins::PluginRegistry>,
 }
 
 /// Hot-swappable policy-bearing snapshot. Plan 04 will swap this on
@@ -142,6 +136,10 @@ pub struct AppSnapshot {
     /// is not in this set. Pre-computed once so the per-request lookup
     /// is a single HashSet contains() call.
     pub configured_key_hashes: Arc<HashSet<String>>,
+    /// Plan 07 P07: plugins now hot-swappable. In-flight requests
+    /// capture the snapshot at the top of `pipeline::dispatch`;
+    /// subsequent reloads do not perturb their plugin view.
+    pub plugins: Arc<agent_shim_plugins::PluginRegistry>,
 }
 
 /// The application-wide handler state cloned into every axum handler.
@@ -193,8 +191,9 @@ impl AppState {
 
     /// Plan 07 P04 T12: integration-test-only constructor that lets tests
     /// inject a custom `PluginRegistry` (instead of the default
-    /// `empty()`). Same shape as `new_with_clock`. Production callers
-    /// MUST use `AppState::new`.
+    /// `empty()`) (in P07, the injected plugins end up on `AppSnapshot`
+    /// rather than `AppCore`). Same shape as `new_with_clock`.
+    /// Production callers MUST use `AppState::new`.
     ///
     /// `#[allow(dead_code)]` because integration tests in
     /// `crates/gateway/tests/` are a separate compilation unit; the
@@ -215,7 +214,8 @@ impl AppState {
     /// Shared construction path for `new`, `new_with_clock`, and
     /// `new_with_plugins`. The callers parameterize the `Clock` handed to
     /// `BreakerRegistry::new` and the `PluginRegistry` placed on
-    /// `AppCore`; everything else (provider registry, resolver, frontend
+    /// `AppSnapshot` (so reload-time hot-swap honors §2.2 atomicity);
+    /// everything else (provider registry, resolver, frontend
     /// handlers) is identical, so extracting this helper keeps the
     /// public constructors as one-liners.
     async fn build(
@@ -395,6 +395,7 @@ impl AppState {
             auth_enabled,
             auth_required,
             configured_key_hashes,
+            plugins,
         };
 
         let core = AppCore {
@@ -411,7 +412,6 @@ impl AppState {
             limiter_registry,
             metrics,
             reload_tx,
-            plugins,
         };
 
         Ok((
@@ -473,6 +473,8 @@ routes:
         let snap = state.snapshot.load_full();
         let _: &Arc<agent_shim_config::GatewayConfig> = &snap.config;
         let _: &Arc<HashSet<String>> = &snap.configured_key_hashes;
+        // Plan 07 P07 T1: plugins live on the hot-swappable snapshot.
+        let _: &Arc<agent_shim_plugins::PluginRegistry> = &snap.plugins;
 
         // Behavioural assertion: the YAML's absent auth block produces the
         // expected defaults on the snapshot side.
@@ -502,6 +504,7 @@ routes:
             auth_enabled: true,
             auth_required: true,
             configured_key_hashes: Arc::clone(&captured.configured_key_hashes),
+            plugins: Arc::clone(&captured.plugins),
         };
         state.snapshot.store(Arc::new(new_snap));
 

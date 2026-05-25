@@ -313,6 +313,67 @@ routes:
 
 Inbound header wins; the route value is the fallback. Comma-separated values are passed through unchanged.
 
+## Plugins
+
+AgentShim supports a small, opt-in plugin system for cross-cutting
+request shaping: PII scrubbing, prompt compression, usage recording,
+and custom logic via the trait surface.
+
+### Hook anchors
+
+| Hook | When | Use cases |
+|---|---|---|
+| `on_decoded_request` (H2) | After protocol decode, before route resolve | PII redaction, prompt compression |
+| `on_resolved` (H3) | After backend target resolution | Target-specific shaping |
+| `on_stream_event` (H5) | Per streamed response event | Output filtering, content moderation |
+| `on_response_complete` (H7) | After full response received | Usage recording, audit logging |
+
+### Built-in plugins (v1)
+
+- `pii_scrubber` — regex-based PII redaction, inbound (H2) and outbound (H5). Behind the `pii_scrubber` Cargo feature (default-on).
+- `prompt_compressor` — token-aware conversation history compression with three strategies (`drop_old_turns`, `truncate_to_tokens`, `summarize_old_turns`). Behind the `prompt_compressor` Cargo feature (default-on).
+- `usage_recorder` — request/response token + cost recording to Prometheus or structured logs (H7). Behind the `usage_recorder` Cargo feature (default-on).
+
+### Configuration example
+
+```yaml
+plugins:
+  scrub:
+    type: pii_scrubber
+    on_error: fail
+    config:
+      inbound:
+        - name: email
+          pattern: "[\\w.]+@[\\w.]+\\.[a-z]{2,}"
+          replacement: "[REDACTED-EMAIL]"
+routes:
+  - frontend: anthropic_messages
+    model: claude-sonnet-4
+    upstream: anthropic_primary
+    upstream_model: claude-sonnet-4
+    plugins:
+      on_decoded_request:
+        - scrub
+```
+
+Plugin configuration is hot-reloadable via SIGHUP or `POST /admin/reload`.
+A failed plugin validation atomically rejects the entire reload; the
+previous configuration continues running.
+
+### Disabling plugin support
+
+Built-in plugins are behind Cargo features. To exclude them from your build:
+
+```bash
+cargo build -p agent-shim --no-default-features --features <subset>
+```
+
+Available feature flags: `usage_recorder`, `pii_scrubber`, `prompt_compressor`. All three are enabled by default.
+
+### Writing custom plugins
+
+See `crates/plugins/src/trait_def.rs` for the `Plugin` trait surface and `crates/plugins/src/builtin/` for production-quality example implementations.
+
 ## Environment variable overlay
 
 Any config field can be overridden via environment variables with the `AGENT_SHIM__` prefix (double underscore for nesting):

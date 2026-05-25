@@ -218,13 +218,13 @@ fn make_app_state(
             limiter_registry,
             metrics: agent_shim_observability::install_metrics(&Default::default()),
             reload_tx: tokio::sync::mpsc::channel(1).0,
-            plugins,
         }),
         snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
             config: Arc::new(cfg),
             auth_enabled: false,
             auth_required: false,
             configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+            plugins,
         }))),
     }
 }
@@ -615,3 +615,85 @@ async fn plugin_protected_field_mutation_returns_502() {
 // All helpers live above. The plugins crate exposes
 // `PluginRegistry::for_testing_single_plugin` so we don't need to
 // reach into the private `RouteHookPlan` / `FrontendRoutePlans` types.
+
+/// H2 plugin that always returns `PluginError::Failed`. Used together with
+/// `OnError::Skip` to verify the error is silently swallowed: the chain
+/// continues, the upstream provider sees the un-modified canonical request,
+/// and the gateway returns 200.
+struct AlwaysErrorPlugin;
+
+#[async_trait]
+impl Plugin for AlwaysErrorPlugin {
+    fn kind_name(&self) -> &'static str {
+        "always_error"
+    }
+    fn hooks(&self) -> HookSet {
+        HookSet::DECODED_REQUEST
+    }
+    async fn on_decoded_request(
+        &self,
+        _ctx: &PluginContext,
+        _req: CanonicalRequest,
+    ) -> PluginResult<CanonicalRequest> {
+        Err(PluginError::Failed {
+            plugin: "always_error".to_string(),
+            hook: "on_decoded_request",
+            message: "synthetic skip test".to_string(),
+        })
+    }
+}
+
+/// §9 T6 coverage: `on_error: skip` swallows non-aborted plugin errors.
+/// The plugin's `Err(PluginError::Failed{..})` is converted to a no-op by
+/// the registry; the upstream provider sees the original request and the
+/// HTTP response is 200.
+#[tokio::test]
+async fn plugin_skip_on_error_returns_200() {
+    let captured = Arc::new(tokio::sync::Mutex::new(None));
+    let registry = registry_with_one_plugin(
+        "always_error",
+        Arc::new(AlwaysErrorPlugin),
+        OnError::Skip,
+        agent_shim_plugins::Hook::DecodedRequest,
+    );
+    let state = make_app_state(registry, Arc::clone(&captured));
+    let app = build_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(ANTHROPIC_BODY))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Skip should swallow the plugin error → 200, got {:?}",
+        response.status(),
+    );
+
+    // The chain continued past the failing plugin, so the upstream was hit
+    // and saw the un-modified request (the plugin attempted no mutation
+    // before erroring).
+    let captured_req = captured
+        .lock()
+        .await
+        .clone()
+        .expect("upstream provider was reached");
+    assert_eq!(
+        captured_req.messages.len(),
+        1,
+        "request reached upstream with its single original message intact"
+    );
+    let first = &captured_req.messages[0];
+    let has_original_text = first
+        .content
+        .iter()
+        .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("hello")));
+    assert!(
+        has_original_text,
+        "original prompt text reached upstream un-modified"
+    );
+}

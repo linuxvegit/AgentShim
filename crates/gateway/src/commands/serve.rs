@@ -132,8 +132,10 @@ where
     // P05 T11: clone the plugin Arc + shutdown.plugin_flush_secs BEFORE
     // moving `state` into axum. After axum drain, no new H7 spawns occur
     // (no requests in flight) so flush can run safely on this clone.
-    let plugins = state.core.plugins.clone();
-    let flush_secs = state.snapshot.load_full().config.shutdown.plugin_flush_secs;
+    // P07: plugins now live on AppSnapshot; capture the current snapshot once.
+    let snap = state.snapshot.load_full();
+    let plugins = snap.plugins.clone();
+    let flush_secs = snap.config.shutdown.plugin_flush_secs;
 
     let result = if let Some(admin_listener) = admin_listener_opt {
         crate::server::run_with_admin_on_listeners(
@@ -247,16 +249,57 @@ pub async fn handle_reload(
 
     match agent_shim_config::validate_for_reload(&candidate, &baseline) {
         Ok(diff) => {
+            // ── P07 §4.3: Layer B (plugin registry rebuild) ───────────
+            // Must happen BEFORE snapshot.store so a failure rejects the
+            // entire reload (no partial commit). Provider set is
+            // guaranteed immutable across reload (UpstreamSetChanged is
+            // upstream of this branch), so borrowing the current
+            // ProviderRegistry is safe.
+            let plugin_specs: Vec<(String, agent_shim_config::plugins::PluginEntry)> = candidate
+                .plugins
+                .iter()
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect();
+            let new_plugins = {
+                let factories = agent_shim_plugins::builtin::builtin_plugins();
+                let deps = agent_shim_plugins::FactoryDependencies {
+                    providers: state.core.providers.inner_map(),
+                };
+                match agent_shim_plugins::PluginRegistry::build(
+                    factories,
+                    &plugin_specs,
+                    &candidate.routes,
+                    deps,
+                ) {
+                    Ok(r) => Arc::new(r),
+                    Err(e) => {
+                        metrics::counter!(
+                            agent_shim_observability::metrics::names::CONFIG_RELOADS_TOTAL,
+                            "result" => "plugin_validation_error",
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            target = "agent_shim::reload",
+                            error = %e,
+                            "config reload rejected: plugin validation"
+                        );
+                        return ReloadOutcome::PluginValidation(e.to_string());
+                    }
+                }
+            };
+
             // Build a fresh snapshot from the candidate config and
             // atomic-swap. In-flight requests captured the OLD snapshot
             // at the top of `pipeline::dispatch` and stay on it (spec
-            // §2.2); new requests after this store() see the new one.
+            // §2.2); new requests after this store() see the new one,
+            // INCLUDING the new PluginRegistry.
             let build = agent_shim_observability::reload::build(candidate);
             let new_snap = Arc::new(crate::state::AppSnapshot {
                 config: build.config,
                 auth_enabled: build.auth_enabled,
                 auth_required: build.auth_required,
                 configured_key_hashes: build.configured_key_hashes,
+                plugins: new_plugins,
             });
             state.snapshot.store(new_snap);
 
