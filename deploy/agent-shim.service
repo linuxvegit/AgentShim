@@ -13,10 +13,14 @@ Wants=network-online.target
 Type=simple
 User=agent-shim
 Group=agent-shim
+Environment=HOME=/var/lib/agent-shim
+Environment=XDG_CONFIG_HOME=/var/lib/agent-shim/.config
 ExecStart=/usr/local/bin/agent-shim serve --config /etc/agent-shim/gateway.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
+StateDirectory=agent-shim
+StateDirectoryMode=0700
 
 # Hardening: minimal sane defaults that don't interfere with agent-shim's
 # work (outbound HTTPS, optional file logging under /var/log/agent-shim).
@@ -24,7 +28,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/agent-shim
+ReadWritePaths=/var/lib/agent-shim /var/log/agent-shim
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

@@ -5,6 +5,7 @@
 # Typical usage:
 #   ./scripts/install-linux-service.sh --start
 #   ./scripts/install-linux-service.sh --config ./my-gateway.yaml --start
+#   ./scripts/install-linux-service.sh --copilot-login --start
 
 set -euo pipefail
 
@@ -13,6 +14,7 @@ SERVICE_USER=agent-shim
 SERVICE_GROUP=agent-shim
 INSTALL_DIR=/usr/local/bin
 CONFIG_DIR=/etc/agent-shim
+STATE_DIR=/var/lib/agent-shim
 LOG_DIR=/var/log/agent-shim
 CONFIG_SOURCE=
 ENV_FILE_SOURCE=
@@ -21,6 +23,7 @@ FORCE_CONFIG=0
 START_SERVICE=0
 ENABLE_SERVICE=1
 VALIDATE_CONFIG=1
+COPILOT_LOGIN=0
 ORIGINAL_PWD=$(pwd)
 
 usage() {
@@ -30,6 +33,7 @@ Install agent-shim as a Linux systemd service.
 Typical usage:
   ./scripts/install-linux-service.sh --start
   ./scripts/install-linux-service.sh --config ./my-gateway.yaml --start
+  ./scripts/install-linux-service.sh --copilot-login --start
 
 Options:
   --service-name NAME    systemd unit name without ".service" (default: agent-shim)
@@ -37,6 +41,7 @@ Options:
   --group NAME           system group to run the service as (default: same as --user)
   --install-dir DIR      binary install directory (default: /usr/local/bin)
   --config-dir DIR       config directory (default: /etc/agent-shim)
+  --state-dir DIR        writable service state directory (default: /var/lib/agent-shim)
   --log-dir DIR          writable log directory (default: /var/log/agent-shim)
   --config PATH          config to install (default: config/gateway.example.yaml when missing)
   --env-file PATH        optional EnvironmentFile to install as <config-dir>/<service-name>.env
@@ -44,6 +49,7 @@ Options:
   --no-build             require target/release/agent-shim to already exist
   --no-enable            install but do not enable at boot
   --no-validate          skip "agent-shim validate-config" before installing the unit
+  --copilot-login        run interactive GitHub Copilot device-flow login as the service user
   --start                enable and start/restart the service after installation
   -h, --help             show this help
 USAGE
@@ -116,6 +122,16 @@ validate_installed_config() {
     fi
 }
 
+run_copilot_login() {
+    step "Logging in to GitHub Copilot"
+    info "running device-flow login as '$SERVICE_USER'; follow the browser/device-code prompts"
+    run_as_service_user env \
+        HOME="$STATE_DIR" \
+        XDG_CONFIG_HOME="$STATE_DIR/.config" \
+        "$INSTALL_BINARY" copilot login
+    info "credentials: $STATE_DIR/.config/agent-shim/copilot-credentials.json"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --service-name=*)
@@ -164,6 +180,14 @@ while [[ $# -gt 0 ]]; do
             CONFIG_DIR=${2:?missing value for --config-dir}
             shift 2
             ;;
+        --state-dir=*)
+            STATE_DIR=${1#*=}
+            shift
+            ;;
+        --state-dir)
+            STATE_DIR=${2:?missing value for --state-dir}
+            shift 2
+            ;;
         --log-dir=*)
             LOG_DIR=${1#*=}
             shift
@@ -204,6 +228,10 @@ while [[ $# -gt 0 ]]; do
             VALIDATE_CONFIG=0
             shift
             ;;
+        --copilot-login)
+            COPILOT_LOGIN=1
+            shift
+            ;;
         --start)
             START_SERVICE=1
             shift
@@ -223,11 +251,13 @@ done
 [[ "$SERVICE_GROUP" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "invalid --group: $SERVICE_GROUP"
 [[ "$INSTALL_DIR" = /* ]] || die "--install-dir must be absolute."
 [[ "$CONFIG_DIR" = /* ]] || die "--config-dir must be absolute."
+[[ "$STATE_DIR" = /* ]] || die "--state-dir must be absolute."
 [[ "$LOG_DIR" = /* ]] || die "--log-dir must be absolute."
 
-for path in "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR"; do
+for path in "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"; do
     [[ "$path" != *[[:space:]]* ]] || die "paths with whitespace are not supported: $path"
 done
+[[ "$STATE_DIR" != /home/* ]] || die "--state-dir must not be under /home because the unit uses ProtectHome=true."
 
 case "$(uname -s)" in
     Linux) ;;
@@ -305,6 +335,8 @@ if [[ -n "$ENV_FILE_TARGET" ]]; then
     run_as_root install -m 0640 -o root -g "$SERVICE_GROUP" "$ENV_FILE_SOURCE" "$ENV_FILE_TARGET"
 fi
 
+run_as_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR"
+run_as_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR/.config/agent-shim"
 run_as_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$LOG_DIR"
 
 if [[ "$VALIDATE_CONFIG" -eq 1 ]]; then
@@ -328,6 +360,8 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
+Environment=HOME=$STATE_DIR
+Environment=XDG_CONFIG_HOME=$STATE_DIR/.config
 UNIT
 
     if [[ -n "$ENV_FILE_TARGET" ]]; then
@@ -344,7 +378,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$LOG_DIR
+ReadWritePaths=$STATE_DIR $LOG_DIR
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -365,6 +399,10 @@ if [[ "$ENABLE_SERVICE" -eq 1 ]]; then
     run_as_root systemctl enable "$SERVICE_NAME"
 fi
 
+if [[ "$COPILOT_LOGIN" -eq 1 ]]; then
+    run_copilot_login
+fi
+
 if [[ "$START_SERVICE" -eq 1 ]]; then
     step "Starting service"
     if run_as_root systemctl is-active --quiet "$SERVICE_NAME"; then
@@ -378,6 +416,7 @@ step "Install complete"
 info "unit:   $UNIT_PATH"
 info "binary: $INSTALL_BINARY"
 info "config: $TARGET_CONFIG"
+info "state:  $STATE_DIR"
 info "logs:   journalctl -u $SERVICE_NAME -f"
 
 if [[ "$START_SERVICE" -eq 0 ]]; then

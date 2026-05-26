@@ -23,7 +23,7 @@ upstreams:
     # No fields — credentials come from the path below.
 
 copilot:
-  credential_path: ~/.config/agent-shim/copilot.json   # optional, this is the default
+  credential_path: ~/.config/agent-shim/copilot-credentials.json   # optional, this is the default
 
 routes:
   - frontend: anthropic_messages

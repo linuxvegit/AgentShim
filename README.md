@@ -196,7 +196,7 @@ Use Copilot models through AgentShim with a paid Copilot subscription:
 # 1. Authenticate (one-time)
 agent-shim copilot login
 # Opens browser for GitHub OAuth device flow
-# Saves credentials to ~/.config/agent-shim/copilot.json
+# Saves credentials to ~/.config/agent-shim/copilot-credentials.json
 
 # 2. Add to config
 ```
@@ -207,7 +207,7 @@ upstreams:
     type: github_copilot
 
 copilot:
-  credential_path: ~/.config/agent-shim/copilot.json  # optional, this is the default
+  credential_path: ~/.config/agent-shim/copilot-credentials.json  # optional, this is the default
 
 routes:
   - frontend: anthropic_messages

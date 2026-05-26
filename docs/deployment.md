@@ -162,6 +162,8 @@ For the default layout below, you can use the repository installer:
 ./scripts/install-linux-service.sh --start
 # or install a prepared config file:
 ./scripts/install-linux-service.sh --config ./gateway.yaml --start
+# run the Copilot device-flow login before starting the service:
+./scripts/install-linux-service.sh --copilot-login --start
 ```
 
 The script builds the release binary if needed, creates the service user,
@@ -214,7 +216,48 @@ logging:
     max_files: 7
 ```
 
-The shipped unit's `ReadWritePaths=/var/log/agent-shim` allows the service to write there even with `ProtectSystem=strict`.
+The shipped unit's `ReadWritePaths=/var/lib/agent-shim /var/log/agent-shim`
+allows the service to write state and logs even with `ProtectSystem=strict`.
+
+### GitHub Copilot credentials under systemd
+
+The systemd unit uses `ProtectHome=true`, so service-mode credentials must not
+live under `/home`. The unit sets:
+
+```ini
+Environment=HOME=/var/lib/agent-shim
+Environment=XDG_CONFIG_HOME=/var/lib/agent-shim/.config
+```
+
+With the default Copilot credential path, run the device-flow login as the
+service user. The installer can do this for you:
+
+```bash
+./scripts/install-linux-service.sh --copilot-login --start
+```
+
+Manual equivalent:
+
+```bash
+sudo -u agent-shim env \
+  HOME=/var/lib/agent-shim \
+  XDG_CONFIG_HOME=/var/lib/agent-shim/.config \
+  /usr/local/bin/agent-shim copilot login
+```
+
+This writes:
+
+```text
+/var/lib/agent-shim/.config/agent-shim/copilot-credentials.json
+```
+
+If your YAML sets `copilot.credential_path`, keep it outside `/home` and make
+sure the `agent-shim` service user can read it. After logging in or changing
+the path, restart the service:
+
+```bash
+sudo systemctl restart agent-shim
+```
 
 ### Reloading config
 
