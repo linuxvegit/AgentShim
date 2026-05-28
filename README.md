@@ -336,6 +336,57 @@ routes:
 
 Inbound header wins; the route value is the fallback. Comma-separated values are passed through unchanged.
 
+## Model catalog
+
+AgentShim exposes the set of aliases it accepts on `GET /v1/models`
+(OpenAI-shape envelope):
+
+```bash
+$ curl http://localhost:8787/v1/models | jq '.data[] | {id, upstream}'
+{
+  "id": "claude-opus-4-7",
+  "upstream": { "provider": "copilot", "model": "claude-opus-4.7" }
+}
+{
+  "id": "gpt-5.5",
+  "upstream": { "provider": "copilot", "model": "gpt-5.5" }
+}
+```
+
+Each record carries the resolved upstream chain head and (when the
+upstream surfaces capability metadata via its own `/models`) a
+`capabilities` block with `context_window_tokens`, `max_output_tokens`,
+`family`, and supports-flags (vision, tool calls, etc.).
+
+Filters: `?frontend=anthropic_messages|openai_chat|openai_responses`
+narrows to a single frontend; `?capability=vision|tool_calls|streaming|structured_outputs|reasoning_effort`
+drops records whose metadata lacks that capability. `GET /v1/models/:id`
+returns one record or 404.
+
+For operator-only views (per-route policy, full `ModelMetadata`,
+`reasoning_mapping` table), use the admin endpoint:
+
+```bash
+curl http://localhost:8788/admin/catalog | jq
+```
+
+`POST /admin/discover` currently returns `501 Not Implemented`; use
+`POST /admin/reload` (or SIGHUP) to re-run model discovery as part of a
+full config reload.
+
+You can also print the catalog from the CLI without starting the
+server:
+
+```bash
+agent-shim show-catalog --config gateway.yaml              # table
+agent-shim show-catalog --config gateway.yaml --format json
+agent-shim show-catalog --config gateway.yaml --strict     # exits non-zero on typos
+```
+
+Force the print at startup by setting `logging.print_catalog_on_start: true`
+in the gateway config. To make typo detection a hard startup error rather
+than a `--strict` opt-in, set `validation.strict_upstream_models: true`.
+
 ## Plugins
 
 AgentShim supports a small, opt-in plugin system for cross-cutting

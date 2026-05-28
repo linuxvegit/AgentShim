@@ -159,6 +159,7 @@ The route table is consulted by `agent_shim_router::StaticRouter`. Wildcards
 | `format` | enum           | `pretty`                       | `pretty` or `json`. Stdout format.                     |
 | `filter` | string         | `info`                         | `EnvFilter` directive (e.g. `info,agent_shim=debug`).  |
 | `file`   | object or null | `null`                         | Optional rolling file output. See [File logging](observability.md#file-logging) for the full schema and behavior. |
+| `print_catalog_on_start` | bool | `false` | When true, the `serve` command prints the resolved model catalog to stderr right after model discovery completes. Same content as `agent-shim show-catalog`. |
 
 #### `logging.file` (optional)
 
@@ -174,6 +175,46 @@ file in addition to stdout. Writes are async (non-blocking) and flushed
 on graceful shutdown — see
 [`docs/observability.md#file-logging`](observability.md#file-logging)
 for full semantics and the Windows Service Control Manager fallback.
+
+## Validation
+
+Cross-cutting validation toggles live under the `validation` block.
+Every field defaults to its permissive value so existing configs keep
+loading; operators opt into stricter behaviour explicitly.
+
+### `validation`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `strict_upstream_models` | bool | `false` | When true, the gateway refuses to start if any route's `upstream_model` is not present in the discovered upstream catalog. Catches typos like `claude-opus-47` against an upstream that lists `claude-opus-4.7`. Wildcards (`upstream_model: "*"`) are skipped. Off by default because not every provider implements `/models` discovery; enabling it against a provider that returned `None` from `list_models` would always fail closed. |
+
+The check runs after `AppState::new` returns (so the discovered
+`ModelIndex` is fully populated) and walks every chain element of
+`upstreams: [...]` fallback routes — a typo on a fallback target fails
+just as loudly as one on the primary.
+
+```yaml
+validation:
+  strict_upstream_models: true
+```
+
+## Model catalog endpoints
+
+The gateway exposes the resolved model catalog on three surfaces, all
+backed by `ModelResolver::list_catalog`:
+
+- `GET /v1/models` (public listener) — OpenAI-shape envelope. Filters:
+  `?frontend=...`, `?capability=...`.
+- `GET /v1/models/:id` (public listener) — one record, 404 if unknown.
+- `GET /admin/catalog` (admin listener) — same catalog plus operator
+  extras: full `ModelMetadata`, per-route `reasoning_mapping`, and
+  `default_reasoning_effort`.
+- `POST /admin/discover` (admin listener) — currently returns
+  `501 Not Implemented`. Use `POST /admin/reload` or SIGHUP to re-run
+  model discovery as part of a full config reload.
+- `agent-shim show-catalog --config <path>` (CLI) — prints the catalog
+  to stdout without binding any listener. `--format table|json` and
+  `--strict` (exits non-zero on missing upstream metadata).
 
 ## Environment overlay
 

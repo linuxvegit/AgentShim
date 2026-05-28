@@ -22,6 +22,18 @@ A backend service the gateway can talk to (e.g. DeepSeek, Copilot, Ollama). Conf
 **Router**
 The component that resolves `(frontend_kind, model_alias) → BackendTarget` from the route table.
 
+**Model index** *(`ModelIndex`)*
+Per-provider map of `BTreeMap<String, ModelMetadata>` populated from each upstream's `/models` response at startup (and on `POST /admin/reload` / SIGHUP). Backs both the existing fuzzy resolver (used during `Router::resolve` to upgrade `gpt-4o` → `gpt-4o-2024-11-20`) and the new catalog surfaces (`/v1/models`, `/admin/catalog`, `agent-shim show-catalog`). Lives in `agent-shim-router::model_index`.
+
+**Model catalog** *(`ModelCatalog`)*
+The composed view of (a) the route table — which model aliases AgentShim accepts on which frontend — and (b) the upstream-discovered capabilities for each alias's `BackendTarget`. Built by `ModelResolver::list_catalog` from the same inputs `resolve` consumes. Surfaced on `GET /v1/models` (public, OpenAI shape) and `GET /admin/catalog` (operator, with policy extras).
+
+**Model record** *(`ModelRecord`)*
+One entry in the catalog. Carries the alias, the resolved upstream chain head, the full chain (length 1 for singular routes, N for fallback chains), the upstream metadata, and the same-family long-context sibling alias if any. Lives in `agent-shim-core::catalog`.
+
+**Model metadata** *(`ModelMetadata`)*
+Structured upstream capability blob: context window, max output tokens, family, supports flags (vision, tool calls, streaming, structured outputs, reasoning effort), version. The same struct backs `ModelIndex` entries and `ModelRecord.metadata`. Lives in `agent-shim-core::catalog`.
+
 **BackendTarget**
 The output of route resolution. Identifies the upstream provider, the model name to send upstream, and the **route policy** for this route.
 
