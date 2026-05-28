@@ -1,7 +1,8 @@
 /// Build an OpenAI Responses API request body from a CanonicalRequest.
 use agent_shim_core::{
-    media::BinarySource, request::CanonicalRequest, BackendTarget, ContentBlock, MessageRole,
-    ToolCallArguments, ToolChoice,
+    media::BinarySource,
+    request::{CanonicalRequest, ReasoningEffort},
+    BackendTarget, ContentBlock, MessageRole, ToolCallArguments, ToolChoice,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
@@ -147,8 +148,13 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
     }
 
     // Reasoning effort (Responses API uses `reasoning: { effort: "..." }`).
+    // Responses tops out at "high" — `Xhigh` and `Max` compress.
     if let Some(effort) = req.resolved_policy.reasoning_effort {
-        body["reasoning"] = json!({ "effort": effort.as_str() });
+        let effort_str = match effort {
+            ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+            other => other.as_str(),
+        };
+        body["reasoning"] = json!({ "effort": effort_str });
     }
 
     body
@@ -248,4 +254,80 @@ fn build_message_content(blocks: &[ContentBlock]) -> Value {
         .collect();
 
     Value::Array(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_shim_core::{
+        request::ReasoningEffort, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
+        GenerationOptions, Message, RequestId,
+    };
+
+    fn target() -> BackendTarget {
+        BackendTarget {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            policy: Default::default(),
+        }
+    }
+
+    fn empty_request() -> CanonicalRequest {
+        CanonicalRequest {
+            id: RequestId::new(),
+            frontend: FrontendInfo {
+                kind: FrontendKind::OpenAiResponses,
+                requested_model: FrontendModel::from("gpt-5"),
+            },
+            model: FrontendModel::from("gpt-5"),
+            system: vec![],
+            messages: vec![Message::user(vec![ContentBlock::text("hi")])],
+            tools: vec![],
+            tool_choice: Default::default(),
+            generation: GenerationOptions::default(),
+            response_format: None,
+            stream: false,
+            metadata: Default::default(),
+            inbound_anthropic_headers: vec![],
+            resolved_policy: Default::default(),
+            extensions: ExtensionMap::new(),
+        }
+    }
+
+    #[test]
+    fn responses_xhigh_compresses_to_high() {
+        let mut req = empty_request();
+        req.resolved_policy.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        let body = build(&req, &target());
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn responses_max_compresses_to_high() {
+        let mut req = empty_request();
+        req.resolved_policy.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = build(&req, &target());
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn responses_low_medium_high_pass_through() {
+        for (eff, want) in [
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+        ] {
+            let mut req = empty_request();
+            req.resolved_policy.reasoning_effort = Some(eff);
+            let body = build(&req, &target());
+            assert_eq!(body["reasoning"]["effort"], want);
+        }
+    }
+
+    #[test]
+    fn responses_no_effort_means_no_reasoning_field() {
+        let body = build(&empty_request(), &target());
+        assert!(body.get("reasoning").is_none());
+    }
 }
