@@ -20,6 +20,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Serve { config } => commands::serve::run(&config).await,
         Commands::ValidateConfig { config } => commands::validate_config::run(&config),
+        Commands::ShowCatalog {
+            config,
+            format,
+            strict,
+        } => commands::show_catalog::run(&config, &format, strict).await,
         Commands::Copilot { sub } => match sub {
             CopilotCommand::Login { credential_path } => {
                 commands::copilot_login::run(credential_path).await
