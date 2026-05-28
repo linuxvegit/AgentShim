@@ -50,6 +50,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -60,6 +61,7 @@ impl ReasoningEffort {
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
             ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 
@@ -69,7 +71,8 @@ impl ReasoningEffort {
             "low" => Some(ReasoningEffort::Low),
             "medium" | "default" => Some(ReasoningEffort::Medium),
             "high" => Some(ReasoningEffort::High),
-            "xhigh" | "x-high" | "extra_high" | "max" => Some(ReasoningEffort::Xhigh),
+            "xhigh" | "x-high" | "extra_high" => Some(ReasoningEffort::Xhigh),
+            "max" => Some(ReasoningEffort::Max),
             _ => None,
         }
     }
@@ -140,4 +143,69 @@ pub struct CanonicalRequest {
 
 fn is_default_resolved_policy(p: &ResolvedPolicy) -> bool {
     p == &ResolvedPolicy::default()
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn parse_known_efforts() {
+        assert_eq!(
+            ReasoningEffort::parse("minimal"),
+            Some(ReasoningEffort::Minimal)
+        );
+        assert_eq!(ReasoningEffort::parse("low"), Some(ReasoningEffort::Low));
+        assert_eq!(
+            ReasoningEffort::parse("medium"),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(ReasoningEffort::parse("high"), Some(ReasoningEffort::High));
+        assert_eq!(
+            ReasoningEffort::parse("xhigh"),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(ReasoningEffort::parse("max"), Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn parse_aliases() {
+        assert_eq!(
+            ReasoningEffort::parse("none"),
+            Some(ReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("default"),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("x-high"),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("extra_high"),
+            Some(ReasoningEffort::Xhigh)
+        );
+        assert_eq!(ReasoningEffort::parse("MAX"), Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn parse_rejects_unknown() {
+        assert_eq!(ReasoningEffort::parse("super"), None);
+        assert_eq!(ReasoningEffort::parse(""), None);
+    }
+
+    #[test]
+    fn as_str_round_trip() {
+        for e in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(ReasoningEffort::parse(e.as_str()), Some(e));
+        }
+    }
 }
