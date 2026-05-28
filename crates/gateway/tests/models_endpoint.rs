@@ -191,3 +191,44 @@ async fn capability_filter_with_no_metadata_yields_empty() {
         "capability filter must drop entries lacking metadata"
     );
 }
+
+#[tokio::test]
+async fn admin_catalog_returns_routes_array() {
+    let cfg = cfg_with_routes(&[(
+        "anthropic_messages",
+        "claude-opus-4-7",
+        "u",
+        "claude-opus-4.7",
+    )]);
+    let (state, _rx) = AppState::new(cfg).await.unwrap();
+    let app = agent_shim_gateway::admin::build_router(state);
+
+    let req = Request::builder()
+        .uri("/admin/catalog")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = parse_body(resp).await;
+    let routes = v["routes"].as_array().expect("routes is array");
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0]["id"], "claude-opus-4-7");
+    assert_eq!(routes[0]["upstream_provider"], "u");
+}
+
+#[tokio::test]
+async fn admin_discover_returns_501_stub() {
+    let cfg = cfg_with_routes(&[]);
+    let (state, _rx) = AppState::new(cfg).await.unwrap();
+    let app = agent_shim_gateway::admin::build_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/discover")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let v = parse_body(resp).await;
+    assert_eq!(v["error"]["code"], "discover_unimplemented");
+}
