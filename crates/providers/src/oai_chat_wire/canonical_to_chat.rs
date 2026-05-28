@@ -30,6 +30,19 @@ fn effort_for_chat(e: ReasoningEffort, accepts_xhigh: bool) -> &'static str {
     }
 }
 
+/// Build the outbound OpenAI-Chat-shape request body as a `serde_json::Value`.
+///
+/// Public wrapper around [`build`] for callers outside the providers crate
+/// (e.g. integration tests in `crates/protocol-tests/`). Returns JSON so the
+/// crate's internal wire types stay `pub(crate)`.
+pub fn build_json(
+    req: &CanonicalRequest,
+    target: &BackendTarget,
+    accepts_xhigh: bool,
+) -> serde_json::Value {
+    serde_json::to_value(build(req, target, accepts_xhigh)).unwrap_or_default()
+}
+
 pub(crate) fn build(
     req: &CanonicalRequest,
     target: &BackendTarget,
