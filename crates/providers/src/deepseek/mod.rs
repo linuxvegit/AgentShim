@@ -101,7 +101,7 @@ impl BackendProvider for DeepseekProvider {
         req: CanonicalRequest,
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError> {
-        let body = request::build(&req, &target);
+        let body = request::build(&req, &target, self.capabilities.accepts_xhigh);
         let is_stream = req.stream;
 
         debug!(

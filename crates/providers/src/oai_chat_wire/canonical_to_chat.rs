@@ -1,8 +1,9 @@
 //! Build an OpenAI-compatible outbound request body from a CanonicalRequest.
 
 use agent_shim_core::{
-    request::ResponseFormat, BackendTarget, CanonicalRequest, ContentBlock, MessageRole,
-    SystemSource, ToolCallArguments, ToolChoice,
+    request::{ReasoningEffort, ResponseFormat},
+    BackendTarget, CanonicalRequest, ContentBlock, MessageRole, SystemSource, ToolCallArguments,
+    ToolChoice,
 };
 
 use super::wire::{
@@ -10,7 +11,30 @@ use super::wire::{
     StreamOptions, ToolCallOut, ToolChoiceFunction, ToolChoiceOut, ToolOut,
 };
 
-pub(crate) fn build(req: &CanonicalRequest, target: &BackendTarget) -> ChatBody {
+/// Compress a canonical effort to whatever the OpenAI Chat-shape upstream accepts.
+///
+/// Pure OpenAI Chat tops out at `"high"`, so canonical `Xhigh` / `Max` get squashed.
+/// Copilot, by contrast, accepts an `"xhigh"` extension on the Chat path — so when
+/// `accepts_xhigh = true` we promote `Max` and pass `Xhigh` through.
+fn effort_for_chat(e: ReasoningEffort, accepts_xhigh: bool) -> &'static str {
+    use ReasoningEffort::*;
+    match e {
+        Minimal => "minimal",
+        Low => "low",
+        Medium => "medium",
+        High => "high",
+        Xhigh if accepts_xhigh => "xhigh",
+        Xhigh => "high",
+        Max if accepts_xhigh => "xhigh",
+        Max => "high",
+    }
+}
+
+pub(crate) fn build(
+    req: &CanonicalRequest,
+    target: &BackendTarget,
+    accepts_xhigh: bool,
+) -> ChatBody {
     let upstream_model = target.model.as_str();
     let mut messages: Vec<MsgOut> = Vec::new();
 
@@ -211,7 +235,7 @@ pub(crate) fn build(req: &CanonicalRequest, target: &BackendTarget) -> ChatBody 
         reasoning_effort: req
             .resolved_policy
             .reasoning_effort
-            .map(|e| e.as_str().to_string()),
+            .map(|e| effort_for_chat(e, accepts_xhigh).to_string()),
     }
 }
 
@@ -363,8 +387,8 @@ fn extract_text_from_tool_result(content: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use agent_shim_core::{
-        ExtensionMap, FrontendInfo, FrontendKind, FrontendModel, GenerationOptions, Message,
-        RequestId, ToolCallId, ToolResultBlock,
+        request::ReasoningEffort, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
+        GenerationOptions, Message, RequestId, ToolCallId, ToolResultBlock,
     };
 
     fn target(model: &str) -> BackendTarget {
@@ -415,7 +439,7 @@ mod tests {
             }),
         ])]);
 
-        let body = build(&req, &target("gpt-test"));
+        let body = build(&req, &target("gpt-test"), false);
 
         assert_eq!(body.messages.len(), 2);
         assert_eq!(body.messages[0].role, "tool");
@@ -463,7 +487,7 @@ mod tests {
             ]),
         ]);
 
-        let body = build(&req, &target("gpt-test"));
+        let body = build(&req, &target("gpt-test"), false);
 
         // Order MUST be: assistant(tool_calls), tool, user(text).
         assert_eq!(body.messages.len(), 3, "got: {:#?}", body.messages);
@@ -498,7 +522,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             }),
         ])]);
-        let body = build(&req, &target("gpt-4o"));
+        let body = build(&req, &target("gpt-4o"), false);
         let content = body.messages[0]
             .content
             .as_ref()
@@ -520,7 +544,7 @@ mod tests {
                 },
                 extensions: ExtensionMap::new(),
             })])]);
-        let body = build(&req, &target("gpt-4o"));
+        let body = build(&req, &target("gpt-4o"), false);
         let parts = body.messages[0]
             .content
             .as_ref()
@@ -547,7 +571,7 @@ mod tests {
                 },
                 extensions: ExtensionMap::new(),
             })])]);
-        let body = build(&req, &target("gpt-4o"));
+        let body = build(&req, &target("gpt-4o"), false);
         let parts = body.messages[0]
             .content
             .as_ref()
@@ -575,7 +599,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             }),
         ])]);
-        let body = build(&req, &target("gpt-4o"));
+        let body = build(&req, &target("gpt-4o"), false);
         let parts = body.messages[0]
             .content
             .as_ref()
@@ -586,4 +610,53 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["type"], "text");
     }
+
+    // ── reasoning_effort compression (Plan A Task 7) ──────────────────
+
+    fn req_with_effort(effort: ReasoningEffort) -> CanonicalRequest {
+        let mut req = request_with_messages(vec![Message::user(vec![ContentBlock::text("hi")])]);
+        req.resolved_policy.reasoning_effort = Some(effort);
+        req
+    }
+
+    #[test]
+    fn xhigh_serialises_as_xhigh_when_target_accepts() {
+        let body = build(&req_with_effort(ReasoningEffort::Xhigh), &target("m"), true);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn xhigh_compresses_to_high_when_target_rejects() {
+        let body = build(&req_with_effort(ReasoningEffort::Xhigh), &target("m"), false);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn max_compresses_to_high_on_pure_openai() {
+        let body = build(&req_with_effort(ReasoningEffort::Max), &target("m"), false);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn max_serialises_as_xhigh_when_copilot() {
+        // Canonical Max → Copilot xhigh: Copilot's top tier on the chat path.
+        let body = build(&req_with_effort(ReasoningEffort::Max), &target("m"), true);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn low_medium_high_pass_through_identically() {
+        for (eff, want) in [
+            (ReasoningEffort::Minimal, "minimal"),
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+        ] {
+            let body_off = build(&req_with_effort(eff), &target("m"), false);
+            let body_on = build(&req_with_effort(eff), &target("m"), true);
+            assert_eq!(body_off.reasoning_effort.as_deref(), Some(want));
+            assert_eq!(body_on.reasoning_effort.as_deref(), Some(want));
+        }
+    }
 }
+

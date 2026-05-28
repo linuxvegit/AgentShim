@@ -104,7 +104,11 @@ impl BackendProvider for OpenAiCompatibleProvider {
         req: CanonicalRequest,
         target: BackendTarget,
     ) -> Result<CanonicalStream, ProviderError> {
-        let body = crate::oai_chat_wire::canonical_to_chat::build(&req, &target);
+        let body = crate::oai_chat_wire::canonical_to_chat::build(
+            &req,
+            &target,
+            self.capabilities.accepts_xhigh,
+        );
         let is_stream = req.stream;
 
         debug!(
