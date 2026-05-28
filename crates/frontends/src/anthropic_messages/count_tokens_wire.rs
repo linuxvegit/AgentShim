@@ -55,6 +55,7 @@ impl CountTokensRequest {
             stream: None,
             metadata: self.metadata,
             thinking: self.thinking,
+            output_config: None,
         }
     }
 }
