@@ -874,6 +874,7 @@ mod tests {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         });
         assert!(matches!(
             validate(&cfg),
@@ -909,6 +910,7 @@ mod tests {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         });
         cfg.routes.push(RouteEntry {
             frontend: "openai_chat".to_string(),
@@ -923,6 +925,7 @@ mod tests {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         });
         assert!(matches!(
             validate(&cfg),
@@ -958,6 +961,7 @@ mod tests {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         });
         assert!(matches!(
             validate(&cfg),
@@ -1795,6 +1799,7 @@ routes:
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         });
         let diff = validate_for_reload(&candidate, &baseline).expect("ok");
         assert_eq!(diff.routes_total, 2);
@@ -1957,6 +1962,7 @@ routes:
             min_tier: Some(Tier::Standard),
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         });
         validate(&cfg).expect("chain has std which meets min_tier=standard");
     }
