@@ -81,6 +81,17 @@ pub trait Router: Send + Sync {
     ) -> Option<agent_shim_config::BreakerConfig> {
         None
     }
+
+    /// Enumerate explicit `(frontend, alias)` pairs for the catalog
+    /// endpoints. Wildcard routes (`model: "*"`) are excluded — they don't
+    /// enumerate a concrete alias.
+    ///
+    /// Default impl returns an empty vec so existing dynamic / test routers
+    /// keep compiling without a catalog. `StaticRouter` overrides this with
+    /// the explicit list of configured aliases.
+    fn list_routes(&self) -> Vec<(FrontendKind, String)> {
+        Vec::new()
+    }
 }
 
 pub use auth::{extract_identity_from_headers, hash_key, AgentIdentity};

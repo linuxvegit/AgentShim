@@ -242,6 +242,15 @@ impl Router for StaticRouter {
     fn find_breaker_policy(&self, frontend: FrontendKind, model: &str) -> Option<BreakerConfig> {
         StaticRouter::find_breaker_policy(self, frontend, model)
     }
+
+    fn list_routes(&self) -> Vec<(FrontendKind, String)> {
+        // Wildcards are intentionally excluded: catalog surfaces enumerate
+        // concrete aliases, not "any model goes" entries.
+        self.route_entries
+            .keys()
+            .map(|k| (k.frontend, k.model.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
