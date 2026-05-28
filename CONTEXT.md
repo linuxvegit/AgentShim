@@ -26,18 +26,28 @@ The component that resolves `(frontend_kind, model_alias) → BackendTarget` fro
 The output of route resolution. Identifies the upstream provider, the model name to send upstream, and the **route policy** for this route.
 
 **Route policy** *(`RoutePolicy`)*
-Per-route defaults that fill in when the inbound request didn't supply a value. Today: default reasoning effort, default `anthropic-beta` header. Owns the **policy merge rule** — "inbound wins, else route default, else nothing." Lives in `agent-shim-core::policy`.
+Per-route defaults that fill in when the inbound request didn't supply a value. Today: default reasoning effort, default `anthropic-beta` header, and a **reasoning mapping table**. Owns the **policy merge rule** — "inbound wins, else route default, else nothing." Lives in `agent-shim-core::policy`.
 
 **Resolved policy** *(`ResolvedPolicy`)*
 The output of `RoutePolicy::resolve(canonical_request)`. A per-request snapshot of the merged values, stored on `CanonicalRequest.resolved_policy`. Providers read from this; they do not consult `RoutePolicy` directly.
 
 **Reasoning effort**
-Qualitative thinking-effort level: `minimal | low | medium | high | xhigh`. Cross-dialect translation:
-- Anthropic `thinking: { budget_tokens }` → `ReasoningOptions.budget_tokens`
-- OpenAI `reasoning_effort` → `ReasoningOptions.effort`
-- OpenAI Responses `reasoning.effort` → `ReasoningOptions.effort`
+Qualitative thinking-effort level drawn from the six-value canonical vocabulary `minimal | low | medium | high | xhigh | max`. Cross-dialect translation is per-direction:
+- Anthropic inbound `output_config.effort` (`effort-2025-11-24` beta) → `ReasoningOptions.effort`
+- OpenAI Chat inbound `reasoning_effort` (`minimal/low/medium/high`) → `ReasoningOptions.effort`
+- OpenAI Responses inbound `reasoning.effort` → `ReasoningOptions.effort`
+- Outbound Anthropic: `Minimal → "low"` (no minimal upstream); else identity
+- Outbound OpenAI Chat (non-Copilot) and Responses API: `Xhigh|Max → "high"`
+- Outbound Copilot Chat (`accepts_xhigh = true`): `Xhigh|Max → "xhigh"`
 
-Forwarded outbound as `reasoning_effort` (chat completions) or `reasoning.effort` (Responses API).
+**Reasoning mapping table** *(`reasoning_mapping`)*
+Optional per-route ordered list of `{ match, set }` rules over canonical effort. First rule whose `match` equals the post-default inbound effort fires its `set`; unmatched passes through. Both fields are canonical-vocabulary effort strings (`minimal/low/medium/high/xhigh/max`), NOT raw inbound or outbound dialect strings. Lives in `agent-shim-core::policy::RoutePolicy`.
+
+**Mapping rule** *(`MappingRule`)*
+One entry in a reasoning mapping table — `{ match: ReasoningEffort, set: ReasoningEffort }`.
+
+**Effort vocabulary**
+Six canonical levels: `Minimal | Low | Medium | High | Xhigh | Max`. The 2026-05-28 mapping spec retired the older five-value list by adding `Max`, and the mapping table operates exclusively on this vocabulary (not on per-dialect strings).
 
 **Anthropic beta header**
 An `anthropic-beta` HTTP header value (e.g. `context-1m-2025-08-07`) that toggles a feature without changing the model name. Captured from the inbound request, replayed verbatim on the outbound, with a per-route fallback.

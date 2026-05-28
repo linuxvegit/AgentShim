@@ -130,8 +130,11 @@ routes:
     model: claude-opus-4-7         # what the agent requests
     upstream: copilot              # which upstream serves it
     upstream_model: claude-opus-4-7  # what the upstream sees
-    reasoning_effort: high         # optional: minimal | low | medium | high | xhigh
+    reasoning_effort: high         # optional: minimal | low | medium | high | xhigh | max
     anthropic_beta: context-1m-2025-08-07  # optional: default anthropic-beta header
+    reasoning_mapping:             # optional: per-route effort rewrite table
+      - match: max                 # canonical inbound effort
+        set:   xhigh               # canonical outbound effort
 ```
 
 | Field | Type | Default | Notes |
@@ -140,8 +143,9 @@ routes:
 | `model` | string | — | The alias the agent asks for. `*` is a wildcard catch-all. |
 | `upstream` | string | — | A key under `upstreams:` |
 | `upstream_model` | string | — | Model name sent to the upstream. `*` (in a wildcard route) means pass-through. |
-| `reasoning_effort` | enum | — | Default thinking effort applied when the request omits one |
+| `reasoning_effort` | enum | — | Default thinking effort applied when the request omits one. One of `minimal/low/medium/high/xhigh/max`. |
 | `anthropic_beta` | string | — | Default `anthropic-beta` header value applied when the request omits one |
+| `reasoning_mapping` | array | `[]` | Ordered list of `{ match, set }` rules that rewrite the inbound canonical effort before forwarding to the upstream. First match wins; unmatched passes through. Both `match` and `set` must be canonical effort strings (`minimal/low/medium/high/xhigh/max`); unknown values fail validation at config-load. |
 
 The route table is consulted by `agent_shim_router::StaticRouter`. Wildcards
 (`model: "*"`) are matched only when no exact route exists.
@@ -203,8 +207,10 @@ start. Common errors:
 * Unknown field (typo) — fix the spelling.
 * Route references an upstream that isn't declared — add the upstream
   entry or remove the route.
-* `reasoning_effort` value outside the documented enum — only the five
-  named values are accepted.
+* `reasoning_effort` value outside the documented enum — only the six
+  named values (`minimal/low/medium/high/xhigh/max`) are accepted.
+* `reasoning_mapping` row with an unknown `match` or `set` — both must
+  be canonical effort strings (`minimal/low/medium/high/xhigh/max`).
 
 ## Example: full multi-provider config
 
