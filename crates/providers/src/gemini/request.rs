@@ -56,16 +56,14 @@
 //!
 //! ## Thinking-budget precedence
 //!
-//! Three sources can specify a thinking budget; precedence is:
+//! The provider reads ONLY from `req.resolved_policy` (per 2026-05-28 spec —
+//! the canonical pipeline folds inbound effort/budget into the resolved
+//! policy via `RoutePolicy::resolve` before the provider is called).
+//! Precedence:
 //!
-//! 1. `req.generation.reasoning.budget_tokens` (Anthropic-style explicit
-//!    token count; if the inbound is Anthropic Messages with
-//!    `thinking.budget_tokens`, it lands here verbatim).
-//! 2. `resolved_policy.reasoning_effort` (route-default; populated when an
-//!    inbound effort wasn't supplied — see `RoutePolicy::resolve`).
-//! 3. `req.generation.reasoning.effort` (request-level qualitative effort).
-//!
-//! Sources (2) and (3) map effort levels to concrete budgets:
+//! 1. `resolved_policy.reasoning_budget_tokens` — explicit token count.
+//! 2. `resolved_policy.reasoning_effort` — qualitative effort, mapped via the
+//!    table below.
 //!
 //! | Effort   | Budget tokens |
 //! |----------|---------------|
@@ -414,50 +412,37 @@ fn build_generation_config(req: &CanonicalRequest) -> Option<GenerationConfig> {
 
 /// Compute the [`ThinkingConfig`] for the outbound request.
 ///
+/// Per the 2026-05-28 spec the provider reads ONLY from
+/// `req.resolved_policy`. The canonical pipeline folds inbound effort and
+/// budget into the resolved policy via `RoutePolicy::resolve` before the
+/// provider is called.
+///
 /// Precedence (returns the first match, never reads later sources):
 ///
-/// 1. `req.generation.reasoning.budget_tokens` — explicit Anthropic-style
-///    token count (frontend-provided).
-/// 2. `req.resolved_policy.reasoning_effort` — route default merged with
-///    inbound effort by `RoutePolicy::resolve`.
-/// 3. `req.generation.reasoning.effort` — request-level effort, used only when
-///    `resolved_policy` is empty (defensive: the canonical pipeline normally
-///    populates `resolved_policy` from this same field).
+/// 1. `req.resolved_policy.reasoning_budget_tokens` — explicit token count
+///    propagated through the canonical pipeline.
+/// 2. `req.resolved_policy.reasoning_effort` — qualitative effort, mapped via
+///    [`effort_to_budget`] below.
 ///
 /// `include_thoughts: Some(true)` is set whenever a budget is emitted, so the
 /// response parser (T6) can route `thought: true` parts into
 /// `ContentBlock::Reasoning`.
 fn thinking_config(req: &CanonicalRequest) -> Option<ThinkingConfig> {
-    // Source 1 — explicit budget on the request.
-    if let Some(reasoning) = req.generation.reasoning.as_ref() {
-        if let Some(budget) = reasoning.budget_tokens {
-            return Some(ThinkingConfig {
-                thinking_budget: Some(budget as i64),
-                include_thoughts: Some(true),
-            });
-        }
+    // Source 1 — explicit budget on the resolved policy (which folds
+    //            inbound budget + mapping `set.budget_tokens`).
+    if let Some(b) = req.resolved_policy.reasoning_budget_tokens {
+        return Some(ThinkingConfig {
+            thinking_budget: Some(b as i64),
+            include_thoughts: Some(true),
+        });
     }
-
-    // Source 2 — resolved policy (route default merged with inbound effort).
+    // Source 2 — effort string from the resolved policy.
     if let Some(effort) = req.resolved_policy.reasoning_effort {
         return Some(ThinkingConfig {
             thinking_budget: Some(effort_to_budget(effort)),
             include_thoughts: Some(true),
         });
     }
-
-    // Source 3 — request-level effort. In the live pipeline `resolve()`
-    // copies this into `resolved_policy.reasoning_effort`, so this branch
-    // is mostly defensive (lets standalone tests skip the resolve step).
-    if let Some(reasoning) = req.generation.reasoning.as_ref() {
-        if let Some(effort) = reasoning.effort {
-            return Some(ThinkingConfig {
-                thinking_budget: Some(effort_to_budget(effort)),
-                include_thoughts: Some(true),
-            });
-        }
-    }
-
     None
 }
 
@@ -949,11 +934,9 @@ mod tests {
 
     #[test]
     fn explicit_budget_tokens_wins_over_resolved_policy() {
+        // Per Task 11 contract, both inputs sit on resolved_policy now.
         let mut req = empty_request();
-        req.generation.reasoning = Some(ReasoningOptions {
-            effort: Some(ReasoningEffort::Low), // would map to 256
-            budget_tokens: Some(7777),          // wins
-        });
+        req.resolved_policy.reasoning_budget_tokens = Some(7777); // wins
         req.resolved_policy.reasoning_effort = Some(ReasoningEffort::High); // would map to 4096
 
         let body = build(&req, &target());
@@ -968,9 +951,13 @@ mod tests {
 
     #[test]
     fn resolved_policy_effort_wins_over_request_effort_when_no_explicit_budget() {
+        // Pre-Task 11 this test inspected the source-3 (request-level effort)
+        // fallback. Under the resolved-policy-only contract, the test now
+        // documents that only resolved_policy.reasoning_effort produces a
+        // budget — bare request.generation.reasoning is ignored.
         let mut req = empty_request();
         req.generation.reasoning = Some(ReasoningOptions {
-            effort: Some(ReasoningEffort::Minimal), // would map to 128
+            effort: Some(ReasoningEffort::Minimal), // ignored
             budget_tokens: None,
         });
         req.resolved_policy.reasoning_effort = Some(ReasoningEffort::Xhigh); // wins → 16384
@@ -986,21 +973,20 @@ mod tests {
 
     #[test]
     fn request_effort_used_when_no_resolved_policy_and_no_explicit_budget() {
+        // Pre-Task 11 the source-3 branch surfaced this. Now it must NOT —
+        // the canonical pipeline is the only path that propagates effort.
         let mut req = empty_request();
         req.generation.reasoning = Some(ReasoningOptions {
             effort: Some(ReasoningEffort::Medium),
             budget_tokens: None,
         });
-        // resolved_policy.reasoning_effort stays None.
-
+        // resolved_policy stays empty.
         let body = build(&req, &target());
-        let tc = body
-            .generation_config
-            .unwrap()
-            .thinking_config
-            .expect("thinking_config set");
-        assert_eq!(tc.thinking_budget, Some(1024));
-        assert_eq!(tc.include_thoughts, Some(true));
+        let gc = body.generation_config.unwrap_or_default();
+        assert!(
+            gc.thinking_config.is_none(),
+            "request.generation.reasoning must not be a source for thinking_config"
+        );
     }
 
     #[test]
@@ -1011,6 +997,58 @@ mod tests {
         let body = build(&req, &target());
         let gc = body.generation_config.unwrap();
         assert!(gc.thinking_config.is_none());
+    }
+
+    #[test]
+    fn gemini_reads_budget_from_resolved_policy() {
+        // Plan A Task 11: the provider reads ONLY from `resolved_policy`.
+        // An explicit budget set there must surface in thinking_config even
+        // when resolved_policy.reasoning_effort is None.
+        let mut req = empty_request();
+        req.resolved_policy.reasoning_budget_tokens = Some(7777);
+        let body = build(&req, &target());
+        let tc = body
+            .generation_config
+            .unwrap()
+            .thinking_config
+            .expect("thinking_config set");
+        assert_eq!(tc.thinking_budget, Some(7777));
+        assert_eq!(tc.include_thoughts, Some(true));
+    }
+
+    #[test]
+    fn gemini_ignores_generation_reasoning_after_task_11() {
+        // After the source 3 branch is removed, setting only the
+        // request-level reasoning effort (with `resolved_policy` empty) must
+        // yield NO thinking_config — the canonical pipeline is now expected
+        // to surface the effort through `resolved_policy`.
+        let mut req = empty_request();
+        req.generation.reasoning = Some(ReasoningOptions {
+            effort: Some(ReasoningEffort::Medium),
+            budget_tokens: None,
+        });
+        let body = build(&req, &target());
+        let gc = body.generation_config.unwrap_or_default();
+        assert!(
+            gc.thinking_config.is_none(),
+            "generation.reasoning must not be a source for thinking_config under Task 11"
+        );
+    }
+
+    #[test]
+    fn gemini_resolved_policy_budget_wins_over_resolved_policy_effort() {
+        // Tie-breaker: when both an explicit budget and an effort sit on
+        // resolved_policy, the explicit budget wins.
+        let mut req = empty_request();
+        req.resolved_policy.reasoning_budget_tokens = Some(5555);
+        req.resolved_policy.reasoning_effort = Some(ReasoningEffort::High); // would be 4096
+        let body = build(&req, &target());
+        let tc = body
+            .generation_config
+            .unwrap()
+            .thinking_config
+            .expect("thinking_config set");
+        assert_eq!(tc.thinking_budget, Some(5555));
     }
 
     #[test]
@@ -1074,10 +1112,8 @@ mod tests {
         });
         req.generation.max_tokens = Some(64);
         req.generation.temperature = Some(0.5);
-        req.generation.reasoning = Some(ReasoningOptions {
-            effort: Some(ReasoningEffort::High),
-            budget_tokens: None,
-        });
+        // Effort surfaces via resolved_policy under the 2026-05-28 contract.
+        req.resolved_policy.reasoning_effort = Some(ReasoningEffort::High);
 
         let body = build(&req, &target());
         let value = serde_json::to_value(&body).unwrap();
