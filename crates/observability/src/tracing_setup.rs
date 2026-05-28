@@ -205,6 +205,7 @@ mod tests {
             format: LogFormat::Pretty,
             filter: "info".to_string(),
             file: None,
+            print_catalog_on_start: false,
         };
         let _ = init(&cfg, None);
     }
@@ -215,6 +216,7 @@ mod tests {
             format: LogFormat::Json,
             filter: "debug".to_string(),
             file: None,
+            print_catalog_on_start: false,
         };
         let _ = init(&cfg, None);
     }
@@ -225,6 +227,7 @@ mod tests {
             format: LogFormat::Pretty,
             filter: "info".to_string(),
             file: None,
+            print_catalog_on_start: false,
         };
         let otel = OtelConfig::default(); // endpoint = None
         let handles = init(&cfg, Some(&otel));

@@ -63,6 +63,27 @@ where
                 )
             })?;
         }
+
+        // Plan B Task 10: optional startup catalog print. Operators who
+        // want a configuration sanity-check at startup opt in via
+        // `logging.print_catalog_on_start: true`. Goes to stderr so it
+        // doesn't pollute stdout pipes (the show-catalog CLI uses
+        // stdout for the same content; both produce identical text).
+        if snap.config.logging.print_catalog_on_start {
+            let catalog = state.core.resolver.list_catalog();
+            eprintln!("Model catalog ({} routes):", catalog.len());
+            for r in &catalog {
+                let ctx = r
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.context_window_tokens)
+                    .map_or_else(|| "?".to_string(), |c| c.to_string());
+                eprintln!(
+                    "  {:<22} → {}/{} (ctx={})",
+                    r.id, r.upstream_provider, r.upstream_model, ctx
+                );
+            }
+        }
     }
 
     // Plan 04 P04 T4: pin the `--config` path onto `AppCore` so the

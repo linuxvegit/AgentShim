@@ -225,6 +225,13 @@ pub struct LoggingConfig {
     /// `FileLoggingConfig` for fields. Plan windows-service P02 T3.
     #[serde(default)]
     pub file: Option<FileLoggingConfig>,
+    /// Plan B Task 10: when true, the `serve` command prints the model
+    /// catalog to stderr once after model discovery completes (right
+    /// before the public listener binds). Off by default — CI /
+    /// automation use cases stay silent. Operators who want a
+    /// configuration sanity-check at startup opt in.
+    #[serde(default)]
+    pub print_catalog_on_start: bool,
 }
 
 fn default_filter() -> String {
@@ -237,6 +244,7 @@ impl Default for LoggingConfig {
             format: LogFormat::default(),
             filter: default_filter(),
             file: None,
+            print_catalog_on_start: false,
         }
     }
 }
