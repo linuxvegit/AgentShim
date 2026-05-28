@@ -9,6 +9,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes yet)
 
+## [0.8.0] — 2026-05-29
+
+Per-route reasoning effort mapping, public model catalog, and the
+operator-side observability that lives around them.
+
+This release introduces a six-value canonical reasoning-effort
+vocabulary that lets agents address the entire range of upstream
+"thinking" knobs through a single dialect-agnostic enum. Routes can
+rewrite effort on the fly with a `reasoning_mapping` table — so
+Claude Code's "max" can land on Copilot's "xhigh", Codex's "high"
+on a DeepSeek route that prefers "medium", and so on, without the
+agent needing to know which dialect is downstream.
+
+The model catalog also gets a public face: `GET /v1/models` exposes
+AgentShim's accepted aliases in OpenAI shape, each enriched with
+upstream-discovered metadata (context window, family, capabilities).
+A new `agent-shim show-catalog` CLI prints the same data from
+configuration alone — useful for CI typo gates.
+
+`crates/core/` is unchanged across the entire 0.7→0.8 cycle except
+for additive vocabulary growth (`ReasoningEffort::{Xhigh, Max}`,
+`ResolvedPolicy::reasoning_budget_tokens`, `RoutePolicy::reasoning_mapping`,
+`catalog::{ModelRecord, ModelMetadata, ModelSupports, UpstreamRef, ModelCatalog}`).
+The frozen-core invariant is honored — no field removals, no
+behavioral changes on existing variants.
+
+### Added (reasoning effort mapping)
+
+- **Six-value canonical effort enum.** `ReasoningEffort::{Minimal,
+  Low, Medium, High, Xhigh, Max}` covers every level expressible
+  by Anthropic, OpenAI, Copilot, Gemini, and DeepSeek. Aliases:
+  `none → Minimal`, `default → Medium`, `x-high|extra_high → Xhigh`.
+- **`RoutePolicy::reasoning_mapping: Vec<MappingRule>`.** Per-route
+  ordered rewrite table. First match wins; unmatched passes through.
+  Both `match` and `set` are canonical-vocabulary effort values, not
+  dialect strings. Route default fills inbound holes before mapping
+  runs.
+- **`ResolvedPolicy::reasoning_budget_tokens`.** Token-quantified
+  reasoning budget carried alongside effort. v0.6 copied this from
+  the inbound request directly; v0.8 keeps that behavior — the
+  field exists so providers that need a number (Gemini, legacy
+  Anthropic `thinking.budget_tokens` shape) read from one source.
+- **Anthropic `effort-2025-11-24` beta plumbed end-to-end.** When the
+  inbound request carries `anthropic-beta: effort-2025-11-24`, the
+  Anthropic provider emits `output_config.effort` + `thinking: {
+  type: adaptive }` instead of the legacy `thinking.budget_tokens`
+  shape. Inbound decode of `output_config.effort` lands the value
+  in `canonical.generation.reasoning.effort`.
+- **`ProviderCapabilities::accepts_xhigh`.** Providers that natively
+  understand "xhigh" (Copilot Chat) opt in via this capability;
+  others (OpenAI Chat, Responses) compress `xhigh`/`max` to `"high"`
+  at the encoder.
+- **Gemini `Max` budget map.** `ReasoningEffort::Max` maps to
+  `thinkingConfig.thinkingBudget = 24576`; matches the
+  "thinking-strong" Gemini tier.
+- **Effort string validation at config load.** `reasoning_mapping`
+  entries with non-canonical effort values fail
+  `validate_config` with a precise field path.
+- **End-to-end protocol test.** New
+  `crates/protocol-tests/tests/effort_mapping_end_to_end.rs`
+  exercises the Claude Code `max` → Copilot `xhigh` rewrite through
+  the full pipeline (decode → policy resolve → mapping → encode).
+
+### Added (`/v1/models` + catalog)
+
+- **Public `GET /v1/models`** OpenAI-shape endpoint. Returns every
+  alias AgentShim accepts. `?frontend=anthropic_messages|openai_chat|openai_responses`
+  filters by inbound dialect; `?capability=vision|tool_calls|streaming|structured_outputs|reasoning_effort`
+  drops records whose metadata lacks the capability.
+  `GET /v1/models/:id` returns one record or 404.
+- **Each catalog record carries** the resolved upstream chain head
+  and, where the upstream's own `list_models` surfaced it, a
+  `capabilities` block (`context_window_tokens`, `max_output_tokens`,
+  `family`, `supports.{vision, tool_calls, streaming, structured_outputs}`).
+- **Admin `GET /admin/catalog`.** Operator-only view including
+  per-route `reasoning_mapping`, `default_reasoning_effort`, and the
+  full `ModelMetadata`. Reachable only on the admin listener.
+- **Admin `POST /admin/discover` (stub, 501).** Reserved for atomic
+  ModelIndex refresh; v0.8 ships a stub. Use `POST /admin/reload`
+  or SIGHUP for now — the full reload re-runs discovery.
+- **`agent-shim show-catalog` CLI.** Prints the catalog from disk
+  config alone without starting the server. `--format table` (default)
+  or `--format json`. `--strict` exits non-zero when any route alias
+  has no upstream metadata — handy for CI.
+- **`logging.print_catalog_on_start: true`.** Optional dump of the
+  catalog to stderr after model discovery completes. Off by default
+  so CI / automation stays silent.
+- **`validation.strict_upstream_models: true`.** Hard startup error
+  when any route's `upstream_model` isn't present in the discovered
+  upstream catalog. Catches typos like `claude-opus-47` (missing
+  dot). Off by default because not every upstream exposes `/models`.
+- **Copilot `/models` enrichment.** `github_copilot::parse_models_response`
+  now extracts the full capability blob — family, limits, supports —
+  populating `ModelMetadata` for every Copilot model. Backwards
+  compatible with providers whose `list_models` returns `None`.
+
+### Added (request log enrichment)
+
+- **Inbound vs outbound reasoning + ctxWindow in the request log.**
+  The per-request `→` line now shows the effort decision in both
+  directions and the upstream model's catalog context window:
+
+  ```text
+  → /v1/messages | model: claude-opus-4-7 → claude-opus-4.7-1m-internal
+    | bodyBytes: 167 | maxTokens: 30 | ctxWindow: 1000000
+    | stream: false | reasoning: max → xhigh
+  ```
+
+  Effort field compresses across five cases: identical inbound/
+  outbound prints as `"high"`; rewrite as `"max → xhigh"`; route
+  default filling silent inbound as `"(default) → high"`; a
+  mapping that clears effort as `"high → (dropped)"`; absent on
+  both as `"none"`. `ctxWindow` comes from the discovered model
+  catalog; falls back to `"?"` when the upstream's `list_models`
+  returned no metadata.
+
+### Fixed
+
+- **`agent-shim serve` stdout no longer silent without `logging.file`
+  or `otel.endpoint`.** The composite layer assembled in
+  `tracing_setup::init` had been built as an empty `Vec<Box<dyn
+  Layer<S>>>` when both inner layers were absent, and the empty Vec's
+  `Layer::enabled()` returned false — short-circuiting the
+  subscriber and masking events from the downstream stdout `fmt`
+  layer. Events arriving via `tracing-log` (reqwest, hyper) bypassed
+  the per-layer check via the LogTracer's own dispatcher path, which
+  is why `RUST_LOG=trace` surfaced those but never `agent_shim`'s
+  own logs. Wrapping the composite as `Option<Vec<…>>` makes the
+  empty case a true no-op layer.
+- **`agent-shim serve` no longer swallows tracing subscriber init
+  errors silently.** `try_init()` errors now surface via `eprintln!`
+  so subsequent regressions don't go invisible.
+- **Anthropic Messages requests no longer emit a duplicate `→` log
+  line.** The proxy_raw branch's pre-decode log line was firing
+  even when proxy_raw was not applicable to the inbound frontend
+  (Copilot upstreams don't implement Anthropic raw passthrough).
+  Moved the log into the `Ok(Some(...))` success arm so the
+  fall-through canonical path emits only its (full structured)
+  line.
+
+### Internal
+
+- **`BackendProvider::list_models` returns `Option<BTreeMap<String,
+  ModelMetadata>>`.** Was `Option<BTreeSet<String>>` in v0.7.
+  ModelIndex stores the full metadata blob; existing call sites
+  that only wanted names migrate trivially.
+- **`ModelIndex::with_metadata` / `::metadata` / `::provider_models`
+  / `::providers` accessors.** The router stores discovered
+  upstream metadata so the resolver and pipeline can answer
+  catalog/capability questions without re-querying upstream.
+- **`ModelResolver::list_catalog`.** Walks every route × ModelIndex
+  combination, populates `ModelRecord` entries with chain heads
+  and metadata. Used by both the public endpoint and the admin
+  endpoint.
+- **`format_effort_log(inbound, outbound) -> String`.** Pure helper
+  in `crates/gateway/src/pipeline.rs` for the 5-way log
+  compression. Five unit tests cover the matrix.
+- **Workspace tests: 1001 passing.** +10 new tests against the v0.7
+  baseline (5 reasoning effort, 1 effort_mapping_end_to_end, 5
+  format_effort_log).
+
 ## [0.7.0] — 2026-05-22
 
 Phase 7 complete. The plugin system goes live, and the cross-platform

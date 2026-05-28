@@ -216,6 +216,60 @@ events for every request.
 
 ## Logging
 
+### Per-request log line (v0.8+)
+
+Every successful request emits two structured lines (target
+`agent_shim::pipeline`):
+
+```text
+→ /v1/messages | model: claude-opus-4-7 → claude-opus-4.7-1m-internal
+  | bodyBytes: 167 | maxTokens: 30 | ctxWindow: 1000000
+  | stream: false | reasoning: max → xhigh
+← /v1/messages (unary) | model: claude-opus-4-7 → claude-opus-4.7-1m-internal
+  | input: 17 | output: 6 | 1.1s
+```
+
+| Field | Meaning |
+|---|---|
+| `model: X → Y` | Inbound alias `X`, resolved upstream model `Y`. |
+| `bodyBytes` | Inbound request body size. |
+| `maxTokens` | Inbound `max_tokens` (response cap), not context window. |
+| `ctxWindow` | Upstream model's context window in tokens, from the discovered catalog (`?` when `BackendProvider::list_models` returned no metadata for the target). |
+| `stream` | Whether the request is streaming. |
+| `reasoning` | Inbound vs outbound effort (see compression matrix below). |
+| `(budget N tok)` | Appended when a token-quantified budget is in play (Gemini, legacy Anthropic `thinking.budget_tokens`). |
+| `\| beta: ...` | Appended when an `anthropic-beta` header is forwarded. |
+
+Effort compression matrix (pure helper `format_effort_log` in
+`crates/gateway/src/pipeline.rs`):
+
+| Case | Renders as |
+|---|---|
+| `(None, None)` | `none` |
+| `(Some(x), Some(x))` | `x` (no rewrite) |
+| `(Some(i), Some(o))`, `i ≠ o` | `i → o` (mapping rewrote) |
+| `(None, Some(o))` | `(default) → o` (route default filled silent inbound) |
+| `(Some(i), None)` | `i → (dropped)` (mapping cleared the effort) |
+
+### Subscriber init
+
+`agent_shim_observability::init(&log_cfg, otel_cfg.as_ref())` composes
+up to three layers in this order:
+
+1. Optional OpenTelemetry layer (when `otel.endpoint` is set).
+2. Optional rolling-file layer (when `logging.file` is set).
+3. stdout `fmt` layer (always installed; pretty or JSON per `logging.format`).
+
+> **v0.8.0 fix.** v0.7 wrapped layers 1 and 2 in a `Vec<Box<dyn
+> Layer<S>>>` that the stdout layer then chained off. When both layers
+> were absent the Vec was empty, and an empty `Vec<Box<dyn Layer<S>>>`'s
+> `Layer::enabled()` returns `false` — short-circuiting the stdout
+> layer. Symptom: foreground `agent-shim serve` with no `logging.file`
+> and no `otel.endpoint` emitted zero stdout. The v0.8 fix wraps the
+> Vec as `Option<Vec<_>>` so the absent case is a true no-op (`None`)
+> rather than a deny-all (empty Vec). If you saw this on v0.7,
+> upgrading to v0.8 resolves it without config changes.
+
 ### File logging
 
 Set `logging.file` in the gateway config to write log events to a rolling file in addition to stdout:

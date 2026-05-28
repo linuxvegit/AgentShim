@@ -34,7 +34,7 @@ Point Claude Code at DeepSeek. Point Cursor at Ollama. Point Codex at GitHub Cop
 
 **Cross-protocol translation works.** An Anthropic-speaking agent can talk to an OpenAI-compatible backend and vice versa, including streaming tool-call argument deltas.
 
-## Capability matrix (v0.6)
+## Capability matrix (v0.8)
 
 | Frontend → Provider | OAI-compat | Copilot | Anthropic | DeepSeek | Gemini |
 |---|---|---|---|---|---|
@@ -489,6 +489,46 @@ curl http://127.0.0.1:8787/healthz
 # ok
 ```
 
+## Logging
+
+AgentShim emits structured `tracing` events. The default `serve` line
+on stdout uses the pretty (ANSI-colored) format; tune with the
+`logging:` config block:
+
+```yaml
+logging:
+  format: pretty            # pretty | json
+  filter: info,agent_shim=debug   # tracing-subscriber EnvFilter syntax
+  # Optional rolling file sink (writes alongside stdout):
+  file:
+    path: "/var/log/agent-shim/agent-shim.log"
+    format: json
+    rotation: daily         # daily | hourly | never
+    max_files: 7
+  print_catalog_on_start: true     # dump catalog to stderr after discovery
+```
+
+`RUST_LOG` overrides `logging.filter` when set.
+
+**Per-request log.** Every request emits a `→` line with the routing
+decision and a `←` line with the outcome:
+
+```text
+→ /v1/messages | model: claude-opus-4-7 → claude-opus-4.7-1m-internal
+  | bodyBytes: 167 | maxTokens: 30 | ctxWindow: 1000000
+  | stream: false | reasoning: max → xhigh
+← /v1/messages (unary) | model: claude-opus-4-7 → claude-opus-4.7-1m-internal
+  | input: 17 | output: 6 | 1.1s
+```
+
+The `reasoning:` field shows the per-request inbound-vs-outbound view
+of the effort decision: identical values compress to a single token
+("high"); a route-mapping rewrite renders as "max → xhigh"; a route
+default filling a silent inbound renders as "(default) → high"; a
+mapping rule that clears the effort renders as "high → (dropped)".
+`ctxWindow` comes from the discovered model catalog
+(`?` when the upstream's `list_models` returned no metadata).
+
 ## How it works
 
 1. Agent sends a request to `/v1/messages` or `/v1/chat/completions`
@@ -513,21 +553,24 @@ crates/
   protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.6.1
+## What's NOT in v0.8.0
 
-Phase 6 ships cost-aware routing (tier filter, per-token cost, p95
-latency budget, per-route cost cap) plus closes the two v0.5 deferrals
-(outbound `traceparent` propagation, rate-limit policy reload). v0.6.1
-adds image-aware cost estimation (`ImageTokenEstimator` trait — see
-[ADR-0007](docs/adr/0007-frozen-core-lift-discipline.md)). v0.6.1 still
-does **not** ship:
+v0.8 adds per-route reasoning effort mapping, a public `/v1/models`
+catalog endpoint, and the operator-side observability shaped around it
+(admin `/admin/catalog`, `agent-shim show-catalog` CLI, optional strict
+typo detection, optional startup catalog print). v0.8 still does **not**
+ship:
 
+- **`POST /admin/discover` atomic catalog refresh.** Currently returns
+  `501 Not Implemented`; use `POST /admin/reload` or `SIGHUP` to
+  re-discover catalog metadata as part of a full config reload.
+  v0.9+ candidate.
 - **Learned realised-cost tracking (rolling EWMA).** The cost filter
-  uses an upper-bound estimate today; observed token counts don't
-  feed back into the filter. v0.7+ candidate.
+  still uses an upper-bound estimate; observed token counts don't
+  feed back into the filter. v0.9+ candidate.
 - **Distributed cost-filter state.** Each gateway instance applies
   the filter independently; multi-instance deployments don't share
-  filter counts. v0.7+ candidate.
+  filter counts. v0.9+ candidate.
 - **Agent-driven routing hints** (e.g. `agent-shim-budget: low`
   headers) — explicitly out of scope. The policy decision belongs to
   the operator, not the agent. Rationale in
@@ -535,22 +578,37 @@ does **not** ship:
 - **Distributed / shared state** — breaker and rate-limit state still
   live in process memory.
 - **k8s manifests / Helm chart** — operators write their own.
-- **Redacted request/response capture** — too disk-heavy for a default;
-  v0.7+.
+- **Redacted request/response capture** — too disk-heavy for a default.
 - **New providers, new frontends, new model alias features** — out of
-  scope for v0.6.
-- **Audio / file content end-to-end** — v0.7+ if at all.
+  scope for v0.8.
+- **Audio / file content end-to-end** — v0.9+ if at all.
 
 Phase 4's `ResilientCaller` orchestrator + Phase 5's observability
-layer + Phase 6's cost filter are the foundation that distributed
-state and realised-cost tracking will plug into in v0.7+.
+layer + Phase 6's cost filter + Phase 7's plugin system + v0.8's
+model catalog are the foundation that distributed state and
+realised-cost tracking will plug into in v0.9+.
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
 
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.6.1** — Patch — closes the five Minor items from Phase 6's P04 review:
+**v0.8.0** — Per-route reasoning effort mapping + public `/v1/models`
+catalog. New six-value canonical effort enum
+(`minimal/low/medium/high/xhigh/max`), per-route `reasoning_mapping:
+[{ match, set }]` rewrite table, OpenAI-shape `/v1/models` with
+upstream-discovered capability metadata, `agent-shim show-catalog`
+CLI, admin `/admin/catalog`, `logging.print_catalog_on_start`, and
+`validation.strict_upstream_models` typo detection. Also: fix for an
+observability bug that silenced foreground `agent-shim serve` stdout
+when neither `logging.file` nor `otel.endpoint` was configured.
+Full release notes: [docs/release-notes-0.8.0.md](docs/release-notes-0.8.0.md).
+
+Previous: **v0.7.0** — Phase 7: plugin system (PII scrubber,
+prompt compressor, usage recorder), hot-reloadable plugin config,
+Windows Service support, rolling file logging.
+
+Previous: **v0.6.1** — Patch — closes the five Minor items from Phase 6's P04 review:
 image-aware cost estimation (`ImageTokenEstimator` trait), `#[derive(Metric)]`
 single-site metric registration, `PolicyVec<T>` length-invariant wrapper,
 disciplined lift of frozen-core invariant
