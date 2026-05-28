@@ -74,6 +74,7 @@
 //! | Medium   | 1024          |
 //! | High     | 4096          |
 //! | Xhigh    | 16384         |
+//! | Max      | 24576         |
 //!
 //! Whenever a budget is set, `include_thoughts` is also set to `true` so the
 //! parser (T6) can route reasoning into `ContentBlock::Reasoning`.
@@ -1019,6 +1020,12 @@ mod tests {
         assert_eq!(effort_to_budget(ReasoningEffort::Medium), 1024);
         assert_eq!(effort_to_budget(ReasoningEffort::High), 4096);
         assert_eq!(effort_to_budget(ReasoningEffort::Xhigh), 16384);
+        assert_eq!(effort_to_budget(ReasoningEffort::Max), 24576);
+    }
+
+    #[test]
+    fn effort_to_budget_includes_max() {
+        assert_eq!(effort_to_budget(ReasoningEffort::Max), 24576);
     }
 
     // ---- Defensive drops -------------------------------------------------
