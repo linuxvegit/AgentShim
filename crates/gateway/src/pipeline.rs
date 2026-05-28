@@ -504,24 +504,47 @@ async fn dispatch_inner(
     // test routes through an OAI-compat upstream specifically to
     // exercise the canonical-path gate.
     if spec.try_proxy_raw {
-        tracing::info!(
-            "→ {} | model: {} → {} | bodyBytes: {} | reasoning_default: {}",
-            spec.endpoint_label,
-            model_alias,
-            upstream_model,
-            body_bytes,
-            first_target
-                .policy
-                .default_reasoning_effort
-                .map(|e| e.as_str())
-                .unwrap_or("none"),
-        );
+        // Don't pre-emit the request log here: when proxy_raw returns
+        // `Ok(None)` or `Err(_)` we fall through to the canonical
+        // decode path, which emits a full structured log line
+        // including inbound/outbound effort and ctxWindow. Emitting a
+        // shorter line here would just duplicate the line for every
+        // non-raw-passthrough request (Anthropic-to-Copilot is the
+        // common case — no Copilot upstream implements Anthropic
+        // raw passthrough today). Successful passthrough emits its
+        // own log line in the `Ok(Some(...))` arm below.
 
         match first_provider
             .proxy_raw(body.clone(), first_target.clone(), spec.frontend.kind())
             .await
         {
             Ok(Some((content_type, byte_stream))) => {
+                // Passthrough succeeded — emit a single log line
+                // tagged with the route default effort and (where
+                // available) the upstream context window. We don't
+                // know the inbound effort here without decoding the
+                // body, so the inbound side reads "(unknown)".
+                let upstream_ctx_log: Option<u32> = state
+                    .core
+                    .resolver
+                    .model_index()
+                    .metadata(&first_target.provider, &upstream_model)
+                    .and_then(|m| m.context_window_tokens);
+                tracing::info!(
+                    "→ {} (passthrough) | model: {} → {} | bodyBytes: {} | ctxWindow: {} | reasoning_default: {}",
+                    spec.endpoint_label,
+                    model_alias,
+                    upstream_model,
+                    body_bytes,
+                    upstream_ctx_log
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    first_target
+                        .policy
+                        .default_reasoning_effort
+                        .map(|e| e.as_str())
+                        .unwrap_or("none"),
+                );
                 tracing::info!(
                     "← {} (passthrough) | model: {} → {} | {:.1}s",
                     spec.endpoint_label,
@@ -630,29 +653,72 @@ async fn dispatch_inner(
 
     let is_stream = canonical.stream;
     let max_tokens = canonical.generation.max_tokens;
-    let reasoning_budget = canonical
+
+    // Capture the INBOUND reasoning effort before merging with the
+    // resolved policy so the request log can show "what the agent
+    // asked for" alongside "what we forward upstream". `None` means
+    // the inbound request was silent on effort.
+    let inbound_effort: Option<&'static str> = canonical
         .generation
         .reasoning
         .as_ref()
-        .and_then(|r| r.budget_tokens);
+        .and_then(|r| r.effort)
+        .map(|e| e.as_str());
+    let outbound_effort: Option<&'static str> = canonical
+        .resolved_policy
+        .reasoning_effort
+        .map(|e| e.as_str());
+
+    // Compress the effort field: identical inbound/outbound prints as
+    // "high"; rewritten prints as "max → xhigh"; route default fills
+    // a silent inbound as "(default) → high"; a route mapping that
+    // explicitly clears the effort prints as "high → (dropped)".
+    let effort_log = format_effort_log(inbound_effort, outbound_effort);
+
+    // Reasoning budget (token-quantified path, used by Gemini and the
+    // legacy Anthropic thinking shape). `resolved_policy` copies the
+    // inbound value as-is in v0.6, so a single field describes both
+    // directions.
+    let reasoning_budget = canonical
+        .resolved_policy
+        .reasoning_budget_tokens
+        .or_else(|| {
+            canonical
+                .generation
+                .reasoning
+                .as_ref()
+                .and_then(|r| r.budget_tokens)
+        });
+
     let beta_log = canonical
         .resolved_policy
         .anthropic_header("anthropic-beta")
         .map(|s| s.to_string());
 
+    // Upstream context window comes from the discovered model catalog.
+    // `None` for upstreams whose `BackendProvider::list_models` returned
+    // `None`, or for wildcard `upstream_model: "*"` routes whose
+    // resolved id wasn't discovered. Logs as "?" in those cases so the
+    // line stays single-form.
+    let upstream_ctx_log: Option<u32> = state
+        .core
+        .resolver
+        .model_index()
+        .metadata(&first_target.provider, &upstream_model)
+        .and_then(|m| m.context_window_tokens);
+
     tracing::info!(
-        "→ {} | model: {} → {} | bodyBytes: {} | maxTokens: {} | stream: {} | reasoning: {}{}{}",
+        "→ {} | model: {} → {} | bodyBytes: {} | maxTokens: {} | ctxWindow: {} | stream: {} | reasoning: {}{}{}",
         spec.endpoint_label,
         model_alias,
         upstream_model,
         body_bytes,
         max_tokens.unwrap_or(0),
+        upstream_ctx_log
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_string()),
         is_stream,
-        canonical
-            .resolved_policy
-            .reasoning_effort
-            .map(|e| e.as_str())
-            .unwrap_or("none"),
+        effort_log,
         reasoning_budget
             .map(|b| format!(" (budget {} tok)", b))
             .unwrap_or_default(),
@@ -1156,6 +1222,31 @@ fn capture_anthropic_headers(headers: &HeaderMap) -> Vec<(String, String)> {
     out
 }
 
+/// Format the inbound/outbound reasoning-effort pair for the request
+/// log line. Pulled out as a pure function so the formatting matrix
+/// (5 cases) can be tested without the full pipeline harness.
+///
+/// * `(None, None)` — neither the inbound request nor the route policy
+///   specified an effort: log "none".
+/// * `(Some(x), Some(x))` — inbound effort survived the policy with
+///   no rewrite: log just the value, no arrow.
+/// * `(Some(i), Some(o))` where `i != o` — policy rewrote it: log
+///   "i → o" so operators see what changed.
+/// * `(None, Some(o))` — route default supplied effort the request
+///   didn't ask for: log "(default) → o".
+/// * `(Some(i), None)` — route mapping explicitly dropped the inbound
+///   effort: log "i → (dropped)". Unlikely with v0.6's mapping schema
+///   but handled defensively for clarity.
+fn format_effort_log(inbound: Option<&str>, outbound: Option<&str>) -> String {
+    match (inbound, outbound) {
+        (None, None) => "none".to_string(),
+        (Some(i), Some(o)) if i == o => i.to_string(),
+        (Some(i), Some(o)) => format!("{i} → {o}"),
+        (None, Some(o)) => format!("(default) → {o}"),
+        (Some(i), None) => format!("{i} → (dropped)"),
+    }
+}
+
 /// Peek at the JSON body to extract the `model` field for raw-passthrough
 /// route resolution.
 fn extract_model_from_body(body: &[u8]) -> Result<String, HandlerError> {
@@ -1277,6 +1368,31 @@ impl<S: futures::Stream + Unpin> futures::Stream for GuardedStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_effort_log_silent_inbound_and_silent_outbound() {
+        assert_eq!(format_effort_log(None, None), "none");
+    }
+
+    #[test]
+    fn format_effort_log_unchanged_effort_compresses_to_single_value() {
+        assert_eq!(format_effort_log(Some("high"), Some("high")), "high");
+    }
+
+    #[test]
+    fn format_effort_log_rewrite_renders_arrow() {
+        assert_eq!(format_effort_log(Some("max"), Some("xhigh")), "max → xhigh");
+    }
+
+    #[test]
+    fn format_effort_log_default_fill_marks_inbound_silent() {
+        assert_eq!(format_effort_log(None, Some("high")), "(default) → high");
+    }
+
+    #[test]
+    fn format_effort_log_drop_marks_outbound_cleared() {
+        assert_eq!(format_effort_log(Some("high"), None), "high → (dropped)");
+    }
 
     #[test]
     fn extract_model_from_body_reads_top_level_field() {
