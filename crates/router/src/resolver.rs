@@ -35,6 +35,14 @@ impl ModelResolver {
         }
     }
 
+    /// Direct accessor for the embedded model index. Most callers should
+    /// use `resolve` / `list_catalog`; this exists for the gateway's
+    /// strict-upstream-models startup check which needs to enumerate the
+    /// full discovered catalog without re-fetching it.
+    pub fn model_index(&self) -> &ModelIndex {
+        &self.model_index
+    }
+
     /// Resolve the inbound `(frontend, model_alias)` to the full fallback
     /// chain of [`BackendTarget`]s. Looks up the static route (which may
     /// already be a multi-element fallback chain for `upstreams: [...]`
@@ -91,6 +99,119 @@ impl ModelResolver {
         self.static_router
             .find_breaker_policy(frontend, model_alias)
     }
+
+    /// Build the public model catalog from the static route table plus the
+    /// discovered upstream metadata.
+    ///
+    /// The result has one [`ModelRecord`] per explicit alias (`routes[].model`
+    /// where `model != "*"`). When the same alias appears on multiple
+    /// frontends, those frontends collapse into the record's `frontends`
+    /// list. Wildcards are excluded because they don't enumerate a concrete
+    /// alias.
+    ///
+    /// `long_context_variant` is computed by scanning the rest of the
+    /// catalog for entries on the same `metadata.family` with a strictly
+    /// larger `context_window_tokens`; the largest match wins. Records
+    /// whose metadata lacks a family (or that have no larger sibling) leave
+    /// the field `None`.
+    pub fn list_catalog(&self) -> agent_shim_core::ModelCatalog {
+        use std::collections::BTreeMap;
+
+        use agent_shim_core::{ModelRecord, UpstreamRef};
+
+        // Pass 1: walk routes, build a map keyed by alias-id. Multiple
+        // frontends for the same alias collapse into one record.
+        let mut by_alias: BTreeMap<String, ModelRecord> = BTreeMap::new();
+        for (frontend, alias) in self.static_router.list_routes() {
+            // Defensive: list_routes already excludes wildcards, but skip
+            // here too in case a future Router impl returns them.
+            if alias == "*" {
+                continue;
+            }
+            let Ok(chain) = self.static_router.resolve(frontend, &alias) else {
+                continue;
+            };
+            // For metadata lookup, use the chain head's (provider, model).
+            let head = match chain.first() {
+                Some(h) => h,
+                None => continue,
+            };
+            let metadata = self
+                .model_index
+                .metadata(&head.provider, &head.model)
+                .cloned();
+            let upstreams_chain: Vec<UpstreamRef> = chain
+                .iter()
+                .map(|t| UpstreamRef {
+                    provider: t.provider.clone(),
+                    model: t.model.clone(),
+                })
+                .collect();
+            let entry = by_alias
+                .entry(alias.clone())
+                .or_insert_with(|| ModelRecord {
+                    id: alias.clone(),
+                    frontends: Vec::new(),
+                    upstream_provider: head.provider.clone(),
+                    upstream_model: head.model.clone(),
+                    upstreams_chain,
+                    metadata,
+                    long_context_variant: None,
+                });
+            if !entry.frontends.contains(&frontend) {
+                entry.frontends.push(frontend);
+            }
+        }
+
+        // Pass 2: long-context sibling lookup. For each record, scan all
+        // other records on the same family and pick the one with the
+        // strictly larger context window; the largest such sibling wins.
+        let records: Vec<ModelRecord> = by_alias.into_values().collect();
+        let mut out: Vec<ModelRecord> = Vec::with_capacity(records.len());
+        for r in &records {
+            let my_family = r.metadata.as_ref().and_then(|m| m.family.clone());
+            let my_ctx = r
+                .metadata
+                .as_ref()
+                .and_then(|m| m.context_window_tokens)
+                .unwrap_or(0);
+            let mut variant: Option<&ModelRecord> = None;
+            if let Some(fam) = my_family.as_deref() {
+                for other in &records {
+                    if other.id == r.id {
+                        continue;
+                    }
+                    let same_family = other
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.family.as_deref())
+                        .is_some_and(|f| f == fam);
+                    let bigger_ctx = other
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.context_window_tokens)
+                        .is_some_and(|c| c > my_ctx);
+                    if same_family && bigger_ctx {
+                        let other_ctx = other
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.context_window_tokens)
+                            .unwrap_or(0);
+                        let cur_ctx = variant
+                            .and_then(|v| v.metadata.as_ref().and_then(|m| m.context_window_tokens))
+                            .unwrap_or(0);
+                        if other_ctx > cur_ctx {
+                            variant = Some(other);
+                        }
+                    }
+                }
+            }
+            let mut rec = r.clone();
+            rec.long_context_variant = variant.map(|v| v.id.clone());
+            out.push(rec);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +246,7 @@ mod tests {
                 min_tier: None,
                 max_cost_usd: None,
                 plugins: None,
+                reasoning_mapping: vec![],
             }],
             plugins: ::std::collections::BTreeMap::new(),
             auth: Default::default(),
@@ -134,6 +256,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         }
     }
 
@@ -230,6 +353,7 @@ mod tests {
                 min_tier: None,
                 max_cost_usd: None,
                 plugins: None,
+                reasoning_mapping: vec![],
             }],
             plugins: ::std::collections::BTreeMap::new(),
             auth: Default::default(),
@@ -239,6 +363,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         };
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
 
@@ -264,5 +389,146 @@ mod tests {
         assert_eq!(chain[0].model, "gpt-4o-2024-11-20"); // openai upgrade
         assert_eq!(chain[1].provider, "copilot");
         assert_eq!(chain[1].model, "gpt-4o-2024-08-06"); // copilot upgrade
+    }
+
+    #[test]
+    fn list_catalog_returns_one_record_per_explicit_alias() {
+        let cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-opus-4-7",
+            "copilot",
+            "claude-opus-4.7",
+        );
+        let resolver = resolver_with(cfg, "copilot", &["claude-opus-4.7"]);
+        let catalog = resolver.list_catalog();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "claude-opus-4-7");
+        assert_eq!(catalog[0].frontends, vec![FrontendKind::AnthropicMessages]);
+        assert_eq!(catalog[0].upstream_provider, "copilot");
+        // Fuzzy resolution converts the configured upstream model to its
+        // canonical discovered form (here, the same string after lowercase
+        // round-trip).
+        assert_eq!(catalog[0].upstream_model, "claude-opus-4.7");
+        assert_eq!(catalog[0].upstreams_chain.len(), 1);
+    }
+
+    #[test]
+    fn list_catalog_collapses_same_alias_on_multiple_frontends() {
+        let mut cfg = cfg_with_route("anthropic_messages", "shared", "copilot", "claude-opus-4.7");
+        cfg.routes.push(RouteEntry::singular(
+            "openai_chat",
+            "shared",
+            "copilot",
+            "claude-opus-4.7",
+        ));
+        let resolver = resolver_with(cfg, "copilot", &["claude-opus-4.7"]);
+        let catalog = resolver.list_catalog();
+        let shared = catalog
+            .iter()
+            .find(|r| r.id == "shared")
+            .expect("shared alias present");
+        assert_eq!(shared.frontends.len(), 2);
+        assert!(shared.frontends.contains(&FrontendKind::AnthropicMessages));
+        assert!(shared.frontends.contains(&FrontendKind::OpenAiChat));
+    }
+
+    #[test]
+    fn list_catalog_populates_metadata_when_index_has_it() {
+        use std::collections::BTreeMap;
+
+        use agent_shim_core::{ModelMetadata, ModelSupports};
+
+        let cfg = cfg_with_route("openai_chat", "gpt-5.5", "copilot", "gpt-5.5");
+        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let mut all = HashMap::new();
+        let mut map = BTreeMap::new();
+        map.insert(
+            "gpt-5.5".to_string(),
+            ModelMetadata {
+                context_window_tokens: Some(1_050_000),
+                family: Some("gpt-5.5".into()),
+                supports: ModelSupports {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        all.insert("copilot".to_string(), map);
+        let index = Arc::new(ModelIndex::with_metadata(all));
+        let resolver = ModelResolver::new(router, index);
+        let cat = resolver.list_catalog();
+        let r = &cat[0];
+        let m = r.metadata.as_ref().expect("metadata present");
+        assert_eq!(m.context_window_tokens, Some(1_050_000));
+        assert_eq!(m.supports.vision, Some(true));
+    }
+
+    #[test]
+    fn list_catalog_omits_metadata_when_index_is_empty() {
+        let cfg = cfg_with_route("openai_chat", "gpt-4o", "openai", "gpt-4o");
+        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let resolver = ModelResolver::new(router, Arc::new(ModelIndex::empty()));
+        let cat = resolver.list_catalog();
+        assert!(cat[0].metadata.is_none());
+        assert!(cat[0].long_context_variant.is_none());
+    }
+
+    #[test]
+    fn list_catalog_finds_long_context_sibling_on_same_family() {
+        use std::collections::BTreeMap;
+
+        use agent_shim_core::ModelMetadata;
+
+        let mut cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-opus-4-7",
+            "copilot",
+            "claude-opus-4.7",
+        );
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-opus-4-7-1m",
+            "copilot",
+            "claude-opus-4.7-1m-internal",
+        ));
+        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let mut all = HashMap::new();
+        let mut map = BTreeMap::new();
+        map.insert(
+            "claude-opus-4.7".to_string(),
+            ModelMetadata {
+                context_window_tokens: Some(200_000),
+                family: Some("claude-opus-4.7".into()),
+                ..Default::default()
+            },
+        );
+        map.insert(
+            "claude-opus-4.7-1m-internal".to_string(),
+            ModelMetadata {
+                context_window_tokens: Some(1_000_000),
+                // Same family marker is what tells the catalog these are
+                // siblings; production data also follows this convention.
+                family: Some("claude-opus-4.7".into()),
+                ..Default::default()
+            },
+        );
+        all.insert("copilot".to_string(), map);
+        let index = Arc::new(ModelIndex::with_metadata(all));
+        let resolver = ModelResolver::new(router, index);
+        let cat = resolver.list_catalog();
+        let small = cat
+            .iter()
+            .find(|r| r.id == "claude-opus-4-7")
+            .expect("small variant present");
+        assert_eq!(
+            small.long_context_variant.as_deref(),
+            Some("claude-opus-4-7-1m")
+        );
+        let big = cat
+            .iter()
+            .find(|r| r.id == "claude-opus-4-7-1m")
+            .expect("big variant present");
+        assert!(big.long_context_variant.is_none());
     }
 }

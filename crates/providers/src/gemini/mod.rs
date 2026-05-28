@@ -108,6 +108,7 @@ impl GeminiProvider {
                 tool_use: true,
                 vision: true,
                 json_mode: true,
+                accepts_xhigh: false,
             },
         })
     }

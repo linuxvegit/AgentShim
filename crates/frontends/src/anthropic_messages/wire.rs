@@ -26,9 +26,15 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub metadata: Option<Value>,
-    /// Anthropic extended-thinking config: `{ "type": "enabled", "budget_tokens": N }`.
+    /// Anthropic extended-thinking config: `{ "type": "enabled" | "adaptive" | "disabled" }`.
+    /// All three modes are tolerated. We no longer extract `budget_tokens`
+    /// into the canonical effort axis — effort comes from
+    /// `output_config.effort` per the `effort-2025-11-24` beta.
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
+    /// Anthropic `effort-2025-11-24` beta: `{ "effort": "low|medium|high|xhigh|max" }`.
+    #[serde(default)]
+    pub output_config: Option<OutputConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +43,12 @@ pub struct ThinkingConfig {
     pub mode: Option<String>,
     #[serde(default)]
     pub budget_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

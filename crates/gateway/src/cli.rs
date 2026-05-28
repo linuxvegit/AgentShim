@@ -27,6 +27,20 @@ pub enum Commands {
         #[arg(short, long, env = "AGENT_SHIM_CONFIG")]
         config: PathBuf,
     },
+    /// Print the model catalog from the configured upstreams (runs one
+    /// round of model discovery, then renders + exits).
+    ShowCatalog {
+        /// Path to the config file
+        #[arg(short, long, env = "AGENT_SHIM_CONFIG")]
+        config: PathBuf,
+        /// Output format: `table` (default) or `json`.
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Exit non-zero if any route alias has no upstream metadata
+        /// (typo detection — caught at startup time, before live traffic).
+        #[arg(long)]
+        strict: bool,
+    },
     /// GitHub Copilot authentication commands
     Copilot {
         #[command(subcommand)]

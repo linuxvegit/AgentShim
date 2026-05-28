@@ -16,6 +16,20 @@ logging:
   #   format: json
   #   rotation: daily     # daily | hourly | never
   #   max_files: 7
+  #
+  # Plan B Task 10: when true, the gateway prints the resolved model
+  # catalog to stderr right after discovery completes. Identical text
+  # to `agent-shim show-catalog`. Off by default — turn on if you want
+  # a startup sanity check.
+  # print_catalog_on_start: true
+#
+# Plan B Task 9: refuse to start if any route's `upstream_model` is not
+# present in the discovered upstream catalog. Off by default because not
+# every provider implements `/models`; turn on only when every upstream
+# you reference does (e.g. Copilot, openai_compatible against a backend
+# whose /v1/models is enumerable).
+# validation:
+#   strict_upstream_models: true
 upstreams:
   # DeepSeek-as-backend (talks to api.deepseek.com directly):
   # Uses the native `deepseek` upstream type which adds:
@@ -63,10 +77,30 @@ routes:
     upstream: deepseek
     upstream_model: deepseek-reasoner
     # Optional: default reasoning_effort applied when the request omits one.
-    # One of: minimal | low | medium | high | xhigh
+    # One of: minimal | low | medium | high | xhigh | max
     # Forwarded to upstreams that understand `reasoning_effort`
     # (Copilot/GPT-5/o-series).
     reasoning_effort: medium
+
+  # Per-route reasoning_mapping table — rewrite the canonical effort axis
+  # before the request reaches the upstream. First matching rule wins;
+  # unmatched passes through. Both `match` and `set` must be canonical
+  # effort strings (`minimal/low/medium/high/xhigh/max`); unknown values
+  # fail validation at config-load.
+  #
+  # Example: a Claude Code user who presses "ultrathink" sends
+  # `output_config.effort: max`. On a Copilot-backed route, lift that to
+  # Copilot's top tier (`xhigh`); also lift any plain `high` request to
+  # `xhigh` for the same model.
+  # - frontend: anthropic_messages
+  #   model: claude-opus-4-7
+  #   upstream: copilot
+  #   upstream_model: claude-opus-4-7
+  #   reasoning_mapping:
+  #     - match: max
+  #       set:   xhigh
+  #     - match: high
+  #       set:   xhigh
 
   # Anthropic 1M context — enabled via header, NOT a different model name.
   # Claude Code sends `anthropic-beta: context-1m-...` automatically; this

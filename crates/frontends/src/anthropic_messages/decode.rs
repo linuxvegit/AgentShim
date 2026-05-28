@@ -4,7 +4,9 @@ use agent_shim_core::{
     ids::{RequestId, ToolCallId},
     media::BinarySource,
     message::{Message, SystemInstruction, SystemSource},
-    request::{CanonicalRequest, GenerationOptions, ReasoningOptions, RequestMetadata},
+    request::{
+        CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
+    },
     target::{FrontendInfo, FrontendKind, FrontendModel},
     tool::{ToolCallArguments, ToolCallBlock, ToolChoice, ToolDefinition, ToolResultBlock},
 };
@@ -106,21 +108,18 @@ pub fn decode_request(req: MessagesRequest) -> Result<CanonicalRequest, Frontend
     };
 
     // -- generation options --
-    let reasoning = req.thinking.as_ref().and_then(|t| {
-        // Anthropic's `type: "disabled"` / absent budget should not enable reasoning.
-        let enabled = t
-            .mode
-            .as_deref()
-            .map(|m| m.eq_ignore_ascii_case("enabled"))
-            .unwrap_or(t.budget_tokens.is_some());
-        if !enabled {
-            return None;
-        }
-        Some(ReasoningOptions {
-            effort: None,
-            budget_tokens: t.budget_tokens,
-        })
-    });
+    // Effort signal lives in output_config.effort (Anthropic `effort-2025-11-24`).
+    // Legacy `thinking.budget_tokens` is intentionally NOT consumed for the
+    // canonical effort axis — see 2026-05-28 spec.
+    let reasoning = req
+        .output_config
+        .as_ref()
+        .and_then(|oc| oc.effort.as_deref())
+        .and_then(ReasoningEffort::parse)
+        .map(|effort| ReasoningOptions {
+            effort: Some(effort),
+            budget_tokens: None,
+        });
     let generation = GenerationOptions {
         max_tokens: Some(req.max_tokens),
         temperature: req.temperature,
@@ -470,5 +469,56 @@ mod tests {
             }
             other => panic!("expected Image, got {other:?}"),
         }
+    }
+
+    // ── effort vocabulary (2026-05-28 spec) ────────────────────────────
+
+    #[test]
+    fn output_config_effort_decodes_to_canonical() {
+        use agent_shim_core::request::ReasoningEffort;
+        let body = br#"{
+            "model":"claude-opus-4.7",
+            "max_tokens":1024,
+            "messages":[{"role":"user","content":"hi"}],
+            "thinking":{"type":"adaptive"},
+            "output_config":{"effort":"max"}
+        }"#;
+        let req = decode(body).expect("decodes");
+        let r = req.generation.reasoning.expect("reasoning set");
+        assert_eq!(r.effort, Some(ReasoningEffort::Max));
+        assert_eq!(r.budget_tokens, None);
+    }
+
+    #[test]
+    fn legacy_thinking_budget_no_longer_populates_canonical() {
+        // Per 2026-05-28 spec, legacy `thinking.budget_tokens` decode is retired.
+        // Clients on the old API lose effort intent unless they also send
+        // `output_config.effort`; route default catches the common case.
+        let body = br#"{
+            "model":"claude-opus-4.7",
+            "max_tokens":1024,
+            "messages":[{"role":"user","content":"hi"}],
+            "thinking":{"type":"enabled","budget_tokens":8192}
+        }"#;
+        let req = decode(body).expect("decodes");
+        assert!(
+            req.generation.reasoning.is_none(),
+            "legacy thinking.budget_tokens path is intentionally dropped per 2026-05-28 spec"
+        );
+    }
+
+    #[test]
+    fn adaptive_thinking_without_output_config_is_silent() {
+        let body = br#"{
+            "model":"claude-opus-4.7",
+            "max_tokens":1024,
+            "messages":[{"role":"user","content":"hi"}],
+            "thinking":{"type":"adaptive"}
+        }"#;
+        let req = decode(body).expect("decodes");
+        assert!(
+            req.generation.reasoning.is_none(),
+            "adaptive without output_config means no effort signal"
+        );
     }
 }

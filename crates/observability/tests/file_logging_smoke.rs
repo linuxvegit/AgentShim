@@ -22,6 +22,7 @@ fn file_logging_writes_json_events_to_configured_path() {
             rotation: RotationPolicy::Daily,
             max_files: 7,
         }),
+        print_catalog_on_start: false,
     };
 
     let handles = agent_shim_observability::init(&cfg, None);

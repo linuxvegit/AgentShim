@@ -1,4 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use agent_shim_core::ModelMetadata;
 
 struct ModelEntry {
     original: String,
@@ -6,8 +8,20 @@ struct ModelEntry {
     tokens: Vec<String>,
 }
 
+/// Map of `provider name → (upstream model id → metadata)` plus pre-tokenised
+/// entries used by the fuzzy resolver. Plan B Task 4 extended this beyond
+/// "set of names" so the catalog endpoints can surface upstream-reported
+/// capabilities (context window, vision support, family) without re-walking
+/// the original JSON each time.
 pub struct ModelIndex {
-    providers: HashMap<String, Vec<ModelEntry>>,
+    /// Per-provider metadata. Source of truth for both `resolve` (via the
+    /// tokenised mirror below) and the new `metadata` / `provider_models`
+    /// accessors that back `/v1/models`.
+    metadata: HashMap<String, BTreeMap<String, ModelMetadata>>,
+    /// Pre-tokenised mirror of the keys in `metadata`, used by the existing
+    /// fuzzy resolver. Built at construction time so per-request lookups
+    /// don't pay tokenisation cost.
+    fuzzy: HashMap<String, Vec<ModelEntry>>,
 }
 
 fn tokenize(name: &str) -> Vec<String> {
@@ -66,36 +80,64 @@ fn score(
 const THRESHOLD: f64 = 0.5;
 
 impl ModelIndex {
-    pub fn new(discovered: HashMap<String, BTreeSet<String>>) -> Self {
-        let providers = discovered
-            .into_iter()
-            .map(|(provider, models)| {
-                let entries = models
-                    .into_iter()
+    /// Primary constructor: takes the metadata-bearing per-provider map. The
+    /// fuzzy resolver is built from the same map's keys.
+    pub fn with_metadata(providers: HashMap<String, BTreeMap<String, ModelMetadata>>) -> Self {
+        let fuzzy = providers
+            .iter()
+            .map(|(provider, map)| {
+                let entries = map
+                    .keys()
                     .map(|name| {
                         let normalized = name.to_lowercase();
-                        let tokens = tokenize(&name);
+                        let tokens = tokenize(name);
                         ModelEntry {
-                            original: name,
+                            original: name.clone(),
                             normalized,
                             tokens,
                         }
                     })
                     .collect();
-                (provider, entries)
+                (provider.clone(), entries)
             })
             .collect();
-        Self { providers }
+        Self {
+            metadata: providers,
+            fuzzy,
+        }
+    }
+
+    /// Back-compat shim for tests that only have name sets and don't care
+    /// about metadata. Wraps each name with `ModelMetadata::default()`.
+    pub fn from_ids(providers: HashMap<String, BTreeSet<String>>) -> Self {
+        let with_meta = providers
+            .into_iter()
+            .map(|(p, set)| {
+                let map: BTreeMap<String, ModelMetadata> = set
+                    .into_iter()
+                    .map(|id| (id, ModelMetadata::default()))
+                    .collect();
+                (p, map)
+            })
+            .collect();
+        Self::with_metadata(with_meta)
+    }
+
+    /// Legacy constructor: one-line alias for `from_ids` so existing
+    /// `ModelIndex::new(...)` call sites compile unchanged.
+    pub fn new(providers: HashMap<String, BTreeSet<String>>) -> Self {
+        Self::from_ids(providers)
     }
 
     pub fn empty() -> Self {
         Self {
-            providers: HashMap::new(),
+            metadata: HashMap::new(),
+            fuzzy: HashMap::new(),
         }
     }
 
     pub fn resolve(&self, provider: &str, requested: &str) -> Option<&str> {
-        let entries = self.providers.get(provider)?;
+        let entries = self.fuzzy.get(provider)?;
 
         // Fast path: exact case-insensitive match avoids tokenize() allocation
         for entry in entries {
@@ -129,6 +171,29 @@ impl ModelIndex {
         }
 
         best.map(|e| e.original.as_str())
+    }
+
+    /// Look up upstream metadata for an exact `(provider, model_id)` pair.
+    /// Returns `None` if either the provider or the model is unknown. The
+    /// `model_id` must be the canonical form discovered from upstream — call
+    /// `resolve` first if you only have a fuzzy alias.
+    pub fn metadata(&self, provider: &str, model: &str) -> Option<&ModelMetadata> {
+        self.metadata.get(provider)?.get(model)
+    }
+
+    /// Enumerate all `(model_id, metadata)` pairs for one provider, ordered
+    /// by model id (`BTreeMap` iteration order). Used by catalog builders.
+    pub fn provider_models(&self, provider: &str) -> impl Iterator<Item = (&str, &ModelMetadata)> {
+        self.metadata
+            .get(provider)
+            .into_iter()
+            .flat_map(|map| map.iter().map(|(k, v)| (k.as_str(), v)))
+    }
+
+    /// Enumerate all providers stored in the index. Useful when catalogs
+    /// need to walk every provider without a-priori knowledge of names.
+    pub fn providers(&self) -> impl Iterator<Item = &str> {
+        self.metadata.keys().map(String::as_str)
     }
 }
 
@@ -244,5 +309,105 @@ mod tests {
             let result = idx.resolve("p", &model);
             prop_assert_eq!(result, Some(model.as_str()));
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use agent_shim_core::ModelMetadata;
+
+    fn metadata_with_ctx(ctx: u32) -> ModelMetadata {
+        ModelMetadata {
+            context_window_tokens: Some(ctx),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn metadata_lookup_returns_stored_value() {
+        let mut p1: BTreeMap<String, ModelMetadata> = BTreeMap::new();
+        p1.insert("gpt-5.5".into(), metadata_with_ctx(1_050_000));
+        let mut all = HashMap::new();
+        all.insert("copilot".into(), p1);
+        let idx = ModelIndex::with_metadata(all);
+        let m = idx.metadata("copilot", "gpt-5.5").expect("present");
+        assert_eq!(m.context_window_tokens, Some(1_050_000));
+    }
+
+    #[test]
+    fn metadata_lookup_returns_none_for_unknown_model() {
+        let mut p1: BTreeMap<String, ModelMetadata> = BTreeMap::new();
+        p1.insert("gpt-5.5".into(), metadata_with_ctx(1_050_000));
+        let mut all = HashMap::new();
+        all.insert("copilot".into(), p1);
+        let idx = ModelIndex::with_metadata(all);
+        assert!(idx.metadata("copilot", "gpt-99999").is_none());
+    }
+
+    #[test]
+    fn metadata_lookup_returns_none_for_unknown_provider() {
+        let idx = ModelIndex::with_metadata(HashMap::new());
+        assert!(idx.metadata("copilot", "x").is_none());
+    }
+
+    #[test]
+    fn provider_models_iterates_in_btreemap_order() {
+        let mut p1: BTreeMap<String, ModelMetadata> = BTreeMap::new();
+        p1.insert("a".into(), Default::default());
+        p1.insert("c".into(), Default::default());
+        p1.insert("b".into(), Default::default());
+        let mut all = HashMap::new();
+        all.insert("copilot".into(), p1);
+        let idx = ModelIndex::with_metadata(all);
+        let names: Vec<_> = idx
+            .provider_models("copilot")
+            .map(|(n, _)| n.to_string())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn provider_models_unknown_provider_yields_empty() {
+        let idx = ModelIndex::with_metadata(HashMap::new());
+        let names: Vec<_> = idx.provider_models("nope").collect();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn providers_lists_all_registered_providers() {
+        let mut all = HashMap::new();
+        all.insert("a".to_string(), BTreeMap::new());
+        all.insert("b".to_string(), BTreeMap::new());
+        let idx = ModelIndex::with_metadata(all);
+        let mut names: Vec<_> = idx.providers().map(String::from).collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn with_metadata_resolves_fuzzy_against_names() {
+        let mut p1: BTreeMap<String, ModelMetadata> = BTreeMap::new();
+        p1.insert("claude-sonnet-4-5-20250514".into(), Default::default());
+        let mut all = HashMap::new();
+        all.insert("copilot".into(), p1);
+        let idx = ModelIndex::with_metadata(all);
+        assert_eq!(
+            idx.resolve("copilot", "claude-sonnet-4-5"),
+            Some("claude-sonnet-4-5-20250514")
+        );
+    }
+
+    #[test]
+    fn from_ids_still_works_for_existing_callers() {
+        let mut set = BTreeSet::new();
+        set.insert("foo".to_string());
+        let mut all = HashMap::new();
+        all.insert("p".into(), set);
+        let idx = ModelIndex::from_ids(all);
+        assert_eq!(idx.resolve("p", "foo"), Some("foo"));
+        // from_ids fills in default metadata, so the model is queryable.
+        let m = idx.metadata("p", "foo").expect("present");
+        assert_eq!(m, &ModelMetadata::default());
     }
 }

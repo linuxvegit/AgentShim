@@ -304,7 +304,10 @@ impl AppState {
 
         let static_router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&config));
 
-        let mut discovered = std::collections::HashMap::new();
+        let mut discovered: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>,
+        > = std::collections::HashMap::new();
         for (name, provider) in registry.iter() {
             match provider.list_models().await {
                 Ok(Some(models)) => {
@@ -319,7 +322,7 @@ impl AppState {
                 }
             }
         }
-        let model_index = Arc::new(ModelIndex::new(discovered));
+        let model_index = Arc::new(ModelIndex::with_metadata(discovered));
         let resolver = Arc::new(ModelResolver::new(static_router, model_index));
 
         let providers = Arc::new(registry);

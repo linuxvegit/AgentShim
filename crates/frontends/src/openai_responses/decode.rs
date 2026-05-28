@@ -685,4 +685,19 @@ mod tests {
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }
+
+    // ── effort vocabulary (2026-05-28 spec) ────────────────────────────
+
+    #[test]
+    fn responses_reasoning_effort_max_decodes() {
+        use agent_shim_core::request::ReasoningEffort;
+        let body = br#"{
+            "model":"gpt-5.5",
+            "input":"hi",
+            "reasoning":{"effort":"max"}
+        }"#;
+        let req = decode(body).expect("decodes");
+        let r = req.generation.reasoning.expect("reasoning set");
+        assert_eq!(r.effort, Some(ReasoningEffort::Max));
+    }
 }

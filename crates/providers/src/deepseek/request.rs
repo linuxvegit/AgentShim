@@ -26,8 +26,12 @@ use agent_shim_core::{BackendTarget, CanonicalRequest};
 /// Delegates to the shared OAI-Chat encoder, then strips any Anthropic-style
 /// `cache_control` keys (defense-in-depth — the OAI-Chat encoder doesn't
 /// currently emit them, but a future change might).
-pub(crate) fn build(req: &CanonicalRequest, target: &BackendTarget) -> serde_json::Value {
-    let body = crate::oai_chat_wire::canonical_to_chat::build(req, target);
+pub(crate) fn build(
+    req: &CanonicalRequest,
+    target: &BackendTarget,
+    accepts_xhigh: bool,
+) -> serde_json::Value {
+    let body = crate::oai_chat_wire::canonical_to_chat::build(req, target, accepts_xhigh);
     // ChatBody is fully Serialize and never produces an error in practice;
     // panic loudly if a future field-shape change ever breaks that invariant
     // rather than silently sending `null` to the upstream.
@@ -215,7 +219,7 @@ mod tests {
         // `cache_control`, so a normal canonical request produces a body with
         // no `cache_control` keys anywhere — no strip needed, no debug log.
         let req = request_with_messages(vec![Message::user(vec![ContentBlock::text("hi")])]);
-        let body = build(&req, &target("deepseek-chat"));
+        let body = build(&req, &target("deepseek-chat"), false);
 
         assert_eq!(strip_cache_control(&mut body.clone()), 0);
         // And the body is well-formed JSON with the expected top-level shape.

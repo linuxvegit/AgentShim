@@ -31,6 +31,23 @@ pub struct RoutePolicy {
     /// (`context-1m-2025-08-07`) without baking them into the model name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_anthropic_beta: Option<String>,
+    /// Per-route ordered rewrite table for canonical reasoning effort. Each
+    /// rule maps an inbound canonical effort (post route-default fallback) to
+    /// an outbound canonical effort. First rule whose `match` equals the
+    /// post-default effort wins; unmatched passes through. Both `match` and
+    /// `set` are canonical-vocabulary effort values, NOT dialect strings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_mapping: Vec<MappingRule>,
+}
+
+/// One entry in a [`RoutePolicy::reasoning_mapping`] table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingRule {
+    /// Inbound canonical effort the rule fires on.
+    pub r#match: ReasoningEffort,
+    /// Outbound canonical effort the rule rewrites to.
+    pub set: ReasoningEffort,
 }
 
 /// The merged per-request view of a [`RoutePolicy`].
@@ -43,6 +60,13 @@ pub struct ResolvedPolicy {
     /// Final reasoning effort to forward to the upstream, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Final reasoning token budget to forward, if any. This is the
+    /// quantitative axis still used by Gemini and by the legacy Anthropic
+    /// `thinking.budget_tokens` shape. It is independent of `reasoning_effort`
+    /// — both may be `Some` (effort drives the effort dialect; budget drives
+    /// any provider that quantizes from a number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
     /// Final `anthropic-*` headers to attach to the upstream HTTP request.
     /// Order is stable; duplicates are not collapsed (callers may pass
     /// comma-separated values verbatim).
@@ -66,13 +90,27 @@ impl RoutePolicy {
     /// Inbound request data wins over route defaults. The resulting
     /// [`ResolvedPolicy`] is what providers actually apply.
     pub fn resolve(&self, req: &CanonicalRequest) -> ResolvedPolicy {
-        let reasoning_effort = req
+        // Step 1: gather inbound effort, falling back to route default.
+        let inbound_effort = req.generation.reasoning.as_ref().and_then(|r| r.effort);
+        let inbound_budget = req
             .generation
             .reasoning
             .as_ref()
-            .and_then(|r| r.effort)
-            .or(self.default_reasoning_effort);
+            .and_then(|r| r.budget_tokens);
+        let post_default = inbound_effort.or(self.default_reasoning_effort);
 
+        // Step 2: apply mapping table. First match wins; unmatched passes through.
+        let final_effort = match post_default {
+            Some(e) => self
+                .reasoning_mapping
+                .iter()
+                .find(|rule| rule.r#match == e)
+                .map(|rule| rule.set)
+                .or(Some(e)),
+            None => None,
+        };
+
+        // Step 3: anthropic headers (unchanged).
         let mut anthropic_headers = req.inbound_anthropic_headers.clone();
         let inbound_has_beta = anthropic_headers
             .iter()
@@ -84,7 +122,8 @@ impl RoutePolicy {
         }
 
         ResolvedPolicy {
-            reasoning_effort,
+            reasoning_effort: final_effort,
+            reasoning_budget_tokens: inbound_budget,
             anthropic_headers,
         }
     }
@@ -201,5 +240,93 @@ mod tests {
             Some("2023-06-01")
         );
         assert_eq!(resolved.anthropic_header("anthropic-beta"), Some("ctx-1m"));
+    }
+
+    #[test]
+    fn resolved_policy_carries_budget_tokens() {
+        let rp = ResolvedPolicy {
+            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_budget_tokens: Some(8192),
+            anthropic_headers: vec![],
+        };
+        assert_eq!(rp.reasoning_budget_tokens, Some(8192));
+    }
+
+    #[test]
+    fn mapping_rule_max_to_xhigh() {
+        let policy = RoutePolicy {
+            reasoning_mapping: vec![MappingRule {
+                r#match: ReasoningEffort::Max,
+                set: ReasoningEffort::Xhigh,
+            }],
+            ..Default::default()
+        };
+        let mut r = req();
+        r.generation.reasoning = Some(ReasoningOptions {
+            effort: Some(ReasoningEffort::Max),
+            budget_tokens: None,
+        });
+        let resolved = policy.resolve(&r);
+        assert_eq!(resolved.reasoning_effort, Some(ReasoningEffort::Xhigh));
+    }
+
+    #[test]
+    fn mapping_first_rule_wins() {
+        let policy = RoutePolicy {
+            reasoning_mapping: vec![
+                MappingRule {
+                    r#match: ReasoningEffort::High,
+                    set: ReasoningEffort::Xhigh,
+                },
+                MappingRule {
+                    r#match: ReasoningEffort::High,
+                    set: ReasoningEffort::Max,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut r = req();
+        r.generation.reasoning = Some(ReasoningOptions {
+            effort: Some(ReasoningEffort::High),
+            budget_tokens: None,
+        });
+        assert_eq!(
+            policy.resolve(&r).reasoning_effort,
+            Some(ReasoningEffort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn mapping_no_match_passthrough() {
+        let policy = RoutePolicy {
+            reasoning_mapping: vec![MappingRule {
+                r#match: ReasoningEffort::Max,
+                set: ReasoningEffort::Xhigh,
+            }],
+            ..Default::default()
+        };
+        let mut r = req();
+        r.generation.reasoning = Some(ReasoningOptions {
+            effort: Some(ReasoningEffort::Low),
+            budget_tokens: None,
+        });
+        assert_eq!(
+            policy.resolve(&r).reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn mapping_runs_after_default_fallback() {
+        let policy = RoutePolicy {
+            default_reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning_mapping: vec![MappingRule {
+                r#match: ReasoningEffort::Medium,
+                set: ReasoningEffort::High,
+            }],
+            ..Default::default()
+        };
+        let resolved = policy.resolve(&req()); // inbound has no effort
+        assert_eq!(resolved.reasoning_effort, Some(ReasoningEffort::High));
     }
 }

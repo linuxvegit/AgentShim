@@ -36,6 +36,26 @@ pub struct GatewayConfig {
     /// Shutdown lifecycle config. Phase 7 P05 §8.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// Optional cross-cutting validation toggles (Plan B Task 9).
+    /// See [`ValidationConfig`] for individual fields.
+    #[serde(default)]
+    pub validation: ValidationConfig,
+}
+
+/// Cross-cutting validation toggles. Each field defaults to its
+/// permissive value (typically `false`) so existing configs keep
+/// loading. Operators opt into stricter behaviour explicitly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ValidationConfig {
+    /// When true, refuse to start if any route's `upstream_model`
+    /// doesn't appear in the discovered upstream catalog. Catches typos
+    /// like `claude-opus-47` against an upstream that only exposes
+    /// `claude-opus-4.7`. Off by default because not every upstream
+    /// returns a catalog (some `BackendProvider::list_models` impls
+    /// return `None`); enabling this against such an upstream would
+    /// always fail-closed.
+    pub strict_upstream_models: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +225,13 @@ pub struct LoggingConfig {
     /// `FileLoggingConfig` for fields. Plan windows-service P02 T3.
     #[serde(default)]
     pub file: Option<FileLoggingConfig>,
+    /// Plan B Task 10: when true, the `serve` command prints the model
+    /// catalog to stderr once after model discovery completes (right
+    /// before the public listener binds). Off by default — CI /
+    /// automation use cases stay silent. Operators who want a
+    /// configuration sanity-check at startup opt in.
+    #[serde(default)]
+    pub print_catalog_on_start: bool,
 }
 
 fn default_filter() -> String {
@@ -217,6 +244,7 @@ impl Default for LoggingConfig {
             format: LogFormat::default(),
             filter: default_filter(),
             file: None,
+            print_catalog_on_start: false,
         }
     }
 }
@@ -515,6 +543,25 @@ pub struct RouteEntry {
     /// path is enabled. Plan 07 P03.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugins: Option<crate::plugins::RoutePluginsBlock>,
+
+    // ── Per-route canonical effort rewrite table (2026-05-28) ──────────────
+    /// Optional ordered list of `{ match, set }` rules over canonical
+    /// reasoning effort. First matching `match` fires its `set`; unmatched
+    /// passes through. Both fields are strings drawn from the canonical
+    /// effort vocabulary `{minimal, low, medium, high, xhigh, max}`.
+    /// Validation rejects unknown values at config-load time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_mapping: Vec<MappingRuleConfig>,
+}
+
+/// One row in a route's `reasoning_mapping` table. The strings are validated
+/// against the canonical effort vocabulary by `validation::validate_routes`
+/// before the router translates them into `agent_shim_core::policy::MappingRule`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MappingRuleConfig {
+    pub r#match: String,
+    pub set: String,
 }
 
 impl RouteEntry {
@@ -542,6 +589,7 @@ impl RouteEntry {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: Vec::new(),
         }
     }
 }
@@ -954,6 +1002,45 @@ default_headers:
         assert_eq!(entry.upstream_model.as_deref(), Some("gpt-4o-2024-11-20"));
         assert!(entry.upstreams.is_empty());
         assert_eq!(entry.retry.max_attempts, 2); // §4.5 default
+                                                 // Mapping table defaults to empty so existing routes are unaffected.
+        assert!(entry.reasoning_mapping.is_empty());
+    }
+
+    #[test]
+    fn route_entry_parses_reasoning_mapping() {
+        let yaml = r#"
+            frontend: anthropic_messages
+            model: claude-opus-4-7
+            upstream: copilot
+            upstream_model: claude-opus-4-7
+            reasoning_mapping:
+              - match: max
+                set: xhigh
+              - match: high
+                set: xhigh
+        "#;
+        let entry: RouteEntry = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(entry.reasoning_mapping.len(), 2);
+        assert_eq!(entry.reasoning_mapping[0].r#match, "max");
+        assert_eq!(entry.reasoning_mapping[0].set, "xhigh");
+        assert_eq!(entry.reasoning_mapping[1].r#match, "high");
+        assert_eq!(entry.reasoning_mapping[1].set, "xhigh");
+    }
+
+    #[test]
+    fn reasoning_mapping_rejects_unknown_set_field() {
+        let yaml = r#"
+            frontend: anthropic_messages
+            model: x
+            upstream: u
+            upstream_model: um
+            reasoning_mapping:
+              - match: high
+                set: high
+                unknown: oops
+        "#;
+        let result: Result<RouteEntry, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "deny_unknown_fields must reject");
     }
 
     #[test]

@@ -130,8 +130,11 @@ routes:
     model: claude-opus-4-7         # what the agent requests
     upstream: copilot              # which upstream serves it
     upstream_model: claude-opus-4-7  # what the upstream sees
-    reasoning_effort: high         # optional: minimal | low | medium | high | xhigh
+    reasoning_effort: high         # optional: minimal | low | medium | high | xhigh | max
     anthropic_beta: context-1m-2025-08-07  # optional: default anthropic-beta header
+    reasoning_mapping:             # optional: per-route effort rewrite table
+      - match: max                 # canonical inbound effort
+        set:   xhigh               # canonical outbound effort
 ```
 
 | Field | Type | Default | Notes |
@@ -140,8 +143,9 @@ routes:
 | `model` | string | — | The alias the agent asks for. `*` is a wildcard catch-all. |
 | `upstream` | string | — | A key under `upstreams:` |
 | `upstream_model` | string | — | Model name sent to the upstream. `*` (in a wildcard route) means pass-through. |
-| `reasoning_effort` | enum | — | Default thinking effort applied when the request omits one |
+| `reasoning_effort` | enum | — | Default thinking effort applied when the request omits one. One of `minimal/low/medium/high/xhigh/max`. |
 | `anthropic_beta` | string | — | Default `anthropic-beta` header value applied when the request omits one |
+| `reasoning_mapping` | array | `[]` | Ordered list of `{ match, set }` rules that rewrite the inbound canonical effort before forwarding to the upstream. First match wins; unmatched passes through. Both `match` and `set` must be canonical effort strings (`minimal/low/medium/high/xhigh/max`); unknown values fail validation at config-load. |
 
 The route table is consulted by `agent_shim_router::StaticRouter`. Wildcards
 (`model: "*"`) are matched only when no exact route exists.
@@ -155,6 +159,7 @@ The route table is consulted by `agent_shim_router::StaticRouter`. Wildcards
 | `format` | enum           | `pretty`                       | `pretty` or `json`. Stdout format.                     |
 | `filter` | string         | `info`                         | `EnvFilter` directive (e.g. `info,agent_shim=debug`).  |
 | `file`   | object or null | `null`                         | Optional rolling file output. See [File logging](observability.md#file-logging) for the full schema and behavior. |
+| `print_catalog_on_start` | bool | `false` | When true, the `serve` command prints the resolved model catalog to stderr right after model discovery completes. Same content as `agent-shim show-catalog`. |
 
 #### `logging.file` (optional)
 
@@ -170,6 +175,46 @@ file in addition to stdout. Writes are async (non-blocking) and flushed
 on graceful shutdown — see
 [`docs/observability.md#file-logging`](observability.md#file-logging)
 for full semantics and the Windows Service Control Manager fallback.
+
+## Validation
+
+Cross-cutting validation toggles live under the `validation` block.
+Every field defaults to its permissive value so existing configs keep
+loading; operators opt into stricter behaviour explicitly.
+
+### `validation`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `strict_upstream_models` | bool | `false` | When true, the gateway refuses to start if any route's `upstream_model` is not present in the discovered upstream catalog. Catches typos like `claude-opus-47` against an upstream that lists `claude-opus-4.7`. Wildcards (`upstream_model: "*"`) are skipped. Off by default because not every provider implements `/models` discovery; enabling it against a provider that returned `None` from `list_models` would always fail closed. |
+
+The check runs after `AppState::new` returns (so the discovered
+`ModelIndex` is fully populated) and walks every chain element of
+`upstreams: [...]` fallback routes — a typo on a fallback target fails
+just as loudly as one on the primary.
+
+```yaml
+validation:
+  strict_upstream_models: true
+```
+
+## Model catalog endpoints
+
+The gateway exposes the resolved model catalog on three surfaces, all
+backed by `ModelResolver::list_catalog`:
+
+- `GET /v1/models` (public listener) — OpenAI-shape envelope. Filters:
+  `?frontend=...`, `?capability=...`.
+- `GET /v1/models/:id` (public listener) — one record, 404 if unknown.
+- `GET /admin/catalog` (admin listener) — same catalog plus operator
+  extras: full `ModelMetadata`, per-route `reasoning_mapping`, and
+  `default_reasoning_effort`.
+- `POST /admin/discover` (admin listener) — currently returns
+  `501 Not Implemented`. Use `POST /admin/reload` or SIGHUP to re-run
+  model discovery as part of a full config reload.
+- `agent-shim show-catalog --config <path>` (CLI) — prints the catalog
+  to stdout without binding any listener. `--format table|json` and
+  `--strict` (exits non-zero on missing upstream metadata).
 
 ## Environment overlay
 
@@ -203,8 +248,10 @@ start. Common errors:
 * Unknown field (typo) — fix the spelling.
 * Route references an upstream that isn't declared — add the upstream
   entry or remove the route.
-* `reasoning_effort` value outside the documented enum — only the five
-  named values are accepted.
+* `reasoning_effort` value outside the documented enum — only the six
+  named values (`minimal/low/medium/high/xhigh/max`) are accepted.
+* `reasoning_mapping` row with an unknown `match` or `set` — both must
+  be canonical effort strings (`minimal/low/medium/high/xhigh/max`).
 
 ## Example: full multi-provider config
 

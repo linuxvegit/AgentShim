@@ -120,6 +120,7 @@ fn make_config(oai_url: &str, anthropic_url: &str) -> GatewayConfig {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
@@ -129,6 +130,7 @@ fn make_config(oai_url: &str, anthropic_url: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 

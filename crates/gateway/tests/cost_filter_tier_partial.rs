@@ -104,6 +104,7 @@ fn make_config(eco_url: &str, std_url: &str) -> GatewayConfig {
             min_tier: Some(Tier::Standard),
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth: Default::default(),
@@ -113,6 +114,7 @@ fn make_config(eco_url: &str, std_url: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 

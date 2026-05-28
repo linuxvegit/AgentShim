@@ -11,6 +11,8 @@ use axum::{
 
 use crate::state::AppState;
 
+mod catalog_handler;
+mod discover_handler;
 mod handlers;
 mod metrics_handler;
 mod reload_handler;
@@ -22,6 +24,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(handlers::readyz))
         .route("/metrics", get(metrics_handler::metrics))
         .route("/admin/reload", post(reload_handler::reload))
+        .route("/admin/catalog", get(catalog_handler::handle))
+        .route("/admin/discover", post(discover_handler::handle))
         .with_state(state)
 }
 

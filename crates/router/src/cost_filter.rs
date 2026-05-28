@@ -256,6 +256,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         };
         for (name, u) in entries {
             cfg.upstreams.insert(name.into(), u);

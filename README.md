@@ -275,11 +275,17 @@ AgentShim translates "thinking effort" between dialects so any agent can drive a
 
 | Frontend dialect | Field accepted on inbound request |
 |---|---|
-| Anthropic `/v1/messages` | `thinking: { type: "enabled", budget_tokens: N }` |
-| OpenAI `/v1/chat/completions` | `reasoning_effort: "minimal" \| "low" \| "medium" \| "high" \| "xhigh"` |
+| Anthropic `/v1/messages` | `output_config: { effort: "low" \| "medium" \| "high" \| "xhigh" \| "max" }` (with `anthropic-beta: effort-2025-11-24`) |
+| OpenAI `/v1/chat/completions` | `reasoning_effort: "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max"` |
 | OpenAI `/v1/responses` | `reasoning: { effort: "..." }` |
 
-On the way out, the value is forwarded to upstreams that understand it (Copilot/GPT-5/o-series as `reasoning_effort`; OpenAI Responses API as `reasoning.effort`).
+Inbound effort is normalised to the six-value canonical enum
+(`minimal/low/medium/high/xhigh/max`) and forwarded to the upstream in its
+native shape. Compression at provider boundaries:
+
+- OpenAI Chat (non-Copilot) and Responses API: `xhigh`/`max` → `"high"`.
+- Anthropic: `minimal` → `"low"` (Anthropic vocabulary has no `minimal`).
+- Copilot Chat: `xhigh`/`max` pass through (Copilot accepts the `xhigh` extension).
 
 **Per-route default.** Set `reasoning_effort` on a route to apply a default when the agent doesn't send one:
 
@@ -289,10 +295,27 @@ routes:
     model: claude-sonnet-4-5
     upstream: copilot
     upstream_model: claude-sonnet-4-5
-    reasoning_effort: high     # minimal | low | medium | high | xhigh
+    reasoning_effort: high     # minimal | low | medium | high | xhigh | max
 ```
 
 Request-level reasoning settings always win over the route default. Unknown values are logged and ignored.
+
+**Per-route mapping table.** Rewrite inbound efforts before they reach the upstream. Rules evaluate top-to-bottom; first match wins; unmatched passes through. The route default fills inbound holes before the mapping table runs, so `reasoning_effort + reasoning_mapping` chain as expected:
+
+```yaml
+routes:
+  - frontend: anthropic_messages
+    model: claude-opus-4-7
+    upstream: copilot
+    upstream_model: claude-opus-4-7
+    reasoning_mapping:
+      - match: max     # Claude Code "ultrathink"
+        set:   xhigh   # → Copilot's top tier
+      - match: high
+        set:   xhigh   # also lift `high` on this route
+```
+
+Unknown effort strings in `match` or `set` are rejected at config load.
 
 ## Anthropic beta features (1M context, prompt caching, etc.)
 
@@ -312,6 +335,57 @@ routes:
 ```
 
 Inbound header wins; the route value is the fallback. Comma-separated values are passed through unchanged.
+
+## Model catalog
+
+AgentShim exposes the set of aliases it accepts on `GET /v1/models`
+(OpenAI-shape envelope):
+
+```bash
+$ curl http://localhost:8787/v1/models | jq '.data[] | {id, upstream}'
+{
+  "id": "claude-opus-4-7",
+  "upstream": { "provider": "copilot", "model": "claude-opus-4.7" }
+}
+{
+  "id": "gpt-5.5",
+  "upstream": { "provider": "copilot", "model": "gpt-5.5" }
+}
+```
+
+Each record carries the resolved upstream chain head and (when the
+upstream surfaces capability metadata via its own `/models`) a
+`capabilities` block with `context_window_tokens`, `max_output_tokens`,
+`family`, and supports-flags (vision, tool calls, etc.).
+
+Filters: `?frontend=anthropic_messages|openai_chat|openai_responses`
+narrows to a single frontend; `?capability=vision|tool_calls|streaming|structured_outputs|reasoning_effort`
+drops records whose metadata lacks that capability. `GET /v1/models/:id`
+returns one record or 404.
+
+For operator-only views (per-route policy, full `ModelMetadata`,
+`reasoning_mapping` table), use the admin endpoint:
+
+```bash
+curl http://localhost:8788/admin/catalog | jq
+```
+
+`POST /admin/discover` currently returns `501 Not Implemented`; use
+`POST /admin/reload` (or SIGHUP) to re-run model discovery as part of a
+full config reload.
+
+You can also print the catalog from the CLI without starting the
+server:
+
+```bash
+agent-shim show-catalog --config gateway.yaml              # table
+agent-shim show-catalog --config gateway.yaml --format json
+agent-shim show-catalog --config gateway.yaml --strict     # exits non-zero on typos
+```
+
+Force the print at startup by setting `logging.print_catalog_on_start: true`
+in the gateway config. To make typo detection a hard startup error rather
+than a `--strict` opt-in, set `validation.strict_upstream_models: true`.
 
 ## Plugins
 

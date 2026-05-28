@@ -17,7 +17,7 @@
 //!   `decode` + `encode_stream` modules.
 
 pub(crate) mod passthrough;
-pub(crate) mod request;
+pub mod request;
 pub(crate) mod response;
 pub(crate) mod wire;
 
@@ -73,6 +73,7 @@ impl AnthropicProvider {
                 tool_use: true,
                 vision: true,
                 json_mode: false,
+                accepts_xhigh: false,
             },
         })
     }

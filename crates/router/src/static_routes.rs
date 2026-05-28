@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
-use agent_shim_core::{request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy};
+use agent_shim_core::{
+    policy::MappingRule, request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy,
+};
 
 use crate::{RouteError, Router};
 
@@ -68,9 +70,25 @@ impl StaticRouter {
                     "ignoring unknown reasoning_effort in route config (expected minimal/low/medium/high/xhigh)"
                 );
             }
+            // Translate config-shape `MappingRuleConfig { match: String, set: String }`
+            // into core-shape `MappingRule { match: ReasoningEffort, set: ReasoningEffort }`.
+            // Unknown effort strings are silently dropped here as a belt-and-braces
+            // — `validate_routes` rejects them at config-load (Task 14), so any
+            // bad row reaching this point came from a hand-built `GatewayConfig`
+            // fixture that bypassed validation.
+            let reasoning_mapping: Vec<MappingRule> = entry
+                .reasoning_mapping
+                .iter()
+                .filter_map(|rule| {
+                    let m = ReasoningEffort::parse(&rule.r#match)?;
+                    let s = ReasoningEffort::parse(&rule.set)?;
+                    Some(MappingRule { r#match: m, set: s })
+                })
+                .collect();
             let policy = RoutePolicy {
                 default_reasoning_effort,
                 default_anthropic_beta: entry.anthropic_beta.clone(),
+                reasoning_mapping,
             };
 
             // Build the full fallback chain from either the singular (v0.3)
@@ -224,6 +242,15 @@ impl Router for StaticRouter {
     fn find_breaker_policy(&self, frontend: FrontendKind, model: &str) -> Option<BreakerConfig> {
         StaticRouter::find_breaker_policy(self, frontend, model)
     }
+
+    fn list_routes(&self) -> Vec<(FrontendKind, String)> {
+        // Wildcards are intentionally excluded: catalog surfaces enumerate
+        // concrete aliases, not "any model goes" entries.
+        self.route_entries
+            .keys()
+            .map(|k| (k.frontend, k.model.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +282,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         }
     }
 
@@ -353,6 +381,7 @@ mod tests {
                 min_tier: None,
                 max_cost_usd: None,
                 plugins: None,
+                reasoning_mapping: vec![],
             }],
             plugins: ::std::collections::BTreeMap::new(),
             auth: Default::default(),
@@ -362,6 +391,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         };
         let router = StaticRouter::from_config(&cfg);
         let chain = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();
@@ -434,5 +464,66 @@ mod tests {
         assert!(router
             .find_breaker_policy(FrontendKind::AnthropicMessages, "claude-foo")
             .is_none());
+    }
+
+    #[test]
+    fn mapping_config_propagates_to_policy() {
+        use agent_shim_config::MappingRuleConfig;
+        let mut cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-opus",
+            "copilot",
+            "claude-opus-4.7",
+        );
+        cfg.routes[0].reasoning_mapping = vec![
+            MappingRuleConfig {
+                r#match: "max".into(),
+                set: "xhigh".into(),
+            },
+            MappingRuleConfig {
+                r#match: "high".into(),
+                set: "xhigh".into(),
+            },
+        ];
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus")
+            .unwrap();
+        let policy = &chain[0].policy;
+        assert_eq!(policy.reasoning_mapping.len(), 2);
+        assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max,);
+        assert_eq!(policy.reasoning_mapping[0].set, ReasoningEffort::Xhigh,);
+        assert_eq!(policy.reasoning_mapping[1].r#match, ReasoningEffort::High,);
+    }
+
+    #[test]
+    fn mapping_config_skips_unknown_effort_strings() {
+        // Validation should have rejected these before reaching the router,
+        // but the router applies a belt-and-braces filter_map so a hand-built
+        // fixture with a typo doesn't panic — it just drops the bad row.
+        use agent_shim_config::MappingRuleConfig;
+        let mut cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-opus",
+            "copilot",
+            "claude-opus-4.7",
+        );
+        cfg.routes[0].reasoning_mapping = vec![
+            MappingRuleConfig {
+                r#match: "bogus".into(),
+                set: "high".into(),
+            },
+            MappingRuleConfig {
+                r#match: "max".into(),
+                set: "xhigh".into(),
+            },
+        ];
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus")
+            .unwrap();
+        let policy = &chain[0].policy;
+        assert_eq!(policy.reasoning_mapping.len(), 1);
+        assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max,);
     }
 }

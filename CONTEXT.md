@@ -22,22 +22,44 @@ A backend service the gateway can talk to (e.g. DeepSeek, Copilot, Ollama). Conf
 **Router**
 The component that resolves `(frontend_kind, model_alias) → BackendTarget` from the route table.
 
+**Model index** *(`ModelIndex`)*
+Per-provider map of `BTreeMap<String, ModelMetadata>` populated from each upstream's `/models` response at startup (and on `POST /admin/reload` / SIGHUP). Backs both the existing fuzzy resolver (used during `Router::resolve` to upgrade `gpt-4o` → `gpt-4o-2024-11-20`) and the new catalog surfaces (`/v1/models`, `/admin/catalog`, `agent-shim show-catalog`). Lives in `agent-shim-router::model_index`.
+
+**Model catalog** *(`ModelCatalog`)*
+The composed view of (a) the route table — which model aliases AgentShim accepts on which frontend — and (b) the upstream-discovered capabilities for each alias's `BackendTarget`. Built by `ModelResolver::list_catalog` from the same inputs `resolve` consumes. Surfaced on `GET /v1/models` (public, OpenAI shape) and `GET /admin/catalog` (operator, with policy extras).
+
+**Model record** *(`ModelRecord`)*
+One entry in the catalog. Carries the alias, the resolved upstream chain head, the full chain (length 1 for singular routes, N for fallback chains), the upstream metadata, and the same-family long-context sibling alias if any. Lives in `agent-shim-core::catalog`.
+
+**Model metadata** *(`ModelMetadata`)*
+Structured upstream capability blob: context window, max output tokens, family, supports flags (vision, tool calls, streaming, structured outputs, reasoning effort), version. The same struct backs `ModelIndex` entries and `ModelRecord.metadata`. Lives in `agent-shim-core::catalog`.
+
 **BackendTarget**
 The output of route resolution. Identifies the upstream provider, the model name to send upstream, and the **route policy** for this route.
 
 **Route policy** *(`RoutePolicy`)*
-Per-route defaults that fill in when the inbound request didn't supply a value. Today: default reasoning effort, default `anthropic-beta` header. Owns the **policy merge rule** — "inbound wins, else route default, else nothing." Lives in `agent-shim-core::policy`.
+Per-route defaults that fill in when the inbound request didn't supply a value. Today: default reasoning effort, default `anthropic-beta` header, and a **reasoning mapping table**. Owns the **policy merge rule** — "inbound wins, else route default, else nothing." Lives in `agent-shim-core::policy`.
 
 **Resolved policy** *(`ResolvedPolicy`)*
 The output of `RoutePolicy::resolve(canonical_request)`. A per-request snapshot of the merged values, stored on `CanonicalRequest.resolved_policy`. Providers read from this; they do not consult `RoutePolicy` directly.
 
 **Reasoning effort**
-Qualitative thinking-effort level: `minimal | low | medium | high | xhigh`. Cross-dialect translation:
-- Anthropic `thinking: { budget_tokens }` → `ReasoningOptions.budget_tokens`
-- OpenAI `reasoning_effort` → `ReasoningOptions.effort`
-- OpenAI Responses `reasoning.effort` → `ReasoningOptions.effort`
+Qualitative thinking-effort level drawn from the six-value canonical vocabulary `minimal | low | medium | high | xhigh | max`. Cross-dialect translation is per-direction:
+- Anthropic inbound `output_config.effort` (`effort-2025-11-24` beta) → `ReasoningOptions.effort`
+- OpenAI Chat inbound `reasoning_effort` (`minimal/low/medium/high`) → `ReasoningOptions.effort`
+- OpenAI Responses inbound `reasoning.effort` → `ReasoningOptions.effort`
+- Outbound Anthropic: `Minimal → "low"` (no minimal upstream); else identity
+- Outbound OpenAI Chat (non-Copilot) and Responses API: `Xhigh|Max → "high"`
+- Outbound Copilot Chat (`accepts_xhigh = true`): `Xhigh|Max → "xhigh"`
 
-Forwarded outbound as `reasoning_effort` (chat completions) or `reasoning.effort` (Responses API).
+**Reasoning mapping table** *(`reasoning_mapping`)*
+Optional per-route ordered list of `{ match, set }` rules over canonical effort. First rule whose `match` equals the post-default inbound effort fires its `set`; unmatched passes through. Both fields are canonical-vocabulary effort strings (`minimal/low/medium/high/xhigh/max`), NOT raw inbound or outbound dialect strings. Lives in `agent-shim-core::policy::RoutePolicy`.
+
+**Mapping rule** *(`MappingRule`)*
+One entry in a reasoning mapping table — `{ match: ReasoningEffort, set: ReasoningEffort }`.
+
+**Effort vocabulary**
+Six canonical levels: `Minimal | Low | Medium | High | Xhigh | Max`. The 2026-05-28 mapping spec retired the older five-value list by adding `Max`, and the mapping table operates exclusively on this vocabulary (not on per-dialect strings).
 
 **Anthropic beta header**
 An `anthropic-beta` HTTP header value (e.g. `context-1m-2025-08-07`) that toggles a feature without changing the model name. Captured from the inbound request, replayed verbatim on the outbound, with a per-route fallback.

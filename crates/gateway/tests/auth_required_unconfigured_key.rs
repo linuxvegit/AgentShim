@@ -126,6 +126,7 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
             min_tier: None,
             max_cost_usd: None,
             plugins: None,
+            reasoning_mapping: vec![],
         }],
         plugins: ::std::collections::BTreeMap::new(),
         auth,
@@ -135,6 +136,7 @@ fn make_config(upstream_url: &str, known_hash: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 

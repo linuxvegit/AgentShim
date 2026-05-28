@@ -67,6 +67,7 @@ impl TextOnlyStubProvider {
                 tool_use: false,
                 vision: false,
                 json_mode: false,
+                accepts_xhigh: false,
             },
         }
     }
@@ -139,6 +140,7 @@ fn make_app_state() -> AppState {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     };
     let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));
     let model_index = Arc::new(ModelIndex::new(Default::default()));
