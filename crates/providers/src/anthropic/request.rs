@@ -21,8 +21,8 @@ use agent_shim_core::{
 use serde_json::{json, Value};
 
 use super::wire::{
-    OutgoingContentBlock, OutgoingMessage, OutgoingRequest, OutgoingSystem, OutgoingThinking,
-    OutgoingTool, OutgoingToolChoice, OutgoingToolResultContent,
+    OutgoingContentBlock, OutgoingMessage, OutgoingOutputConfig, OutgoingRequest, OutgoingSystem,
+    OutgoingThinking, OutgoingTool, OutgoingToolChoice, OutgoingToolResultContent,
 };
 
 /// Anthropic API requires `max_tokens`. Use this when the canonical request
@@ -55,7 +55,7 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
     let system = build_system(&req.system);
     let tools = build_tools(req);
     let tool_choice = build_tool_choice(&req.tool_choice);
-    let thinking = build_thinking(req);
+    let (thinking, output_config) = build_reasoning_blocks(req);
     let metadata = build_metadata(req);
     let max_tokens = req.generation.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
@@ -79,6 +79,7 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
         stream: req.stream,
         metadata,
         thinking,
+        output_config,
     };
 
     serde_json::to_value(&outgoing).unwrap_or(Value::Null)
@@ -287,17 +288,73 @@ fn build_tool_choice(choice: &ToolChoice) -> Option<OutgoingToolChoice> {
     }
 }
 
-// ── thinking ────────────────────────────────────────────────────────────────
+// ── reasoning blocks ────────────────────────────────────────────────────────
 
-fn build_thinking(req: &CanonicalRequest) -> Option<OutgoingThinking> {
-    let reasoning = req.generation.reasoning.as_ref()?;
-    let budget = reasoning
-        .budget_tokens
-        .or_else(|| reasoning.effort.map(effort_to_budget))?;
-    Some(OutgoingThinking {
-        ty: "enabled",
-        budget_tokens: budget,
-    })
+/// Build the `thinking` / `output_config` pair for the outbound body.
+///
+/// Two wire shapes coexist:
+///
+/// * **`effort-2025-11-24` beta** — when the route policy carries the
+///   `anthropic-beta: effort-2025-11-24` header, emit
+///   `thinking: {type: "adaptive"}` with NO `budget_tokens`, plus
+///   `output_config: {effort: "..."}` for the canonical effort.
+/// * **Legacy** — otherwise, emit `thinking: {type: "enabled", budget_tokens}`
+///   derived from either the resolved policy's explicit budget or, failing
+///   that, an effort→budget table.
+fn build_reasoning_blocks(
+    req: &CanonicalRequest,
+) -> (Option<OutgoingThinking>, Option<OutgoingOutputConfig>) {
+    let effort = req.resolved_policy.reasoning_effort;
+    if effort.is_none() && req.resolved_policy.reasoning_budget_tokens.is_none() {
+        return (None, None);
+    }
+
+    let use_effort_beta = req.resolved_policy.anthropic_headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("anthropic-beta")
+            && v.split(',').any(|seg| seg.trim() == "effort-2025-11-24")
+    });
+
+    if use_effort_beta {
+        // New shape: adaptive thinking + explicit output_config.effort.
+        // Default to High when only a budget was supplied but no effort —
+        // Adaptive mode requires the effort signal to surface.
+        let e = effort.unwrap_or(ReasoningEffort::High);
+        (
+            Some(OutgoingThinking {
+                ty: "adaptive",
+                budget_tokens: None,
+            }),
+            Some(OutgoingOutputConfig {
+                effort: anthropic_effort_str(e),
+            }),
+        )
+    } else {
+        // Legacy shape: thinking.budget_tokens.
+        let budget = req
+            .resolved_policy
+            .reasoning_budget_tokens
+            .or_else(|| effort.map(effort_to_budget));
+        budget.map_or((None, None), |b| {
+            (
+                Some(OutgoingThinking {
+                    ty: "enabled",
+                    budget_tokens: Some(b),
+                }),
+                None,
+            )
+        })
+    }
+}
+
+fn anthropic_effort_str(e: ReasoningEffort) -> &'static str {
+    match e {
+        ReasoningEffort::Minimal => "low", // Anthropic has no minimal
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+    }
 }
 
 fn effort_to_budget(effort: ReasoningEffort) -> u32 {
@@ -342,7 +399,7 @@ mod tests {
         media::BinarySource,
         message::{Message, MessageRole, SystemInstruction, SystemSource},
         request::{
-            CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
+            CanonicalRequest, GenerationOptions, ReasoningEffort, RequestMetadata,
         },
         target::{FrontendInfo, FrontendKind, FrontendModel},
         tool::{ToolCallBlock, ToolDefinition, ToolResultBlock},
@@ -549,13 +606,13 @@ mod tests {
 
     #[test]
     fn thinking_with_explicit_budget_is_emitted() {
+        // Per 2026-05-28 spec, the canonical pipeline always populates
+        // `resolved_policy` — the provider reads from there, not from
+        // `generation.reasoning`.
         let mut req = empty_request(false);
         req.messages
             .push(Message::user(vec![ContentBlock::text("hi")]));
-        req.generation.reasoning = Some(ReasoningOptions {
-            effort: None,
-            budget_tokens: Some(4096),
-        });
+        req.resolved_policy.reasoning_budget_tokens = Some(4096);
         let body = build(&req, &target());
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
@@ -566,20 +623,20 @@ mod tests {
         let mut req = empty_request(false);
         req.messages
             .push(Message::user(vec![ContentBlock::text("hi")]));
-        req.generation.reasoning = Some(ReasoningOptions {
-            effort: Some(ReasoningEffort::High),
-            budget_tokens: None,
-        });
+        req.resolved_policy.reasoning_effort = Some(ReasoningEffort::High);
         let body = build(&req, &target());
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
     }
 
     #[test]
     fn thinking_omitted_when_neither_field_set() {
+        // Under the 2026-05-28 contract the provider reads only from
+        // `resolved_policy`. Leaving both effort and budget unset there
+        // must produce no `thinking` field, regardless of what may sit
+        // on `req.generation.reasoning`.
         let mut req = empty_request(false);
         req.messages
             .push(Message::user(vec![ContentBlock::text("hi")]));
-        req.generation.reasoning = Some(ReasoningOptions::default());
         let body = build(&req, &target());
         assert!(body.get("thinking").is_none());
     }

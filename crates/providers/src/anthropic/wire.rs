@@ -41,6 +41,8 @@ pub(crate) struct OutgoingRequest {
     pub(crate) metadata: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) thinking: Option<OutgoingThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output_config: Option<OutgoingOutputConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,7 +60,13 @@ pub(crate) enum OutgoingSystem {
 pub(crate) struct OutgoingThinking {
     #[serde(rename = "type")]
     pub(crate) ty: &'static str,
-    pub(crate) budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) budget_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OutgoingOutputConfig {
+    pub(crate) effort: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
