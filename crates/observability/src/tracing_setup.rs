@@ -59,6 +59,16 @@ pub fn init(log: &LoggingConfig, otel_cfg: Option<&OtelConfig>) -> TracingHandle
     // to collect both into a single `Vec<Box<dyn Layer<Registry>>>`, which
     // itself implements `Layer<Registry>` and applies all inner layers at
     // once. Plan windows-service P02 T5.
+    //
+    // IMPORTANT: an EMPTY `Vec<Box<dyn Layer<S>>>` short-circuits the
+    // whole subscriber — its `Layer::enabled` returns false, which masks
+    // events from any downstream layer (including the stdout `fmt`
+    // layer). When `otel_layer` and `file_layer` are both `None`, we
+    // must wrap with `Option::None` instead of an empty Vec so the
+    // composite layer is absent rather than disabled. Symptom otherwise:
+    // foreground `agent-shim serve` with neither otel nor file logging
+    // emits zero stdout — present since Plan windows-service P02 T5
+    // introduced the Vec.
     let mut composite: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
     if let Some(otel) = otel_layer {
         composite.push(Box::new(otel));
@@ -66,15 +76,24 @@ pub fn init(log: &LoggingConfig, otel_cfg: Option<&OtelConfig>) -> TracingHandle
     if let Some(file) = file_layer {
         composite.push(file);
     }
+    let composite = if composite.is_empty() {
+        None
+    } else {
+        Some(composite)
+    };
 
     let registry = tracing_subscriber::registry().with(composite).with(filter);
 
     match log.format {
         LogFormat::Json => {
-            let _ = registry.with(fmt::layer().json()).try_init();
+            if let Err(e) = registry.with(fmt::layer().json()).try_init() {
+                eprintln!("WARNING: tracing subscriber init failed: {e}");
+            }
         }
         LogFormat::Pretty => {
-            let _ = registry.with(fmt::layer().pretty()).try_init();
+            if let Err(e) = registry.with(fmt::layer().pretty()).try_init() {
+                eprintln!("WARNING: tracing subscriber init failed: {e}");
+            }
         }
     }
 
@@ -233,5 +252,78 @@ mod tests {
         let handles = init(&cfg, Some(&otel));
         assert!(handles.otel.is_none(), "no endpoint → no OtelHandle");
         assert!(handles.file_guard.is_none(), "no file cfg → no guard");
+    }
+
+    /// Regression: when neither `logging.file` nor `otel.endpoint` is
+    /// configured, the empty `Vec<Box<dyn Layer<S>>>` previously fed to
+    /// `registry.with(composite)` was treated as a Layer whose
+    /// `enabled()` returned false, short-circuiting the entire
+    /// subscriber and silencing the stdout `fmt` layer. The fix wraps
+    /// the composite as `Option<Vec<_>>` so the empty case becomes
+    /// `None` (a true no-op layer) instead of an empty Vec (a deny-all
+    /// layer).
+    ///
+    /// This test verifies the no-emit symptom isn't present by
+    /// installing a custom capture layer alongside the fmt layer: if
+    /// the empty composite (Option::None) wired up by `init` does not
+    /// short-circuit, our capture sees the events. We can't observe
+    /// stdout directly from inside a test (`fmt::layer` writes to the
+    /// process stdout), so we use a side-channel layer.
+    #[test]
+    fn no_file_no_otel_does_not_silence_subscriber() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Subscriber;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct CaptureLayer(Arc<Mutex<Vec<String>>>);
+
+        impl<S: Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                let mut s = format!("{}: ", event.metadata().target());
+                struct V<'a>(&'a mut String);
+                impl<'a> tracing::field::Visit for V<'a> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write;
+                        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                    }
+                }
+                event.record(&mut V(&mut s));
+                self.0.lock().unwrap().push(s);
+            }
+        }
+
+        // We can't use `init` here because it calls try_init globally
+        // and we need an isolated subscriber for the test. Instead,
+        // replicate the exact subscriber-construction logic from `init`
+        // with the fix in place and run it with `with_default`.
+        let capture = CaptureLayer::default();
+        let composite: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
+        let composite = if composite.is_empty() {
+            None
+        } else {
+            Some(composite)
+        };
+        let filter = EnvFilter::new("info");
+        let subscriber = tracing_subscriber::registry()
+            .with(composite)
+            .with(filter)
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "regression_test", "event must be visible");
+        });
+
+        let events = capture.0.lock().unwrap();
+        assert!(
+            events.iter().any(|s| s.contains("regression_test")),
+            "Empty composite Vec must NOT short-circuit downstream \
+             layers. Captured events: {:?}",
+            *events
+        );
     }
 }
