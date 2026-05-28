@@ -31,10 +31,7 @@
 //!    `response.output_text.{delta,done}` on output_index 0 (rs_0) then
 //!    output_index 1 (msg_1).
 
-use agent_shim_core::{
-    request::{ReasoningEffort, ReasoningOptions},
-    BackendTarget, FrontendKind,
-};
+use agent_shim_core::{request::ReasoningEffort, BackendTarget, FrontendKind};
 use agent_shim_frontends::{openai_responses::OpenAiResponses, FrontendProtocol, FrontendResponse};
 use agent_shim_protocol_tests::{
     collect_sse, make_canonical_request, make_gemini_provider, TEST_CLOCK,
@@ -101,15 +98,13 @@ async fn responses_to_gemini_thinking_round_trip() {
         .await;
 
     // Build a Responses-flavored request and turn on Medium effort. The
-    // canonical pipeline normally copies `generation.reasoning.effort` into
-    // `resolved_policy.reasoning_effort` via `RoutePolicy::resolve`, but
-    // since this is a standalone test we exercise source #3 (request-level
-    // effort) of the `thinking_config` precedence ladder.
+    // canonical pipeline normally surfaces effort via `RoutePolicy::resolve`
+    // → `resolved_policy.reasoning_effort`. Per the 2026-05-28 spec the
+    // Gemini provider reads from `resolved_policy` only, so we populate it
+    // directly here instead of relying on the now-retired
+    // `req.generation.reasoning.effort` fallback (Plan A Task 11).
     let mut req = make_canonical_request(true, FrontendKind::OpenAiResponses);
-    req.generation.reasoning = Some(ReasoningOptions {
-        effort: Some(ReasoningEffort::Medium),
-        budget_tokens: None,
-    });
+    req.resolved_policy.reasoning_effort = Some(ReasoningEffort::Medium);
 
     // Provider produces a CanonicalStream from the upstream Gemini JSON array.
     let provider = make_gemini_provider(server.url());
