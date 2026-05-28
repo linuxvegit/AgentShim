@@ -311,8 +311,7 @@ impl AppState {
                     tracing::info!(provider = %name, count = models.len(), "discovered models");
                     // ModelIndex currently takes BTreeSet<String>; convert
                     // until Plan B Task 3 migrates ModelIndex to BTreeMap.
-                    let names: std::collections::BTreeSet<String> =
-                        models.into_keys().collect();
+                    let names: std::collections::BTreeSet<String> = models.into_keys().collect();
                     discovered.insert(name.clone(), names);
                 }
                 Ok(None) => {

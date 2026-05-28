@@ -398,9 +398,7 @@ mod tests {
         ids::{RequestId, ToolCallId},
         media::BinarySource,
         message::{Message, MessageRole, SystemInstruction, SystemSource},
-        request::{
-            CanonicalRequest, GenerationOptions, ReasoningEffort, RequestMetadata,
-        },
+        request::{CanonicalRequest, GenerationOptions, ReasoningEffort, RequestMetadata},
         target::{FrontendInfo, FrontendKind, FrontendModel},
         tool::{ToolCallBlock, ToolDefinition, ToolResultBlock},
     };

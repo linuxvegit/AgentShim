@@ -273,8 +273,6 @@ impl BackendProvider for OpenAiCompatibleProvider {
     }
 }
 
-use std::collections::BTreeMap;
-
 /// Forward Anthropic-style negotiation headers onto the outbound HTTP request.
 /// Reads the merged snapshot from `req.resolved_policy` — the gateway has
 /// already applied the inbound-vs-route-default merge.

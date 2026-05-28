@@ -640,7 +640,11 @@ mod tests {
 
     #[test]
     fn xhigh_compresses_to_high_when_target_rejects() {
-        let body = build(&req_with_effort(ReasoningEffort::Xhigh), &target("m"), false);
+        let body = build(
+            &req_with_effort(ReasoningEffort::Xhigh),
+            &target("m"),
+            false,
+        );
         assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
     }
 
@@ -672,4 +676,3 @@ mod tests {
         }
     }
 }
-

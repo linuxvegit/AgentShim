@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
-use agent_shim_core::{policy::MappingRule, request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy};
+use agent_shim_core::{
+    policy::MappingRule, request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy,
+};
 
 use crate::{RouteError, Router};
 
@@ -80,10 +82,7 @@ impl StaticRouter {
                 .filter_map(|rule| {
                     let m = ReasoningEffort::parse(&rule.r#match)?;
                     let s = ReasoningEffort::parse(&rule.set)?;
-                    Some(MappingRule {
-                        r#match: m,
-                        set: s,
-                    })
+                    Some(MappingRule { r#match: m, set: s })
                 })
                 .collect();
             let policy = RoutePolicy {
@@ -481,18 +480,9 @@ mod tests {
             .unwrap();
         let policy = &chain[0].policy;
         assert_eq!(policy.reasoning_mapping.len(), 2);
-        assert_eq!(
-            policy.reasoning_mapping[0].r#match,
-            ReasoningEffort::Max,
-        );
-        assert_eq!(
-            policy.reasoning_mapping[0].set,
-            ReasoningEffort::Xhigh,
-        );
-        assert_eq!(
-            policy.reasoning_mapping[1].r#match,
-            ReasoningEffort::High,
-        );
+        assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max,);
+        assert_eq!(policy.reasoning_mapping[0].set, ReasoningEffort::Xhigh,);
+        assert_eq!(policy.reasoning_mapping[1].r#match, ReasoningEffort::High,);
     }
 
     #[test]
@@ -523,9 +513,6 @@ mod tests {
             .unwrap();
         let policy = &chain[0].policy;
         assert_eq!(policy.reasoning_mapping.len(), 1);
-        assert_eq!(
-            policy.reasoning_mapping[0].r#match,
-            ReasoningEffort::Max,
-        );
+        assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max,);
     }
 }

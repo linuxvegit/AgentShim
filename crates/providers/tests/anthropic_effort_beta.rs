@@ -4,11 +4,11 @@
 //! back to the legacy `thinking: {type:"enabled", budget_tokens}` shape when
 //! the beta is absent.
 
+use agent_shim_core::{policy::ResolvedPolicy, request::ReasoningEffort};
 use agent_shim_core::{
     BackendTarget, CanonicalRequest, ContentBlock, ExtensionMap, FrontendInfo, FrontendKind,
     FrontendModel, GenerationOptions, Message, RequestId,
 };
-use agent_shim_core::{policy::ResolvedPolicy, request::ReasoningEffort};
 
 fn req_with_effort_and_beta(effort: ReasoningEffort, has_effort_beta: bool) -> CanonicalRequest {
     let mut headers = vec![];

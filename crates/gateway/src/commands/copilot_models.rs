@@ -31,7 +31,7 @@ pub async fn run(credential_path: Option<PathBuf>) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to list models: {e}"))?;
 
-    for (id, _meta) in &model_ids {
+    for id in model_ids.keys() {
         println!("  {}", id);
     }
     println!("\n{} models available", model_ids.len());

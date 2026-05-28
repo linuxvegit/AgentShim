@@ -974,7 +974,7 @@ default_headers:
         assert_eq!(entry.upstream_model.as_deref(), Some("gpt-4o-2024-11-20"));
         assert!(entry.upstreams.is_empty());
         assert_eq!(entry.retry.max_attempts, 2); // §4.5 default
-        // Mapping table defaults to empty so existing routes are unaffected.
+                                                 // Mapping table defaults to empty so existing routes are unaffected.
         assert!(entry.reasoning_mapping.is_empty());
     }
 
