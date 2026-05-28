@@ -1,5 +1,6 @@
 pub mod anthropic_count_tokens;
 pub mod anthropic_messages;
+pub mod models;
 pub mod openai_chat;
 pub mod openai_responses;
 

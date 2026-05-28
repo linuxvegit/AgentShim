@@ -18,6 +18,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/chat/completions", post(handlers::openai_chat::handle))
         .route("/v1/responses", post(handlers::openai_responses::handle))
+        .route("/v1/models", get(handlers::models::list))
+        .route("/v1/models/:id", get(handlers::models::get_one))
         .layer(TraceLayer::new_for_http())
         .layer(crate::metrics_layer::MetricsLayer)
         .layer(RequestIdLayer)
