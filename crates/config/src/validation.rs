@@ -505,6 +505,26 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
         if route.breaker.min_requests == 0 {
             return Err(format!("route[{i}] breaker.min_requests must be >= 1"));
         }
+
+        // Rule 7: reasoning_mapping entries must use known canonical effort
+        // strings on both `match` and `set`. Validated here (rather than at
+        // serde-decode time) so the error message can name the offending
+        // route. Unknown values are a configuration mistake, not a future
+        // extension — refuse to start.
+        for (idx, rule) in route.reasoning_mapping.iter().enumerate() {
+            if agent_shim_core::request::ReasoningEffort::parse(&rule.r#match).is_none() {
+                return Err(format!(
+                    "route[{i}] '{}/{}' reasoning_mapping[{}].match has unknown effort '{}' (expected one of: minimal, low, medium, high, xhigh, max)",
+                    route.frontend, route.model, idx, rule.r#match
+                ));
+            }
+            if agent_shim_core::request::ReasoningEffort::parse(&rule.set).is_none() {
+                return Err(format!(
+                    "route[{i}] '{}/{}' reasoning_mapping[{}].set has unknown effort '{}' (expected one of: minimal, low, medium, high, xhigh, max)",
+                    route.frontend, route.model, idx, rule.set
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1280,6 +1300,64 @@ mod tests {
         );
         let err = validate_routes(&cfg).unwrap_err();
         assert!(err.contains("no upstream configured"));
+    }
+
+    #[test]
+    fn invalid_effort_in_mapping_match_is_rejected() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            reasoning_mapping:
+              - match: super-mega
+                set: high
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(
+            err.contains("reasoning_mapping") && err.contains("super-mega"),
+            "expected error to mention reasoning_mapping and the bad value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_effort_in_mapping_set_is_rejected() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            reasoning_mapping:
+              - match: high
+                set: ultra
+        "#,
+        );
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(
+            err.contains("reasoning_mapping") && err.contains("ultra"),
+            "expected error to mention reasoning_mapping and the bad value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn valid_reasoning_mapping_accepted() {
+        let cfg = make_cfg_with_route_yaml(
+            r#"
+            frontend: openai_chat
+            model: gpt-4o
+            upstream: openai
+            upstream_model: gpt-4o
+            reasoning_mapping:
+              - match: max
+                set: xhigh
+              - match: high
+                set: xhigh
+        "#,
+        );
+        validate_routes(&cfg).expect("valid mapping should pass");
     }
 
     #[test]
