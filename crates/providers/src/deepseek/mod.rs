@@ -12,7 +12,7 @@ pub(crate) mod request;
 pub(crate) mod response;
 pub(crate) mod usage;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -64,6 +64,7 @@ impl DeepseekProvider {
                 tool_use: true,
                 vision: false,
                 json_mode: true,
+                accepts_xhigh: false,
             },
         })
     }
@@ -156,7 +157,12 @@ impl BackendProvider for DeepseekProvider {
         }
     }
 
-    async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
+    async fn list_models(
+        &self,
+    ) -> Result<
+        Option<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>,
+        ProviderError,
+    > {
         let url = self.models_url();
         let resp = self
             .client
@@ -181,7 +187,8 @@ impl BackendProvider for DeepseekProvider {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                    .collect::<BTreeSet<String>>()
+                    .map(|id| (id, agent_shim_core::ModelMetadata::default()))
+                    .collect::<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>()
             })
             .unwrap_or_default();
 

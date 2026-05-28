@@ -5,7 +5,6 @@ pub mod headers;
 pub mod models;
 pub mod token_manager;
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -86,6 +85,12 @@ impl CopilotProvider {
                 // unsupported-tool-use is handled today.
                 vision: true,
                 json_mode: true,
+                // Per 2026-05-28 reasoning-effort spec: Copilot Claude on the
+                // Chat path accepts `reasoning_effort: "xhigh"` as a non-OpenAI
+                // extension. Encoder uses this flag to decide whether to
+                // serialise canonical Xhigh/Max as `"xhigh"` or compress to
+                // `"high"`.
+                accepts_xhigh: true,
             },
         })
     }
@@ -108,6 +113,7 @@ impl CopilotProvider {
                 tool_use: true,
                 vision: true,
                 json_mode: true,
+                accepts_xhigh: true,
             },
         })
     }
@@ -285,7 +291,12 @@ impl BackendProvider for CopilotProvider {
         }
     }
 
-    async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
+    async fn list_models(
+        &self,
+    ) -> Result<
+        Option<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>,
+        ProviderError,
+    > {
         let token = self.manager.get().await?;
         // Discovery hop — spec D8 carve-out: outbound `traceparent` is
         // intentionally NOT injected on `models.list`. The escape hatch

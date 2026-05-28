@@ -51,6 +51,7 @@ impl OpenAiCompatibleProvider {
                 tool_use: true,
                 vision: true,
                 json_mode: true,
+                accepts_xhigh: false,
             },
         })
     }
@@ -164,7 +165,12 @@ impl BackendProvider for OpenAiCompatibleProvider {
         }
     }
 
-    async fn list_models(&self) -> Result<Option<BTreeSet<String>>, ProviderError> {
+    async fn list_models(
+        &self,
+    ) -> Result<
+        Option<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>,
+        ProviderError,
+    > {
         let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
         let resp = self
             .client
@@ -189,7 +195,8 @@ impl BackendProvider for OpenAiCompatibleProvider {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                    .collect::<BTreeSet<String>>()
+                    .map(|id| (id, agent_shim_core::ModelMetadata::default()))
+                    .collect::<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>()
             })
             .unwrap_or_default();
 
@@ -262,7 +269,7 @@ impl BackendProvider for OpenAiCompatibleProvider {
     }
 }
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 /// Forward Anthropic-style negotiation headers onto the outbound HTTP request.
 /// Reads the merged snapshot from `req.resolved_policy` — the gateway has
@@ -324,9 +331,9 @@ mod tests {
                 .unwrap();
 
         let result = provider.list_models().await.unwrap().unwrap();
-        assert!(result.contains("gpt-4o"));
-        assert!(result.contains("gpt-4o-mini"));
-        assert!(result.contains("deepseek-chat"));
+        assert!(result.contains_key("gpt-4o"));
+        assert!(result.contains_key("gpt-4o-mini"));
+        assert!(result.contains_key("deepseek-chat"));
         assert_eq!(result.len(), 3);
         mock.assert_async().await;
     }

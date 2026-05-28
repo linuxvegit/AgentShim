@@ -34,6 +34,9 @@ pub struct ProviderCapabilities {
     pub tool_use: bool,
     pub vision: bool,
     pub json_mode: bool,
+    /// Provider's OpenAI-Chat-shape upstream accepts `reasoning_effort: "xhigh"`
+    /// as a non-OpenAI extension. Today: Copilot only.
+    pub accepts_xhigh: bool,
 }
 
 #[derive(Debug, Error)]
@@ -64,7 +67,10 @@ pub trait BackendProvider: Send + Sync {
 
     async fn list_models(
         &self,
-    ) -> Result<Option<std::collections::BTreeSet<String>>, ProviderError> {
+    ) -> Result<
+        Option<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>,
+        ProviderError,
+    > {
         Ok(None)
     }
 
@@ -149,6 +155,7 @@ mod tests {
                 tool_use: false,
                 vision: false,
                 json_mode: false,
+                accepts_xhigh: false,
             }
         }
         async fn complete(

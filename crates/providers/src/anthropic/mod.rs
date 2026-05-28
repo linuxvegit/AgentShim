@@ -73,6 +73,7 @@ impl AnthropicProvider {
                 tool_use: true,
                 vision: true,
                 json_mode: false,
+                accepts_xhigh: false,
             },
         })
     }
