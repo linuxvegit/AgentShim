@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capabilities;
+pub mod catalog;
 pub mod content;
 pub mod cost;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod tool;
 pub mod usage;
 
 pub use capabilities::ProviderCapabilities;
+pub use catalog::{ModelCatalog, ModelMetadata, ModelRecord, ModelSupports, UpstreamRef};
 pub use content::*;
 pub use error::{CoreError, StreamError};
 pub use extensions::ExtensionMap;
