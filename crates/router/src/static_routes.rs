@@ -282,6 +282,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         }
     }
 
@@ -390,6 +391,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         };
         let router = StaticRouter::from_config(&cfg);
         let chain = router.resolve(FrontendKind::OpenAiChat, "gpt-4o").unwrap();

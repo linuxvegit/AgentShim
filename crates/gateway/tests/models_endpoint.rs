@@ -109,12 +109,7 @@ async fn list_returns_openai_shape_envelope() {
 
 #[tokio::test]
 async fn get_one_returns_known_alias() {
-    let cfg = cfg_with_routes(&[(
-        "openai_chat",
-        "gpt-5.5",
-        "openai",
-        "gpt-5.5",
-    )]);
+    let cfg = cfg_with_routes(&[("openai_chat", "gpt-5.5", "openai", "gpt-5.5")]);
     let (state, _rx) = AppState::new(cfg).await.unwrap();
     let app = build_router(state);
 
@@ -170,12 +165,7 @@ async fn frontend_filter_narrows_results() {
 async fn capability_filter_with_no_metadata_yields_empty() {
     // Discovery fails against the unreachable upstream → metadata is None
     // → ?capability=vision filters out every record (no metadata can satisfy).
-    let cfg = cfg_with_routes(&[(
-        "openai_chat",
-        "gpt-5.5",
-        "openai",
-        "gpt-5.5",
-    )]);
+    let cfg = cfg_with_routes(&[("openai_chat", "gpt-5.5", "openai", "gpt-5.5")]);
     let (state, _rx) = AppState::new(cfg).await.unwrap();
     let app = build_router(state);
 

@@ -82,9 +82,7 @@ const THRESHOLD: f64 = 0.5;
 impl ModelIndex {
     /// Primary constructor: takes the metadata-bearing per-provider map. The
     /// fuzzy resolver is built from the same map's keys.
-    pub fn with_metadata(
-        providers: HashMap<String, BTreeMap<String, ModelMetadata>>,
-    ) -> Self {
+    pub fn with_metadata(providers: HashMap<String, BTreeMap<String, ModelMetadata>>) -> Self {
         let fuzzy = providers
             .iter()
             .map(|(provider, map)| {
@@ -185,10 +183,7 @@ impl ModelIndex {
 
     /// Enumerate all `(model_id, metadata)` pairs for one provider, ordered
     /// by model id (`BTreeMap` iteration order). Used by catalog builders.
-    pub fn provider_models(
-        &self,
-        provider: &str,
-    ) -> impl Iterator<Item = (&str, &ModelMetadata)> {
+    pub fn provider_models(&self, provider: &str) -> impl Iterator<Item = (&str, &ModelMetadata)> {
         self.metadata
             .get(provider)
             .into_iter()

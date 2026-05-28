@@ -46,9 +46,7 @@ pub async fn list_models(
 /// Pure parser, exposed for tests. Walks the upstream `data: [...]` array
 /// and synthesises a [`ModelMetadata`] per item. Items without `capabilities`
 /// or fields therein deserialise to `None` cleanly (via `Option<>` fields).
-pub fn parse_models_response(
-    raw: &str,
-) -> Result<BTreeMap<String, ModelMetadata>, ProviderError> {
+pub fn parse_models_response(raw: &str) -> Result<BTreeMap<String, ModelMetadata>, ProviderError> {
     let json: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| ProviderError::Decode(format!("models response: {e}")))?;
 

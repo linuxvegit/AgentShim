@@ -147,15 +147,17 @@ impl ModelResolver {
                     model: t.model.clone(),
                 })
                 .collect();
-            let entry = by_alias.entry(alias.clone()).or_insert_with(|| ModelRecord {
-                id: alias.clone(),
-                frontends: Vec::new(),
-                upstream_provider: head.provider.clone(),
-                upstream_model: head.model.clone(),
-                upstreams_chain,
-                metadata,
-                long_context_variant: None,
-            });
+            let entry = by_alias
+                .entry(alias.clone())
+                .or_insert_with(|| ModelRecord {
+                    id: alias.clone(),
+                    frontends: Vec::new(),
+                    upstream_provider: head.provider.clone(),
+                    upstream_model: head.model.clone(),
+                    upstreams_chain,
+                    metadata,
+                    long_context_variant: None,
+                });
             if !entry.frontends.contains(&frontend) {
                 entry.frontends.push(frontend);
             }
@@ -196,9 +198,7 @@ impl ModelResolver {
                             .and_then(|m| m.context_window_tokens)
                             .unwrap_or(0);
                         let cur_ctx = variant
-                            .and_then(|v| {
-                                v.metadata.as_ref().and_then(|m| m.context_window_tokens)
-                            })
+                            .and_then(|v| v.metadata.as_ref().and_then(|m| m.context_window_tokens))
                             .unwrap_or(0);
                         if other_ctx > cur_ctx {
                             variant = Some(other);
@@ -414,12 +414,7 @@ mod tests {
 
     #[test]
     fn list_catalog_collapses_same_alias_on_multiple_frontends() {
-        let mut cfg = cfg_with_route(
-            "anthropic_messages",
-            "shared",
-            "copilot",
-            "claude-opus-4.7",
-        );
+        let mut cfg = cfg_with_route("anthropic_messages", "shared", "copilot", "claude-opus-4.7");
         cfg.routes.push(RouteEntry::singular(
             "openai_chat",
             "shared",
