@@ -1379,6 +1379,7 @@ mod tests {
             tool_use: false,
             vision: false,
             json_mode: false,
+            accepts_xhigh: false,
         };
         let req = req_with_content(vec![ContentBlock::text("hi")]);
         assert!(check_capabilities(&req, &caps).is_ok());
@@ -1391,6 +1392,7 @@ mod tests {
             tool_use: false,
             vision: true,
             json_mode: false,
+            accepts_xhigh: false,
         };
         let req = req_with_content(vec![ContentBlock::text("describe"), img_block()]);
         assert!(check_capabilities(&req, &caps).is_ok());
@@ -1403,6 +1405,7 @@ mod tests {
             tool_use: false,
             vision: false,
             json_mode: false,
+            accepts_xhigh: false,
         };
         let req = req_with_content(vec![img_block()]);
         let err = check_capabilities(&req, &caps).unwrap_err();

@@ -87,6 +87,7 @@ impl CapturingStubProvider {
                 tool_use: false,
                 vision: false,
                 json_mode: false,
+                accepts_xhigh: false,
             },
             last_request: captured,
         }

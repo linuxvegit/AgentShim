@@ -71,6 +71,7 @@ impl StaticRouter {
             let policy = RoutePolicy {
                 default_reasoning_effort,
                 default_anthropic_beta: entry.anthropic_beta.clone(),
+                reasoning_mapping: Vec::new(),
             };
 
             // Build the full fallback chain from either the singular (v0.3)

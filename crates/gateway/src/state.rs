@@ -309,7 +309,11 @@ impl AppState {
             match provider.list_models().await {
                 Ok(Some(models)) => {
                     tracing::info!(provider = %name, count = models.len(), "discovered models");
-                    discovered.insert(name.clone(), models);
+                    // ModelIndex currently takes BTreeSet<String>; convert
+                    // until Plan B Task 3 migrates ModelIndex to BTreeMap.
+                    let names: std::collections::BTreeSet<String> =
+                        models.into_keys().collect();
+                    discovered.insert(name.clone(), names);
                 }
                 Ok(None) => {
                     tracing::debug!(provider = %name, "provider does not support model discovery");

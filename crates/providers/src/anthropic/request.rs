@@ -307,6 +307,7 @@ fn effort_to_budget(effort: ReasoningEffort) -> u32 {
         ReasoningEffort::Medium => 2048,
         ReasoningEffort::High => 8192,
         ReasoningEffort::Xhigh => 16384,
+        ReasoningEffort::Max => 16384,
     }
 }
 

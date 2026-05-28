@@ -467,6 +467,7 @@ fn effort_to_budget(effort: ReasoningEffort) -> i64 {
         ReasoningEffort::Medium => 1024,
         ReasoningEffort::High => 4096,
         ReasoningEffort::Xhigh => 16384,
+        ReasoningEffort::Max => 24576,
     }
 }
 

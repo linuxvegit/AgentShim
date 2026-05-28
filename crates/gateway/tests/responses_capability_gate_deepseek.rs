@@ -67,6 +67,7 @@ impl TextOnlyStubProvider {
                 tool_use: false,
                 vision: false,
                 json_mode: false,
+                accepts_xhigh: false,
             },
         }
     }
