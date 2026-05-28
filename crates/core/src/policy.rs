@@ -43,6 +43,13 @@ pub struct ResolvedPolicy {
     /// Final reasoning effort to forward to the upstream, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Final reasoning token budget to forward, if any. This is the
+    /// quantitative axis still used by Gemini and by the legacy Anthropic
+    /// `thinking.budget_tokens` shape. It is independent of `reasoning_effort`
+    /// — both may be `Some` (effort drives the effort dialect; budget drives
+    /// any provider that quantizes from a number).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
     /// Final `anthropic-*` headers to attach to the upstream HTTP request.
     /// Order is stable; duplicates are not collapsed (callers may pass
     /// comma-separated values verbatim).
@@ -85,6 +92,7 @@ impl RoutePolicy {
 
         ResolvedPolicy {
             reasoning_effort,
+            reasoning_budget_tokens: None,
             anthropic_headers,
         }
     }
@@ -201,5 +209,15 @@ mod tests {
             Some("2023-06-01")
         );
         assert_eq!(resolved.anthropic_header("anthropic-beta"), Some("ctx-1m"));
+    }
+
+    #[test]
+    fn resolved_policy_carries_budget_tokens() {
+        let rp = ResolvedPolicy {
+            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_budget_tokens: Some(8192),
+            anthropic_headers: vec![],
+        };
+        assert_eq!(rp.reasoning_budget_tokens, Some(8192));
     }
 }
