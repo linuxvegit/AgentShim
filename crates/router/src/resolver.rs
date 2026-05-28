@@ -35,6 +35,14 @@ impl ModelResolver {
         }
     }
 
+    /// Direct accessor for the embedded model index. Most callers should
+    /// use `resolve` / `list_catalog`; this exists for the gateway's
+    /// strict-upstream-models startup check which needs to enumerate the
+    /// full discovered catalog without re-fetching it.
+    pub fn model_index(&self) -> &ModelIndex {
+        &self.model_index
+    }
+
     /// Resolve the inbound `(frontend, model_alias)` to the full fallback
     /// chain of [`BackendTarget`]s. Looks up the static route (which may
     /// already be a multi-element fallback chain for `upstreams: [...]`
@@ -248,6 +256,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         }
     }
 
@@ -354,6 +363,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         };
         let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
 

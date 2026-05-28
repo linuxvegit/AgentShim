@@ -125,6 +125,7 @@ fn make_config(a_url: &str, b_url: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 

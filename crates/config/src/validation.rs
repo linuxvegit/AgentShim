@@ -80,6 +80,22 @@ pub enum ValidationError {
     /// still slip through. Phase 7 spec §5.3.
     #[error("duplicate plugin name: `{0}`")]
     DuplicatePluginName(String),
+
+    /// Plan B Task 9: a route's `upstream_model` is not in the
+    /// upstream's discovered catalog. Surfaced only when
+    /// `validation.strict_upstream_models = true`. The default
+    /// permissive mode logs a warning instead so configs that point at
+    /// upstreams without a `/models` endpoint (or otherwise don't
+    /// support discovery) still start.
+    #[error(
+        "route `{route_id}` references upstream `{upstream}` model `{model}` \
+         which is not present in the discovered model catalog"
+    )]
+    UnknownUpstreamModel {
+        route_id: String,
+        upstream: String,
+        model: String,
+    },
 }
 
 /// What "baseline" means for reload validation. Built from the running
@@ -841,6 +857,60 @@ pub fn validate_for_reload(
     Ok(diff)
 }
 
+/// Plan B Task 9 strict typo detector. Cross-references each route's
+/// `(upstream, upstream_model)` (and every chain element of multi-upstream
+/// routes) against the discovered model catalog. Surfaces the first
+/// mismatch as an error when `validation.strict_upstream_models` is `true`;
+/// returns `Ok(())` immediately otherwise.
+///
+/// `discovered` is a slice of `(provider_name, model_ids)` pairs — the
+/// shape produced by walking the gateway's [`ModelIndex`]. Providers
+/// that returned `None` from `list_models` MUST be omitted from this
+/// slice; checking against an empty list for an undiscoverable provider
+/// would always fail-closed and defeat the opt-in property.
+///
+/// Wildcard routes (`model == "*"`, `upstream_model == "*"`) are skipped:
+/// the catalog typo only applies to explicit alias → upstream-model
+/// mappings.
+pub fn validate_with_index(
+    cfg: &crate::schema::GatewayConfig,
+    discovered: &[(String, Vec<String>)],
+) -> Result<(), ValidationError> {
+    if !cfg.validation.strict_upstream_models {
+        return Ok(());
+    }
+    for entry in &cfg.routes {
+        // Collect (upstream, upstream_model) pairs for both the singular
+        // and array-form routes; skip wildcards.
+        let pairs: Vec<(String, String)> = if !entry.upstreams.is_empty() {
+            entry
+                .upstreams
+                .iter()
+                .filter(|u| u.model != "*")
+                .map(|u| (u.name.clone(), u.model.clone()))
+                .collect()
+        } else {
+            match (entry.upstream.as_deref(), entry.upstream_model.as_deref()) {
+                (Some(u), Some(m)) if m != "*" => vec![(u.to_string(), m.to_string())],
+                _ => Vec::new(),
+            }
+        };
+        for (upstream, model) in pairs {
+            let found = discovered
+                .iter()
+                .any(|(p, models)| p == &upstream && models.iter().any(|m| m == &model));
+            if !found {
+                return Err(ValidationError::UnknownUpstreamModel {
+                    route_id: format!("{}/{}", entry.frontend, entry.model),
+                    upstream,
+                    model,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,6 +932,7 @@ mod tests {
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         }
     }
 
@@ -2095,6 +2166,7 @@ routes:
             metrics: Default::default(),
             otel: None,
             shutdown: Default::default(),
+            validation: Default::default(),
         }
     }
 
@@ -2322,5 +2394,142 @@ routes: []
             plugin_flush_secs: 300,
         };
         assert!(validate(&cfg).is_ok());
+    }
+
+    // ── Plan B Task 9: validate_with_index ──────────────────────────────
+
+    fn cfg_with_route_for_validate_with_index(
+        frontend: &str,
+        model: &str,
+        upstream: &str,
+        upstream_model: &str,
+    ) -> GatewayConfig {
+        serde_yaml::from_str::<GatewayConfig>(&format!(
+            r#"
+upstreams:
+  {upstream}:
+    type: open_ai_compatible
+    base_url: http://example.com/v1
+    api_key: dummy
+    tier: standard
+routes:
+  - frontend: {frontend}
+    model: {model}
+    upstream: {upstream}
+    upstream_model: {upstream_model}
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_with_index_is_noop_when_strict_off() {
+        let cfg = cfg_with_route_for_validate_with_index("openai_chat", "x", "openai", "gpt-99999");
+        // strict_upstream_models defaults to false → the routes-vs-catalog
+        // mismatch is silently tolerated.
+        let discovered = vec![("openai".to_string(), vec!["gpt-4o".to_string()])];
+        assert!(validate_with_index(&cfg, &discovered).is_ok());
+    }
+
+    #[test]
+    fn validate_with_index_rejects_unknown_upstream_model_in_strict() {
+        let mut cfg =
+            cfg_with_route_for_validate_with_index("openai_chat", "x", "openai", "gpt-99999");
+        cfg.validation.strict_upstream_models = true;
+        let discovered = vec![("openai".to_string(), vec!["gpt-4o".to_string()])];
+        let err = validate_with_index(&cfg, &discovered).unwrap_err();
+        match err {
+            ValidationError::UnknownUpstreamModel {
+                upstream, model, ..
+            } => {
+                assert_eq!(upstream, "openai");
+                assert_eq!(model, "gpt-99999");
+            }
+            other => panic!("expected UnknownUpstreamModel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_with_index_accepts_known_upstream_model_in_strict() {
+        let mut cfg =
+            cfg_with_route_for_validate_with_index("openai_chat", "x", "openai", "gpt-4o");
+        cfg.validation.strict_upstream_models = true;
+        let discovered = vec![("openai".to_string(), vec!["gpt-4o".to_string()])];
+        assert!(validate_with_index(&cfg, &discovered).is_ok());
+    }
+
+    #[test]
+    fn validate_with_index_skips_wildcards() {
+        // Wildcards (model: "*", upstream_model: "*") must be skipped —
+        // they don't enumerate a concrete alias, so the catalog typo
+        // check doesn't apply. Build the route by hand because YAML
+        // anchor parsing treats bare `*` as an alias reference, not a
+        // string literal.
+        let route = crate::schema::RouteEntry {
+            frontend: "openai_chat".into(),
+            model: "*".into(),
+            upstream: Some("openai".into()),
+            upstream_model: Some("*".into()),
+            upstreams: vec![],
+            reasoning_effort: None,
+            anthropic_beta: None,
+            retry: Default::default(),
+            breaker: Default::default(),
+            min_tier: None,
+            max_cost_usd: None,
+            plugins: None,
+            reasoning_mapping: vec![],
+        };
+        let mut cfg = mk_cfg_with_routes(vec![route]);
+        cfg.validation.strict_upstream_models = true;
+        let discovered: Vec<(String, Vec<String>)> = vec![];
+        assert!(validate_with_index(&cfg, &discovered).is_ok());
+    }
+
+    #[test]
+    fn validate_with_index_walks_each_chain_element() {
+        // Build a multi-upstream route by hand — the YAML form for
+        // `upstreams: [...]` is a different parse path; for tests we
+        // construct GatewayConfig directly.
+        let cfg = serde_yaml::from_str::<GatewayConfig>(
+            r#"
+upstreams:
+  good:
+    type: open_ai_compatible
+    base_url: http://example.com/v1
+    api_key: dummy
+    tier: standard
+  bad:
+    type: open_ai_compatible
+    base_url: http://example.com/v1
+    api_key: dummy
+    tier: standard
+routes:
+  - frontend: openai_chat
+    model: gpt-x
+    upstreams:
+      - name: good
+        model: gpt-4o
+      - name: bad
+        model: nope
+validation:
+  strict_upstream_models: true
+"#,
+        )
+        .unwrap();
+        let discovered = vec![
+            ("good".to_string(), vec!["gpt-4o".to_string()]),
+            ("bad".to_string(), vec!["something-else".to_string()]),
+        ];
+        let err = validate_with_index(&cfg, &discovered).unwrap_err();
+        match err {
+            ValidationError::UnknownUpstreamModel {
+                upstream, model, ..
+            } => {
+                assert_eq!(upstream, "bad");
+                assert_eq!(model, "nope");
+            }
+            other => panic!("expected UnknownUpstreamModel, got {other:?}"),
+        }
     }
 }

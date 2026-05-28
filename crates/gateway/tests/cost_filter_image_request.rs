@@ -130,6 +130,7 @@ fn make_config(upstream_url: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 

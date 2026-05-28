@@ -65,6 +65,7 @@ fn cfg_with_routes(specs: &[(&str, &str, &str, &str)]) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 

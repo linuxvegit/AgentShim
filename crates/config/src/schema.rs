@@ -36,6 +36,26 @@ pub struct GatewayConfig {
     /// Shutdown lifecycle config. Phase 7 P05 §8.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// Optional cross-cutting validation toggles (Plan B Task 9).
+    /// See [`ValidationConfig`] for individual fields.
+    #[serde(default)]
+    pub validation: ValidationConfig,
+}
+
+/// Cross-cutting validation toggles. Each field defaults to its
+/// permissive value (typically `false`) so existing configs keep
+/// loading. Operators opt into stricter behaviour explicitly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ValidationConfig {
+    /// When true, refuse to start if any route's `upstream_model`
+    /// doesn't appear in the discovered upstream catalog. Catches typos
+    /// like `claude-opus-47` against an upstream that only exposes
+    /// `claude-opus-4.7`. Off by default because not every upstream
+    /// returns a catalog (some `BackendProvider::list_models` impls
+    /// return `None`); enabling this against such an upstream would
+    /// always fail-closed.
+    pub strict_upstream_models: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

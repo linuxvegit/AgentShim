@@ -37,6 +37,34 @@ where
     let tracing_handles = agent_shim_observability::init(&cfg.logging, cfg.otel.as_ref());
     let (mut state, mut reload_rx) = crate::state::AppState::new(cfg).await?;
 
+    // Plan B Task 9: strict-upstream-models catalog typo detection. The
+    // discovered ModelIndex isn't fully populated until AppState::new
+    // returns, so we run the check here (post-startup, pre-bind). The
+    // current config is captured in the snapshot we just built.
+    {
+        let snap = state.snapshot.load_full();
+        if snap.config.validation.strict_upstream_models {
+            let index = state.core.resolver.model_index();
+            let discovered: Vec<(String, Vec<String>)> = index
+                .providers()
+                .map(|p| {
+                    let models: Vec<String> = index
+                        .provider_models(p)
+                        .map(|(name, _meta)| name.to_string())
+                        .collect();
+                    (p.to_string(), models)
+                })
+                .collect();
+            agent_shim_config::validate_with_index(&snap.config, &discovered).map_err(|e| {
+                anyhow::anyhow!(
+                    "strict_upstream_models validation failed: {} \
+                     (set validation.strict_upstream_models: false in config to downgrade)",
+                    e
+                )
+            })?;
+        }
+    }
+
     // Plan 04 P04 T4: pin the `--config` path onto `AppCore` so the
     // SIGHUP listener and `POST /admin/reload` (with no body) can re-read
     // the original file. `AppState::new` constructs `AppCore` without a

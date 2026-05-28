@@ -152,6 +152,7 @@ fn make_chat_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 
@@ -226,6 +227,7 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
         metrics: Default::default(),
         otel: None,
         shutdown: Default::default(),
+        validation: Default::default(),
     }
 }
 
