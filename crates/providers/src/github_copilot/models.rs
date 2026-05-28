@@ -1,13 +1,19 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+
+use agent_shim_core::ModelMetadata;
 
 use super::token_manager::CopilotToken;
 use crate::ProviderError;
 
-/// Fetch the list of available model IDs from the Copilot API.
+/// Fetch the list of available models from the Copilot API.
+///
+/// Task 2 transitional implementation: returns an empty `ModelMetadata` for
+/// each discovered id. Task 3 rewrites this to parse the full capability
+/// blob.
 pub async fn list_models(
     http: &reqwest::Client,
     token: &CopilotToken,
-) -> Result<BTreeSet<String>, ProviderError> {
+) -> Result<BTreeMap<String, ModelMetadata>, ProviderError> {
     let url = format!("{}/models", token.api_base.trim_end_matches('/'));
     let resp = http
         .get(&url)
@@ -37,11 +43,11 @@ pub async fn list_models(
         .await
         .map_err(|e| ProviderError::Decode(format!("models response: {e}")))?;
 
-    let mut ids = BTreeSet::new();
+    let mut ids = BTreeMap::new();
     if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
         for item in data {
             if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                ids.insert(id.to_string());
+                ids.insert(id.to_string(), ModelMetadata::default());
             }
         }
     }
