@@ -403,10 +403,33 @@ fn decode_tools(
                 }
                 builtin.push(raw);
             }
+            // Forward-compatibility: OpenAI/codex periodically introduces new
+            // built-in tool types (e.g. `namespace`, `mcp`, `local_shell`).
+            // Treat any unknown type as an opaque built-in: preserve every
+            // top-level field as raw JSON so the byte-passthrough path can
+            // forward it verbatim to an OpenAI-Responses-native upstream.
+            // The canonical chain walk (non-passthrough) loses these tools
+            // because they have no canonical representation -- that mirrors
+            // the v0.8 behavior for `web_search` et al. routing to Anthropic.
             other => {
-                return Err(FrontendError::InvalidBody(format!(
-                    "unknown tool type: {other}"
-                )));
+                let mut raw = serde_json::json!({"type": other});
+                if let Some(name) = &tool.name {
+                    raw["name"] = serde_json::Value::String(name.clone());
+                }
+                if let Some(desc) = &tool.description {
+                    raw["description"] = serde_json::Value::String(desc.clone());
+                }
+                if let Some(params) = &tool.parameters {
+                    raw["parameters"] = params.clone();
+                }
+                if let Some(function) = &tool.function {
+                    raw["function"] = serde_json::json!({
+                        "name": function.name,
+                        "description": function.description,
+                        "parameters": function.parameters,
+                    });
+                }
+                builtin.push(raw);
             }
         }
     }
@@ -472,6 +495,39 @@ mod tests {
         assert!(req.tools.is_empty());
         let builtin = req.extensions.get("builtin_tools").unwrap();
         assert_eq!(builtin.as_array().unwrap().len(), 1);
+    }
+
+    /// Forward-compatibility: codex 0.5+ and future OpenAI Responses clients
+    /// emit tool types we don't enumerate (`namespace`, `mcp`, `local_shell`,
+    /// etc.). These must survive decode -- the byte-passthrough path then
+    /// forwards the original request body verbatim to the upstream, which
+    /// is the authority on whether the tool type is valid.
+    #[test]
+    fn decode_unknown_tool_type_becomes_builtin_passthrough() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": "Hi",
+            "tools": [
+                {"type":"namespace","name":"agent","description":"agent ns"},
+                {"type":"mcp","name":"my_mcp","parameters":{"server":"x"}},
+                {"type":"local_shell"}
+            ]
+        }"#;
+        let req = decode(body).expect("unknown tool types should not hard-fail");
+        assert!(req.tools.is_empty());
+        let builtin = req
+            .extensions
+            .get("builtin_tools")
+            .expect("builtin_tools key present")
+            .as_array()
+            .expect("builtin_tools is an array");
+        assert_eq!(builtin.len(), 3);
+        assert_eq!(builtin[0]["type"], "namespace");
+        assert_eq!(builtin[0]["name"], "agent");
+        assert_eq!(builtin[0]["description"], "agent ns");
+        assert_eq!(builtin[1]["type"], "mcp");
+        assert_eq!(builtin[1]["parameters"]["server"], "x");
+        assert_eq!(builtin[2]["type"], "local_shell");
     }
 
     #[test]
