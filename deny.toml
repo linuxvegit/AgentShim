@@ -1,9 +1,41 @@
 [advisories]
 yanked = "deny"
-unmaintained = "all"     # was: "warn"
+unmaintained = "all"
+# Time-boxed ignores — revisit on or before 2026-08-29.
+# Surfaced 2026-05-29 by the cargo-deny 0.19 schema modernization.
+# Each is a transitive dependency; resolution requires upstream
+# bumps tracked separately from the v0.8 admission unification work.
+#
+# RUSTSEC-2025-0052: async-std discontinued, pulled via
+#   opentelemetry_sdk. Resolution: bump opentelemetry-* crates
+#   when an upstream release drops the async-std dependency.
+# RUSTSEC-2025-0134: rustls-pemfile unmaintained, pulled via
+#   eventsource-client -> hyper-rustls -> rustls-native-certs.
+#   Resolution: bump eventsource-client / rustls stack.
+# RUSTSEC-2026-0098 / 0099 / 0104: rustls-webpki 0.101.7
+#   name-constraint + wildcard + CRL-parse issues. Fixed in
+#   0.102.x. Resolution: bump rustls-webpki via rustls bump.
+ignore = [
+  "RUSTSEC-2025-0052",
+  "RUSTSEC-2025-0134",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
+]
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-DFS-2016", "Zlib"]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "BSD-2-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "Zlib",
+]
 confidence-threshold = 0.9
 
 [bans]
