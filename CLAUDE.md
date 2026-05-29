@@ -1,81 +1,89 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository. Keep this file short — additions land only when they prevent a real mistake.
 
-## Build & Test Commands
+## Build & Test
 
 ```bash
-cargo build --workspace                    # Build all crates
-cargo build --release -p agent-shim        # Release binary
+cargo build --workspace
+cargo build --release -p agent-shim
 
-cargo fmt --all -- --check                 # Check formatting
-cargo clippy --workspace --all-targets     # Lint (treat warnings as errors in CI)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings   # CI treats warnings as errors
 
-cargo nextest run --workspace              # Run all tests (preferred)
-cargo nextest run -p agent-shim-frontends  # Single crate
-cargo nextest run cancellation_fuzz_anthropic  # Single test by name
-cargo test --workspace                     # Fallback if nextest unavailable
+cargo nextest run --workspace          # preferred
+cargo nextest run -p agent-shim-frontends    # single crate
+cargo nextest run cancellation_fuzz_anthropic   # single test
+cargo test --workspace                 # fallback
 
-cargo deny check                           # License & advisory check
+cargo deny check                       # licenses + advisories
 ```
 
-Run the server:
-```bash
-agent-shim serve --config config/gateway.yaml
-agent-shim validate-config --config gateway.yaml
+**Windows binary-locked rebuild.** If `cargo build --release` fails with `Access is denied (os error 5)`, a running `agent-shim.exe` is holding the file. Rename the locked exe (Windows allows rename of a running binary) and rebuild — it auto-cleans next time the holder exits:
+
+```powershell
+Rename-Item target\release\agent-shim.exe target\release\agent-shim.exe.OLD-by-<PID>
+cargo build --release -p agent-shim
 ```
+
+CLI surface: `serve`, `validate-config`, `show-catalog [--format json|table] [--strict]`, `copilot login|models [--format json|table]`, `service install|...` (Windows).
 
 ## Architecture
 
-AgentShim is a protocol-translating API gateway that lets AI agents (Claude Code, Cursor, etc.) talk to any LLM backend through their native protocol. Agents send Anthropic or OpenAI requests; the gateway translates to/from a canonical internal model, routes to the configured backend, and streams back in the agent's expected format.
-
-### Request Flow
+Protocol-translating gateway. Agents send Anthropic Messages, OpenAI Chat, or OpenAI Responses; the gateway decodes to a canonical model, routes per `(frontend, model)`, re-encodes to the upstream's native shape.
 
 ```
-Agent HTTP Request → FrontendProtocol::decode_request → CanonicalRequest
-  → Router::resolve(frontend, model) → BackendTarget
-  → BackendProvider::complete(req, target) → CanonicalStream
-  → FrontendProtocol::encode_stream → SSE HTTP Response
+HTTP req → FrontendProtocol::decode_request → CanonicalRequest
+       → RoutePolicy::resolve → ResolvedPolicy (effort + mapping + headers)
+       → Router::resolve → BackendTarget chain
+       → BackendProvider::complete → CanonicalStream
+       → FrontendProtocol::encode_stream → SSE response
 ```
 
-### Crate Dependency Layers
-
 ```
-gateway (binary: axum server, CLI, handlers)
-├── frontends (Anthropic Messages + OpenAI Chat adapters)
-├── providers (OpenAI-compatible + GitHub Copilot clients)
-├── router (model alias → backend resolution)
-├── observability (tracing, request IDs, header redaction)
-├── config (YAML schema, env overlay, secrets, validation)
-└── core (canonical data model, zero I/O, #![forbid(unsafe_code)])
+gateway (binary, pipeline, handlers, admin)
+├── frontends   — anthropic_messages, openai_chat, openai_responses
+├── providers   — openai_compat, github_copilot, anthropic, deepseek, gemini
+├── router      — alias resolution, ModelIndex, ResilientCaller, cost filter
+├── plugins     — H2/H3/H5/H7 hook registry + builtin
+├── observability(+derive) — tracing/OTel/Prometheus, file logging, `#[derive(Metric)]`
+├── tokens      — cl100k for cost + compressor
+├── config, protocol-tests
+└── core        — canonical model, ResolvedPolicy, ModelMetadata, #![forbid(unsafe_code)]
 ```
 
-### Boundary Rule
+**Boundary:** frontends and providers never import each other. Both depend only on `core`. The gateway binary is the sole wiring point. Translation happens only at the two edges.
 
-Frontends and providers must never import each other. Both depend only on `core`. The gateway binary is the sole wiring point. Translation happens only at the two edges.
+**Key traits:**
+- `FrontendProtocol` — `decode_request`, `encode_unary`, `encode_stream`, `kind()`.
+- `BackendProvider` — `complete()`, `list_models() -> Option<BTreeMap<String, ModelMetadata>>` (None = no catalog), `proxy_raw()` optional for byte-passthrough.
 
-### Key Traits
+**Canonical model (frozen-core):** providers read `CanonicalRequest::resolved_policy`, never raw inbound headers. `ReasoningEffort` is `Minimal|Low|Medium|High|Xhigh|Max`; encoders compress per-provider (`xhigh`/`max` → `"high"` for OpenAI Chat/Responses; Copilot passes through via `ProviderCapabilities::accepts_xhigh`; Anthropic emits `output_config.effort` + adaptive thinking under `anthropic-beta: effort-2025-11-24`).
 
-- **`FrontendProtocol`** (frontends): `decode_request`, `encode_unary`, `encode_stream`
-- **`BackendProvider`** (providers): `async fn complete() → CanonicalStream`
-
-### Canonical Model (core)
-
-`CanonicalRequest` / `CanonicalStream` / `StreamEvent` / `CanonicalResponse` — protocol-neutral types that both edges translate to/from. `StreamEvent` is a tagged enum: `ResponseStart`, `TextDelta`, `ToolCallArgumentsDelta`, `UsageDelta`, `MessageStop`, etc.
-
-### Streaming
-
-Encoding is fully lazy — `encode_stream` returns a `BoxStream<Bytes>` that pulls from upstream on demand. Dropping the output stream propagates backpressure to the provider connection. SSE keepalive is configurable (default 15s).
+**Streaming:** `encode_stream` returns `BoxStream<Bytes>` that pulls lazily; dropping it backpressures the provider. SSE keepalive default 15s.
 
 ## Configuration
 
-YAML config with env variable overlay using `AGENT_SHIM__` prefix (double underscores for nesting). All config structs use `deny_unknown_fields` — typos fail at startup. API keys use `Secret<String>` newtype that prevents debug/log output.
+YAML with `AGENT_SHIM__`-prefixed env overlay (double underscores nest). Every struct uses `#[serde(deny_unknown_fields)]` — typos fail at startup. API keys: `Secret<String>` newtype (no Debug/Display leakage).
 
-## Code Conventions
+Per-route knobs: `reasoning_effort` (default), `reasoning_mapping: [{ match, set }, …]` (first-match rewrite), `anthropic_beta` (default header), `plugins: { h2: [...], … }`.
 
-- `thiserror` in library crates, `anyhow` only at binary boundary
-- `#![forbid(unsafe_code)]` in all crates except gateway
-- `async-trait` only where dyn dispatch needed
-- `serde_json::RawValue` for byte-accurate tool call argument passthrough
-- Max line width 100 (`rustfmt.toml`)
-- Property-based tests with `proptest`, mock server tests with `mockito`
+Validation/logging toggles: `validation.strict_upstream_models` (hard-fail typos), `logging.print_catalog_on_start` (dump catalog to stderr after discovery).
+
+## Conventions
+
+- `thiserror` in libs; `anyhow` only at the binary boundary.
+- `#![forbid(unsafe_code)]` everywhere except `gateway`.
+- `async-trait` only where dyn dispatch is needed.
+- `serde_json::RawValue` for byte-accurate tool-call args.
+- New `serde` fields additive: `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps wire compatibility.
+- Max line width 100 (`rustfmt.toml`).
+- Property tests `proptest`; mock HTTP `mockito`.
+- Workspace version at `workspace.package.version`; bump once per release, crates inherit via `version.workspace = true`.
+
+## Hard-won Traps
+
+- **Empty `Vec<Box<dyn Layer<S>>>` is deny-all.** In `tracing_subscriber` 0.3, an empty Vec wrapped via `.with(...)` short-circuits the whole subscriber. When optional layers may be absent, wrap as `Option<Vec<_>>`; `None` is a true no-op. Caused stdout silence in v0.7 → fixed in v0.8 `tracing_setup::init`.
+- **`let _ = try_init()` is a debugging black hole.** Surface the error (`eprintln!` at startup; `tracing::warn!` later).
+- **`proxy_raw` log emission belongs in the success arm.** Per-request `→` log inside `Ok(Some(_))` only — otherwise non-applicable frontends double-log via the canonical fall-through.
+- **One catalog read site.** `ModelIndex::metadata(provider, model)` feeds logs, `/v1/models`, `/admin/catalog`, `show-catalog`, and `copilot models`. Populate once via `ModelIndex::with_metadata` at startup; don't re-query upstream per request.
