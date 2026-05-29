@@ -155,12 +155,19 @@ fn make_app_state(plugins: Arc<PluginRegistry>) -> (AppState, Arc<MetricsHandle>
     let limiter_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
         agent_shim_router::LimiterRegistry::disabled(),
     ));
+    let latency_probe = Arc::new(agent_shim_router::DisabledLatencyProbe)
+        as Arc<dyn agent_shim_router::LatencyProbe>;
+    let admission = Arc::new(agent_shim_router::Admission::new(
+        Arc::clone(&limiter_registry),
+        Arc::clone(&breaker_registry),
+        Arc::clone(&provider_lookup),
+        Arc::clone(&latency_probe),
+    ));
     let resilient_caller = Arc::new(ResilientCaller::new(
         provider_lookup,
         Arc::clone(&breaker_registry),
         Arc::clone(&limiter_registry),
-        Arc::new(agent_shim_router::DisabledLatencyProbe)
-            as Arc<dyn agent_shim_router::LatencyProbe>,
+        Arc::clone(&latency_probe),
     ));
 
     let metrics = agent_shim_observability::install_metrics(&Default::default());
@@ -176,6 +183,7 @@ fn make_app_state(plugins: Arc<PluginRegistry>) -> (AppState, Arc<MetricsHandle>
             providers,
             resolver,
             resilient_caller,
+            admission,
             breaker_registry,
             limiter_registry,
             metrics: metrics.clone(),

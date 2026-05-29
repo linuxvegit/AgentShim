@@ -3,9 +3,9 @@
 //! The gateway owns the inbound-protocol decision (it sees the route via
 //! `FrontendKind`), so the per-frontend image-token math also lives here.
 //! `select_image_estimator` returns a `&'static dyn ImageTokenEstimator`
-//! of the matching shape; the resilience layer threads it through
-//! [`agent_shim_router::CostFilterInputs::image_estimator`] so the cost-cap
-//! pre-pass charges image blocks at the same rate the upstream will bill.
+//! of the matching shape; the admission layer threads it into the cost filter
+//! so the cost-cap pre-pass charges image blocks at the same rate the
+//! upstream will bill.
 //!
 //! `'static` is sound because every estimator is a unit struct (zero-sized,
 //! trivially shareable across threads); we hand out references to module-

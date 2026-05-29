@@ -232,6 +232,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "futures",
+ "futures-core",
  "governor",
  "metrics",
  "nonzero_ext",

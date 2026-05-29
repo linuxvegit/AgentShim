@@ -35,16 +35,19 @@
 //! `crates/observability/src/request_id.rs`. A future task should plumb a
 //! real `Context { request_id }` from the pipeline.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
-use agent_shim_core::{BackendTarget, CanonicalRequest, CanonicalStream};
+use agent_shim_core::{CanonicalRequest, CanonicalStream, StreamError, StreamEvent};
 use agent_shim_providers::{BackendProvider, ProviderError};
+use futures_core::Stream;
 use tracing::Instrument;
 
+use crate::admission::AdmissionTicket;
 use crate::errors::{ResilienceError, TriedUpstream};
 use crate::fallback::{fallback_eligibility_with_overrides, FallbackEligibility};
-use crate::policy_vec::PolicyVec;
 use crate::retry::{retry_with_policy, RetryPolicy};
 
 /// Trait abstraction over the provider registry so tests can substitute a
@@ -53,41 +56,12 @@ pub trait ProviderLookup: Send + Sync {
     fn get(&self, provider: &str) -> Option<Arc<dyn BackendProvider>>;
 }
 
-/// Plan 06 P04 T4: inputs required by the cost filter when `complete()`
-/// is asked to run a pre-chain four-axis pass.
-///
-/// Bundled into a single optional struct so existing call sites (tests
-/// that build a `ResilientCaller` without any route/config context) can
-/// continue to pass `None` and get the v0.4 chain-walk semantics
-/// unchanged. The pipeline always supplies `Some(...)`.
-pub struct CostFilterInputs<'a> {
-    /// The matching route entry, source of `min_tier` and `max_cost_usd`.
-    pub route: &'a agent_shim_config::RouteEntry,
-    /// The full gateway config, used to look up per-upstream
-    /// `tier`/`cost`/`p95_latency_budget_ms`.
-    pub config: &'a agent_shim_config::GatewayConfig,
-    /// Stable label for `agent_shim_cost_filtered_total{route=...}`.
-    /// Pre-computed by the caller so all resilience metrics for one
-    /// request share a single string form (typically
-    /// `"<frontend>/<model>"`).
-    pub route_label: String,
-    /// Per-request image-token estimator. The gateway selects this
-    /// from the inbound `FrontendKind` and stashes a reference here.
-    /// `cost_filter` passes it through to `estimate_request_cost` so
-    /// image blocks contribute to the per-route cost-cap pre-pass.
-    /// Plan v0.6.1 P04 (M-8).
-    pub image_estimator: &'a dyn agent_shim_core::cost::ImageTokenEstimator,
-}
-
 /// The resilience-layer entry point.
 pub struct ResilientCaller {
     providers: Arc<dyn ProviderLookup>,
-    breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
-    limiters: Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>>,
-    /// Plan 06 P04 T4: latency observation source for the cost filter's
-    /// latency axis. Production wires `PrometheusLatencyProbe`; tests
-    /// that don't care about latency filtering pass `DisabledLatencyProbe`.
-    probe: Arc<dyn crate::latency_probe::LatencyProbe>,
+    _breakers: Arc<crate::circuit_breaker::BreakerRegistry>,
+    _limiters: Arc<arc_swap::ArcSwap<crate::rate_limit::LimiterRegistry>>,
+    _probe: Arc<dyn crate::latency_probe::LatencyProbe>,
 }
 
 impl ResilientCaller {
@@ -99,222 +73,39 @@ impl ResilientCaller {
     ) -> Self {
         Self {
             providers,
-            breakers,
-            limiters,
-            probe,
+            _breakers: breakers,
+            _limiters: limiters,
+            _probe: probe,
         }
     }
 
-    /// Walk the chain. Each element gets its own retry budget. Fallback
-    /// to chain[i+1] only on retry exhaustion with a fallback-eligible
-    /// error; terminal errors short-circuit.
-    ///
-    /// The breaker gate runs before each chain element:
-    /// - `Skip` → continue to chain[i+1] without consuming retries.
-    /// - `Probe` → fall through; `record()` resets `probe_in_flight`.
-    /// - `Allow` → normal path.
-    ///
-    /// Plan 04 P04 T4: rate-limit gates layered around the chain walk:
-    /// - Pre-chain (per-key + per-route + per-IP): runs once before the
-    ///   chain walk. First rejecting bucket short-circuits the request.
-    /// - Per-upstream: runs inside the chain walk on each element after
-    ///   the breaker gate. A rejection returns `RateLimited{PerUpstream}`
-    ///   immediately — no fallback to the next chain element.
-    ///
-    /// `#[allow(clippy::too_many_arguments)]`: the parameters are the
-    /// minimum needed to fully describe the request — chain, body,
-    /// per-element retry/breaker policies, and identity/IP/model for
-    /// the rate-limit gates. Bundling them into a struct would just
-    /// move the verbosity to the caller without buying anything.
-    ///
-    /// Plan 06 P04 T4: the cost-filter pre-pass is exposed via a
-    /// separate entry point [`Self::complete_with_cost_filter`]; this
-    /// method skips it, preserving v0.4 semantics for callers (notably
-    /// the unit tests in this module) that don't supply a `RouteEntry`
-    /// or `GatewayConfig`.
-    #[allow(clippy::too_many_arguments)]
+    /// Walk the admitted chain. Each element gets its own retry budget.
+    /// Fallback to chain[i+1] only on retry exhaustion with a fallback-
+    /// eligible last error; terminal errors short-circuit.
     pub async fn complete(
         &self,
-        chain: Vec<BackendTarget>,
+        ticket: AdmissionTicket,
         req: CanonicalRequest,
-        retry_policies: Vec<RetryPolicy>,
-        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
-        identity: crate::auth::AgentIdentity,
-        client_ip: String,
-        frontend_model: String,
     ) -> Result<CanonicalStream, ResilienceError> {
-        let chain_len = chain.len();
-        let retry_policies =
-            PolicyVec::new(retry_policies, chain_len).expect("one retry policy per chain element");
-        let breaker_policies = PolicyVec::new(breaker_policies, chain_len)
-            .expect("one breaker policy per chain element");
-        self.complete_inner_with_optional_filter(
-            chain,
-            req,
-            retry_policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
-            None,
-        )
-        .await
-    }
-
-    /// Plan 06 P04 T4: `complete()` plus the four-axis cost filter
-    /// pre-pass. Skipped upstreams emit `agent_shim_cost_filtered_total`
-    /// counters; if every chain element is filtered, returns
-    /// [`ResilienceError::NoEligibleUpstream`] before any provider is
-    /// contacted.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn complete_with_cost_filter(
-        &self,
-        chain: Vec<BackendTarget>,
-        req: CanonicalRequest,
-        retry_policies: Vec<RetryPolicy>,
-        breaker_policies: Vec<crate::circuit_breaker::BreakerPolicy>,
-        identity: crate::auth::AgentIdentity,
-        client_ip: String,
-        frontend_model: String,
-        cost_inputs: CostFilterInputs<'_>,
-    ) -> Result<CanonicalStream, ResilienceError> {
-        let chain_len = chain.len();
-        let retry_policies =
-            PolicyVec::new(retry_policies, chain_len).expect("one retry policy per chain element");
-        let breaker_policies = PolicyVec::new(breaker_policies, chain_len)
-            .expect("one breaker policy per chain element");
-        self.complete_inner_with_optional_filter(
-            chain,
-            req,
-            retry_policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
-            Some(cost_inputs),
-        )
-        .await
-    }
-
-    /// Shared body: optionally pre-filters the chain, then performs the
-    /// usual chain walk via [`Self::complete_inner`].
-    #[allow(clippy::too_many_arguments)]
-    async fn complete_inner_with_optional_filter(
-        &self,
-        chain: Vec<BackendTarget>,
-        req: CanonicalRequest,
-        retry_policies: PolicyVec<RetryPolicy>,
-        breaker_policies: PolicyVec<crate::circuit_breaker::BreakerPolicy>,
-        identity: crate::auth::AgentIdentity,
-        client_ip: String,
-        frontend_model: String,
-        cost_inputs: Option<CostFilterInputs<'_>>,
-    ) -> Result<CanonicalStream, ResilienceError> {
-        // Plan 06 P04 T4: cost filter pre-pass. Skip upstreams that
-        // don't meet the route's tier / latency / cost constraints.
-        // If the entire chain is filtered, return NoEligibleUpstream
-        // before any provider is contacted, before any rate-limit
-        // bucket is debited, and before the resilience `complete`
-        // summary is emitted.
-        let (chain, retry_policies, breaker_policies) = if let Some(ref ci) = cost_inputs {
-            let outcome = crate::cost_filter::filter_chain(
-                chain.clone(),
-                ci.route,
-                &req,
-                ci.config,
-                self.probe.as_ref(),
-                ci.image_estimator,
-            );
-            for skip in &outcome.skipped {
-                metrics::counter!(
-                    crate::metric_names::COST_FILTERED_TOTAL,
-                    "reason" => skip.reason.as_str(),
-                    "upstream" => skip.upstream.clone(),
-                    "route" => ci.route_label.clone(),
-                )
-                .increment(1);
-            }
-            for note in &outcome.notes {
-                metrics::counter!(
-                    crate::metric_names::COST_FILTERED_TOTAL,
-                    "reason" => note.reason.as_str(),
-                    "upstream" => note.upstream.clone(),
-                    "route" => ci.route_label.clone(),
-                )
-                .increment(1);
-            }
-            if outcome.survivors.is_empty() {
-                return Err(ResilienceError::NoEligibleUpstream {
-                    filtered: outcome.skipped,
-                });
-            }
-            // Re-align the per-position retry/breaker policy vectors
-            // with the surviving chain. The pipeline builds these as
-            // `vec![policy; chain.len()]` (uniform per route), so we
-            // shorten to the new length via `PolicyVec::retain_first`,
-            // which preserves the same-length invariant by construction
-            // (v0.6.1 P03 / M-7).
-            let survivor_count = outcome.survivors.len();
-            let mut retry_policies = retry_policies;
-            let mut breaker_policies = breaker_policies;
-            retry_policies.retain_first(survivor_count);
-            breaker_policies.retain_first(survivor_count);
-            (outcome.survivors, retry_policies, breaker_policies)
-        } else {
-            (chain, retry_policies, breaker_policies)
-        };
-
-        self.complete_inner_summary(
-            chain,
-            req,
-            retry_policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
-        )
-        .await
+        self.complete_inner_summary(ticket, req).await
     }
 
     /// Wrapper that emits the `request.completed` summary on every exit
-    /// path. Pulled out of `complete()` so the cost-filter wrapper can
-    /// short-circuit BEFORE the summary span is recorded (the summary
-    /// reports on attempted upstreams; a NoEligibleUpstream rejection
-    /// has none).
-    #[allow(clippy::too_many_arguments)]
+    /// path.
     async fn complete_inner_summary(
         &self,
-        chain: Vec<BackendTarget>,
+        ticket: AdmissionTicket,
         req: CanonicalRequest,
-        retry_policies: PolicyVec<RetryPolicy>,
-        breaker_policies: PolicyVec<crate::circuit_breaker::BreakerPolicy>,
-        identity: crate::auth::AgentIdentity,
-        client_ip: String,
-        frontend_model: String,
     ) -> Result<CanonicalStream, ResilienceError> {
-        // Length invariant carried by the `PolicyVec<T>` types
-        // (v0.6.1 P03 / M-7). The chain and both PolicyVecs always
-        // have equal length by construction at every entry point.
-
         // KNOWN LIMITATION (Plan 05 P05 T1): generate a fresh UUID per call
         // until middleware-level request-id plumbing lands. See module doc.
         let request_id = uuid::Uuid::new_v4().to_string();
         let start = Instant::now();
+        let frontend_model = ticket.resolved().route_label.to_string();
 
         // Run the chain walk in an inner async block so we can emit the
         // `request.completed` summary on every exit path.
-        let result = self
-            .complete_inner(
-                chain,
-                req,
-                retry_policies,
-                breaker_policies,
-                &identity,
-                &client_ip,
-                &frontend_model,
-                &request_id,
-            )
-            .await;
+        let result = self.complete_inner(ticket, req, &request_id).await;
 
         let total_elapsed_ms = start.elapsed().as_millis() as u64;
         let outcome: &'static str = match &result {
@@ -355,7 +146,7 @@ impl ResilientCaller {
                 target: "agent_shim::resilience",
                 event_name = "request.completed",
                 request_id = %request_id,
-                identity = %identity.log_id(),
+                identity = "admitted",
                 frontend_model = %frontend_model,
                 outcome = outcome,
                 total_elapsed_ms = total_elapsed_ms,
@@ -367,7 +158,7 @@ impl ResilientCaller {
                 target: "agent_shim::resilience",
                 event_name = "request.completed",
                 request_id = %request_id,
-                identity = %identity.log_id(),
+                identity = "admitted",
                 frontend_model = %frontend_model,
                 outcome = outcome,
                 total_elapsed_ms = total_elapsed_ms,
@@ -381,73 +172,31 @@ impl ResilientCaller {
     /// Inner chain-walk body. Pulled out of `complete()` so the wrapper can
     /// emit the `request.completed` summary on every exit path without
     /// repeating it at every `return`.
-    #[allow(clippy::too_many_arguments)]
     async fn complete_inner(
         &self,
-        chain: Vec<BackendTarget>,
+        ticket: AdmissionTicket,
         req: CanonicalRequest,
-        retry_policies: PolicyVec<RetryPolicy>,
-        breaker_policies: PolicyVec<crate::circuit_breaker::BreakerPolicy>,
-        identity: &crate::auth::AgentIdentity,
-        client_ip: &str,
-        frontend_model: &str,
         request_id: &str,
     ) -> Result<CanonicalStream, ResilienceError> {
-        // ── PRE-CHAIN RATE LIMIT GATE ────────────────────────────────────
-        // Outermost gate per §5.2 layering: per-key + per-route + per-IP
-        // buckets are consulted before any breaker decision or provider
-        // lookup. A rejection here is request-scoped (not chain-element
-        // scoped) so we never enter the chain walk.
-        //
-        // Plan 03 P03 T3 followup: wrap the pre-chain gate in a
-        // `rate_limit.check` child span per spec §4.1. The span guard
-        // drops immediately after the check; per-upstream rate-limit
-        // checks inside the chain loop don't need a separate span (the
-        // dimension label on the `rate_limit.rejected` event already
-        // distinguishes pre-chain from per-upstream).
-        let pre_chain_result = {
-            let _rl_span = tracing::info_span!("rate_limit.check").entered();
-            self.limiters
-                .load_full()
-                .check_pre_chain(identity, frontend_model, client_ip)
-        };
-        if let Err((dim, retry_after_secs)) = pre_chain_result {
-            tracing::warn!(
-                target: "agent_shim::resilience",
-                event_name = "rate_limit.rejected",
-                request_id = %request_id,
-                identity = %identity.log_id(),
-                dimension = dimension_label(dim),
-                retry_after_secs = retry_after_secs,
-                "rate limit exceeded (pre-chain)"
-            );
-            metrics::counter!(
-                crate::metric_names::RATE_LIMIT_REJECTED_TOTAL,
-                "dimension" => dimension_label(dim),
-            )
-            .increment(1);
-            return Err(ResilienceError::RateLimited {
-                dimension: dim,
-                retry_after_secs,
-            });
-        }
-
+        let chain = ticket.chain().to_vec();
+        let retry_policy = RetryPolicy::from(&ticket.resolved().retry);
         let mut tried: Vec<TriedUpstream> = Vec::new();
         let mut last_error: Option<ProviderError> = None;
         let mut breakers_skipped: Vec<String> = Vec::new();
 
         for (i, target) in chain.iter().enumerate() {
-            let bpolicy = &breaker_policies[i];
-            let rpolicy = &retry_policies[i];
+            if !ticket.breaker_allowed(i) {
+                tracing::warn!(
+                    target: "agent_shim::resilience",
+                    provider = %target.provider,
+                    model = %target.model,
+                    chain_position = i,
+                    "breaker open; skipping chain element"
+                );
+                breakers_skipped.push(target.provider.clone());
+                continue;
+            }
 
-            // Resolve the provider BEFORE consulting the breaker. If the
-            // provider name is unknown, we'd return TerminalError early
-            // and skip the breaker's record() call — which would leak
-            // a probe authorization (probe_in_flight stuck true) when the
-            // breaker happened to be in HalfOpen. Production routes are
-            // validated at startup so UnknownProvider should never reach
-            // this point, but doing the lookup first makes the invariant
-            // independent of that guarantee.
             let provider = match self.providers.get(&target.provider) {
                 Some(p) => p,
                 None => {
@@ -455,74 +204,6 @@ impl ResilientCaller {
                     return Err(ResilienceError::TerminalError { error: e, tried });
                 }
             };
-
-            // ── BREAKER GATE ────────────────────────────────────────────────
-            let decision = self
-                .breakers
-                .decision(&target.provider, &target.model, bpolicy);
-            match decision {
-                crate::circuit_breaker::BreakerDecision::Skip => {
-                    // Operational log — NOT a `breaker.state_change` event;
-                    // those are emitted from inside `BreakerState`.
-                    tracing::warn!(
-                        target: "agent_shim::resilience",
-                        provider = %target.provider,
-                        model = %target.model,
-                        chain_position = i,
-                        "breaker open; skipping chain element"
-                    );
-                    breakers_skipped.push(target.provider.clone());
-                    continue; // next chain element
-                }
-                crate::circuit_breaker::BreakerDecision::Probe => {
-                    tracing::info!(
-                        target: "agent_shim::resilience",
-                        provider = %target.provider,
-                        model = %target.model,
-                        chain_position = i,
-                        "breaker half-open; attempting probe"
-                    );
-                    // Fall through to call. probe_in_flight is set by
-                    // decision(); record() clears it. Because the provider
-                    // lookup is already complete above, no early-return
-                    // path between here and the record() calls can leak it.
-                }
-                crate::circuit_breaker::BreakerDecision::Allow => {
-                    // Normal path.
-                }
-            }
-
-            // ── PER-UPSTREAM RATE LIMIT GATE ────────────────────────────
-            // §5.2: just-in-time on each chain element after the breaker
-            // gate, before retry. A rejection here returns RateLimited
-            // immediately — we do NOT fall back to the next chain element
-            // (the upstream is intentionally back-pressured; trying the
-            // fallback would defeat the bucket).
-            if let Err((dim, retry_after_secs)) = self
-                .limiters
-                .load_full()
-                .check_per_upstream(&target.provider)
-            {
-                tracing::warn!(
-                    target: "agent_shim::resilience",
-                    event_name = "rate_limit.rejected",
-                    request_id = %request_id,
-                    identity = %identity.log_id(),
-                    dimension = dimension_label(dim),
-                    retry_after_secs = retry_after_secs,
-                    upstream = %target.provider,
-                    "rate limit exceeded (per-upstream); not falling back"
-                );
-                metrics::counter!(
-                    crate::metric_names::RATE_LIMIT_REJECTED_TOTAL,
-                    "dimension" => dimension_label(dim),
-                )
-                .increment(1);
-                return Err(ResilienceError::RateLimited {
-                    dimension: dim,
-                    retry_after_secs,
-                });
-            }
 
             let started = Instant::now();
             // Plan 03 P03 T3: `provider.complete` child span wrapping the
@@ -542,10 +223,15 @@ impl ResilientCaller {
             // attempt count so the span attribute reflects the actual number
             // of provider calls made, not `policy.max_attempts` (the upper
             // bound).
-            let outcome =
-                retry_with_policy(provider, target.clone(), req.clone(), rpolicy, request_id)
-                    .instrument(provider_span.clone())
-                    .await;
+            let outcome = retry_with_policy(
+                provider,
+                target.clone(),
+                req.clone(),
+                &retry_policy,
+                request_id,
+            )
+            .instrument(provider_span.clone())
+            .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             provider_span.record("agent_shim.attempts", outcome.attempts as i64);
             let result = outcome.result;
@@ -553,8 +239,6 @@ impl ResilientCaller {
 
             match result {
                 Ok(stream) => {
-                    self.breakers
-                        .record(&target.provider, &target.model, true, bpolicy);
                     tracing::info!(
                         target: "agent_shim::resilience",
                         provider = %target.provider,
@@ -563,12 +247,11 @@ impl ResilientCaller {
                         elapsed_ms,
                         "chain element succeeded"
                     );
-                    return Ok(stream);
+                    return Ok(Box::pin(ConsumeOnFirstEventStream::new(stream, ticket, i)));
                 }
                 Err(e) => {
-                    self.breakers
-                        .record(&target.provider, &target.model, false, bpolicy);
-                    let eligibility = fallback_eligibility_with_overrides(&e, &rpolicy.retry_on);
+                    let eligibility =
+                        fallback_eligibility_with_overrides(&e, &retry_policy.retry_on);
                     let tag = crate::fallback::error_tag(&e);
                     tried.push(TriedUpstream {
                         provider: target.provider.clone(),
@@ -636,15 +319,33 @@ impl ResilientCaller {
     }
 }
 
-/// Stable label for a [`crate::errors::RateLimitDimension`] in tracing
-/// events (Plan 05 P05 T1).
-fn dimension_label(dim: crate::errors::RateLimitDimension) -> &'static str {
-    use crate::errors::RateLimitDimension as D;
-    match dim {
-        D::PerKey => "per_key",
-        D::PerRoute => "per_route",
-        D::PerUpstream => "per_upstream",
-        D::PerIp => "per_ip",
+struct ConsumeOnFirstEventStream {
+    inner: CanonicalStream,
+    ticket: Option<AdmissionTicket>,
+    chain_index: usize,
+}
+
+impl ConsumeOnFirstEventStream {
+    fn new(inner: CanonicalStream, ticket: AdmissionTicket, chain_index: usize) -> Self {
+        Self {
+            inner,
+            ticket: Some(ticket),
+            chain_index,
+        }
+    }
+}
+
+impl Stream for ConsumeOnFirstEventStream {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(Some(_))) {
+            if let Some(mut ticket) = self.ticket.take() {
+                ticket.consume(self.chain_index, true);
+            }
+        }
+        poll
     }
 }
 
@@ -652,30 +353,36 @@ fn dimension_label(dim: crate::errors::RateLimitDimension) -> &'static str {
 mod tests {
     use super::*;
     use crate::circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry};
-    use crate::errors::RateLimitDimension;
+    use agent_shim_config::{BreakerConfig, RetryConfig};
     use agent_shim_core::{
-        request::RequestMetadata, ContentBlock, ExtensionMap, FrontendInfo, FrontendKind,
-        FrontendModel, GenerationOptions, Message, RequestId, ResolvedPolicy,
+        request::RequestMetadata, BackendTarget, ContentBlock, ExtensionMap, FrontendInfo,
+        FrontendKind, FrontendModel, GenerationOptions, Message, RequestId, ResolvedPolicy,
+        ResponseId, StreamEvent,
     };
     use agent_shim_providers::ProviderCapabilities;
     use async_trait::async_trait;
-    use futures::stream;
+    use futures::{stream, StreamExt};
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::time::Duration;
 
-    /// Build N policies with `enabled: false` so the breaker never trips
-    /// and existing P02 retry/fallback semantics are unchanged.
-    fn disabled_breaker(n: usize) -> Vec<BreakerPolicy> {
-        (0..n)
-            .map(|_| BreakerPolicy {
-                enabled: false,
-                failure_threshold_pct: 50,
-                min_requests: 5,
-                window: Duration::from_secs(60),
-                open_cooldown: Duration::from_secs(30),
-            })
-            .collect()
+    fn disabled_breaker_config() -> BreakerConfig {
+        BreakerConfig {
+            enabled: false,
+            failure_threshold_pct: 50,
+            min_requests: 5,
+            window_secs: 60,
+            open_cooldown_secs: 30,
+        }
+    }
+
+    fn open_on_single_failure_breaker_config() -> BreakerConfig {
+        BreakerConfig {
+            enabled: true,
+            failure_threshold_pct: 100,
+            min_requests: 1,
+            window_secs: 60,
+            open_cooldown_secs: 30,
+        }
     }
 
     /// Build a disabled `LimiterRegistry` so the rate-limit gates are
@@ -695,13 +402,6 @@ mod tests {
         Arc::new(crate::latency_probe::DisabledLatencyProbe)
     }
 
-    /// Standard test identity — no real key in tests, so use Anonymous.
-    /// Combined with `disabled_limiter()`, the pre-chain gate is a no-op
-    /// regardless of identity, but the helper keeps call sites readable.
-    fn anon() -> crate::auth::AgentIdentity {
-        crate::auth::AgentIdentity::Anonymous
-    }
-
     /// In-memory ProviderLookup with a name → MockProvider mapping.
     struct InMemoryProviders {
         map: HashMap<String, Arc<dyn BackendProvider>>,
@@ -716,12 +416,15 @@ mod tests {
     /// Scripted MockProvider — returns one result per call.
     struct MockProvider {
         name: &'static str,
-        scripted: Mutex<Vec<Result<(), ProviderError>>>,
+        scripted: Mutex<Vec<Result<Vec<StreamEvent>, ProviderError>>>,
         capabilities: ProviderCapabilities,
     }
 
     impl MockProvider {
-        fn new(name: &'static str, scripted: Vec<Result<(), ProviderError>>) -> Arc<Self> {
+        fn new(
+            name: &'static str,
+            scripted: Vec<Result<Vec<StreamEvent>, ProviderError>>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 name,
                 scripted: Mutex::new(scripted),
@@ -748,7 +451,7 @@ mod tests {
                 return Err(ProviderError::Network("script exhausted".into()));
             }
             match s.remove(0) {
-                Ok(()) => Ok(Box::pin(stream::iter(vec![]))),
+                Ok(events) => Ok(Box::pin(stream::iter(events.into_iter().map(Ok)))),
                 Err(e) => Err(e),
             }
         }
@@ -776,8 +479,8 @@ mod tests {
         }
     }
 
-    fn fast_policy(max_attempts: u32) -> RetryPolicy {
-        RetryPolicy {
+    fn fast_retry_config(max_attempts: u32) -> RetryConfig {
+        RetryConfig {
             max_attempts,
             initial_backoff_ms: 1,
             multiplier: 2.0,
@@ -799,30 +502,60 @@ mod tests {
         }
     }
 
+    fn ticket_for(
+        chain: Vec<BackendTarget>,
+        registry: &Arc<BreakerRegistry>,
+        retry: RetryConfig,
+        breaker: BreakerConfig,
+    ) -> AdmissionTicket {
+        let policy = BreakerPolicy::from(&breaker);
+        let holds = chain
+            .iter()
+            .map(|target| registry.try_hold(&target.provider, &target.model, &policy))
+            .collect();
+        AdmissionTicket::for_test(
+            chain.clone(),
+            crate::ResolvedRoute {
+                chain,
+                retry,
+                breaker,
+                route_label: Arc::from("openai_chat/gpt-4o"),
+            },
+            holds,
+        )
+    }
+
+    fn response_start() -> StreamEvent {
+        StreamEvent::ResponseStart {
+            id: ResponseId::new(),
+            model: "gpt-4o".into(),
+            created_at_unix: 0,
+        }
+    }
+
     #[tokio::test]
     async fn returns_first_chain_element_on_success() {
         let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
             map: HashMap::from([(
                 "a".to_string(),
-                MockProvider::new("a", vec![Ok(())]) as Arc<_>,
+                MockProvider::new("a", vec![Ok(vec![])]) as Arc<_>,
             )]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller =
-            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a")];
-        let policies = vec![fast_policy(2)];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                policies,
-                disabled_breaker(1),
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
+        let ticket = ticket_for(
+            chain,
+            &registry,
+            fast_retry_config(2),
+            disabled_breaker_config(),
+        );
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+        let result = caller.complete(ticket, dummy_request()).await;
         assert!(result.is_ok());
     }
 
@@ -848,26 +581,25 @@ mod tests {
                 ),
                 (
                     "b".to_string(),
-                    MockProvider::new("b", vec![Ok(())]) as Arc<_>,
+                    MockProvider::new("b", vec![Ok(vec![])]) as Arc<_>,
                 ),
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller =
-            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
-        let policies = vec![fast_policy(2), fast_policy(2)];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                policies,
-                disabled_breaker(2),
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
+        let ticket = ticket_for(
+            chain,
+            &registry,
+            fast_retry_config(2),
+            disabled_breaker_config(),
+        );
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+        let result = caller.complete(ticket, dummy_request()).await;
         assert!(result.is_ok());
     }
 
@@ -887,26 +619,25 @@ mod tests {
                 ),
                 (
                     "b".to_string(),
-                    MockProvider::new("b", vec![Ok(())]) as Arc<_>,
+                    MockProvider::new("b", vec![Ok(vec![])]) as Arc<_>,
                 ),
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller =
-            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
-        let policies = vec![fast_policy(2), fast_policy(2)];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                policies,
-                disabled_breaker(2),
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
+        let ticket = ticket_for(
+            chain,
+            &registry,
+            fast_retry_config(2),
+            disabled_breaker_config(),
+        );
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+        let result = caller.complete(ticket, dummy_request()).await;
         assert!(matches!(result, Err(ResilienceError::TerminalError { .. })));
     }
 
@@ -937,21 +668,20 @@ mod tests {
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let caller =
-            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
-        let policies = vec![fast_policy(2), fast_policy(2)];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                policies,
-                disabled_breaker(2),
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
+        let ticket = ticket_for(
+            chain,
+            &registry,
+            fast_retry_config(2),
+            disabled_breaker_config(),
+        );
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+        let result = caller.complete(ticket, dummy_request()).await;
         match result {
             Err(ResilienceError::NoUpstreamSucceeded { tried, .. }) => {
                 assert_eq!(tried.len(), 2);
@@ -970,20 +700,21 @@ mod tests {
                 ("a".to_string(), MockProvider::new("a", vec![]) as Arc<_>),
                 (
                     "b".to_string(),
-                    MockProvider::new("b", vec![Ok(())]) as Arc<_>,
+                    MockProvider::new("b", vec![Ok(vec![])]) as Arc<_>,
                 ),
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
 
         // Pre-trip A's breaker.
-        let policy = BreakerPolicy {
+        let breaker = BreakerConfig {
             enabled: true,
             failure_threshold_pct: 50,
             min_requests: 5,
-            window: Duration::from_secs(60),
-            open_cooldown: Duration::from_secs(30),
+            window_secs: 60,
+            open_cooldown_secs: 30,
         };
+        let policy = BreakerPolicy::from(&breaker);
         for _ in 0..5 {
             registry.record("a", "gpt-4o", false, &policy);
         }
@@ -992,20 +723,15 @@ mod tests {
             BreakerDecision::Skip
         );
 
-        let caller =
-            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                vec![fast_policy(2), fast_policy(2)],
-                vec![policy.clone(), policy.clone()],
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
+        let ticket = ticket_for(chain, &registry, fast_retry_config(2), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+        let result = caller.complete(ticket, dummy_request()).await;
         assert!(result.is_ok());
         // A's MockProvider was set up with empty scripted vec; if `a` was
         // called even once it would have errored with "script exhausted".
@@ -1021,33 +747,29 @@ mod tests {
             ]),
         });
         let registry = Arc::new(BreakerRegistry::with_system_clock());
-        let policy = BreakerPolicy {
+        let breaker = BreakerConfig {
             enabled: true,
             failure_threshold_pct: 50,
             min_requests: 5,
-            window: Duration::from_secs(60),
-            open_cooldown: Duration::from_secs(30),
+            window_secs: 60,
+            open_cooldown_secs: 30,
         };
+        let policy = BreakerPolicy::from(&breaker);
         for _ in 0..5 {
             registry.record("a", "gpt-4o", false, &policy);
         }
         for _ in 0..5 {
             registry.record("b", "gpt-4o", false, &policy);
         }
-        let caller =
-            ResilientCaller::new(providers, registry, disabled_limiter(), disabled_probe());
         let chain = vec![target("a"), target("b")];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                vec![fast_policy(2), fast_policy(2)],
-                vec![policy.clone(), policy.clone()],
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
+        let ticket = ticket_for(chain, &registry, fast_retry_config(2), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+        let result = caller.complete(ticket, dummy_request()).await;
         match result {
             Err(ResilienceError::AllBreakersOpen { tried }) => {
                 assert_eq!(tried.len(), 2);
@@ -1059,140 +781,103 @@ mod tests {
         }
     }
 
-    /// Build a tiny rate_limit config with burst=2 buckets so the third
-    /// request in the same instant gets rejected. Used by the two
-    /// rate-limit gate tests below.
-    fn small_rate_limit_cfg() -> agent_shim_config::RateLimitConfig {
-        let bucket = agent_shim_config::BucketConfigYaml {
-            rate_per_sec: 1,
-            burst: 2,
-        };
-        let mut cfg = agent_shim_config::RateLimitConfig {
-            enabled: true,
-            per_key: agent_shim_config::PerKeyConfig {
-                default: Some(bucket.clone()),
-                anonymous: Some(bucket.clone()),
-                overrides: std::collections::BTreeMap::new(),
-            },
-            per_route: std::collections::BTreeMap::new(),
-            per_upstream: std::collections::BTreeMap::new(),
-            per_ip: agent_shim_config::PerIpConfig {
-                enabled: false,
-                rate_per_sec: 5,
-                burst: 5,
-            },
-        };
-        cfg.per_upstream.insert("a".to_string(), bucket);
-        cfg
-    }
-
     #[tokio::test]
-    async fn pre_chain_rate_limit_returns_rate_limited() {
-        // Pre-chain gate (per-key, anonymous bucket): once the bucket is
-        // burnt, complete() must short-circuit with RateLimited{PerKey}
-        // BEFORE consulting the breaker or the provider lookup. We assert
-        // the provider was never called by giving it an empty scripted
-        // vec — any call would raise "script exhausted".
+    async fn complete_consumes_on_first_event() {
         let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
-            map: HashMap::from([("a".to_string(), MockProvider::new("a", vec![]) as Arc<_>)]),
+            map: HashMap::from([(
+                "a".to_string(),
+                MockProvider::new("a", vec![Ok(vec![response_start()])]) as Arc<_>,
+            )]),
         });
-        let breakers = Arc::new(BreakerRegistry::with_system_clock());
-        let inner = crate::rate_limit::LimiterRegistry::from_config(&small_rate_limit_cfg());
-
-        // Burn the anonymous per-key bucket (burst=2 → two allows then
-        // a reject) by directly checking the registry.
-        for _ in 0..2 {
-            assert!(inner
-                .check_pre_chain(&anon(), "openai_chat/gpt-4o", "127.0.0.1")
-                .is_ok());
-        }
-
-        let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
-        let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let breaker = open_on_single_failure_breaker_config();
+        let policy = BreakerPolicy::from(&breaker);
         let chain = vec![target("a")];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                vec![fast_policy(2)],
-                disabled_breaker(1),
-                anon(),
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
-        match result {
-            Err(ResilienceError::RateLimited {
-                dimension,
-                retry_after_secs,
-            }) => {
-                assert_eq!(dimension, RateLimitDimension::PerKey);
-                assert!(retry_after_secs >= 1);
-            }
-            Err(other) => panic!("expected RateLimited{{PerKey}}, got {other:?}"),
-            Ok(_) => panic!("expected RateLimited{{PerKey}}, got Ok(stream)"),
-        }
+        let ticket = ticket_for(chain, &registry, fast_retry_config(1), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+
+        let mut stream = caller.complete(ticket, dummy_request()).await.unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+
+        assert_eq!(
+            registry.decision("a", "gpt-4o", &policy),
+            BreakerDecision::Allow
+        );
     }
 
     #[tokio::test]
-    async fn per_upstream_rate_limit_returns_rate_limited() {
-        // Per-upstream gate runs INSIDE the chain walk after the breaker
-        // gate. Burn upstream "a"'s bucket; the chain walk hits "a", the
-        // gate rejects, and complete() returns RateLimited{PerUpstream}
-        // immediately — no fallback to upstream "b".
-        //
-        // Identity is a fresh KeyHash so the per-key bucket (which is
-        // also configured by small_rate_limit_cfg) doesn't fire first;
-        // the per-key gate uses the keyed bucket which is independent
-        // of the anonymous bucket burnt below.
+    async fn complete_does_not_consume_on_cancellation_before_first_byte() {
+        let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
+            map: HashMap::from([(
+                "a".to_string(),
+                MockProvider::new("a", vec![Ok(vec![response_start()])]) as Arc<_>,
+            )]),
+        });
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let breaker = open_on_single_failure_breaker_config();
+        let policy = BreakerPolicy::from(&breaker);
+        let chain = vec![target("a")];
+        let ticket = ticket_for(chain, &registry, fast_retry_config(1), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+
+        let stream = caller.complete(ticket, dummy_request()).await.unwrap();
+        drop(stream);
+
+        assert_eq!(
+            registry.decision("a", "gpt-4o", &policy),
+            BreakerDecision::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_consumes_index_1_on_fallback() {
         let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
             map: HashMap::from([
-                ("a".to_string(), MockProvider::new("a", vec![]) as Arc<_>),
+                (
+                    "a".to_string(),
+                    MockProvider::new("a", vec![Err(ProviderError::Network("a-down".into()))])
+                        as Arc<_>,
+                ),
                 (
                     "b".to_string(),
-                    MockProvider::new("b", vec![Ok(())]) as Arc<_>,
+                    MockProvider::new("b", vec![Ok(vec![response_start()])]) as Arc<_>,
                 ),
             ]),
         });
-        let breakers = Arc::new(BreakerRegistry::with_system_clock());
-        let inner = crate::rate_limit::LimiterRegistry::from_config(&small_rate_limit_cfg());
-
-        // Burn the per-upstream bucket for "a" (burst=2).
-        for _ in 0..2 {
-            assert!(inner.check_per_upstream("a").is_ok());
-        }
-
-        // Use a fresh per-request KeyHash identity so the per-key bucket
-        // doesn't reject first. Any sha256-shaped string works because
-        // the test config has no per_key_overrides → the default
-        // per_key bucket is used, with its own burst=2 budget for this
-        // identity.
-        let id = crate::auth::AgentIdentity::KeyHash("sha256:test_key_hash".to_string());
-
-        let limiters = Arc::new(arc_swap::ArcSwap::from_pointee(inner));
-        let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let breaker = open_on_single_failure_breaker_config();
+        let policy = BreakerPolicy::from(&breaker);
         let chain = vec![target("a"), target("b")];
-        let result = caller
-            .complete(
-                chain,
-                dummy_request(),
-                vec![fast_policy(2), fast_policy(2)],
-                disabled_breaker(2),
-                id,
-                "127.0.0.1".to_string(),
-                "openai_chat/gpt-4o".to_string(),
-            )
-            .await;
-        match result {
-            Err(ResilienceError::RateLimited {
-                dimension,
-                retry_after_secs,
-            }) => {
-                assert_eq!(dimension, RateLimitDimension::PerUpstream);
-                assert!(retry_after_secs >= 1);
-            }
-            Err(other) => panic!("expected RateLimited{{PerUpstream}}, got {other:?}"),
-            Ok(_) => panic!("expected RateLimited{{PerUpstream}}, got Ok(stream)"),
-        }
+        let ticket = ticket_for(chain, &registry, fast_retry_config(1), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+
+        let mut stream = caller.complete(ticket, dummy_request()).await.unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+
+        assert_eq!(
+            registry.decision("a", "gpt-4o", &policy),
+            BreakerDecision::Skip
+        );
+        assert_eq!(
+            registry.decision("b", "gpt-4o", &policy),
+            BreakerDecision::Allow
+        );
     }
 }

@@ -19,17 +19,21 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use agent_shim_config::{
+    BreakerConfig, GatewayConfig, OpenAiCompatibleUpstream, RetryConfig, RouteEntry, Secret, Tier,
+    UpstreamConfig,
+};
 use agent_shim_core::{
     request::RequestMetadata, BackendTarget, CanonicalRequest, CanonicalStream, ContentBlock,
     ExtensionMap, FrontendInfo, FrontendKind, FrontendModel, GenerationOptions, Message, RequestId,
-    ResolvedPolicy,
+    ResolvedPolicy, StreamEvent,
 };
 use agent_shim_providers::{BackendProvider, ProviderCapabilities, ProviderError};
 use agent_shim_router::{
-    AgentIdentity, BreakerPolicy, BreakerRegistry, DisabledLatencyProbe, LatencyProbe,
-    LimiterRegistry, ProviderLookup, ResilientCaller, RetryPolicy,
+    Admission, AdmissionError, AgentIdentity, AnthropicImageEstimator, BreakerPolicy,
+    BreakerRegistry, DisabledLatencyProbe, LatencyProbe, LimiterRegistry, ProviderLookup,
+    ResilientCaller, ResolvedRoute,
 };
 use async_trait::async_trait;
 use futures::stream;
@@ -51,12 +55,15 @@ impl ProviderLookup for InMemoryProviders {
 
 struct MockProvider {
     name: &'static str,
-    scripted: Mutex<Vec<Result<(), ProviderError>>>,
+    scripted: Mutex<Vec<Result<Vec<StreamEvent>, ProviderError>>>,
     capabilities: ProviderCapabilities,
 }
 
 impl MockProvider {
-    fn new(name: &'static str, scripted: Vec<Result<(), ProviderError>>) -> Arc<Self> {
+    fn new(
+        name: &'static str,
+        scripted: Vec<Result<Vec<StreamEvent>, ProviderError>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             name,
             scripted: Mutex::new(scripted),
@@ -83,7 +90,7 @@ impl BackendProvider for MockProvider {
             return Err(ProviderError::Network("script exhausted".into()));
         }
         match s.remove(0) {
-            Ok(()) => Ok(Box::pin(stream::iter(vec![]))),
+            Ok(events) => Ok(Box::pin(stream::iter(events.into_iter().map(Ok)))),
             Err(e) => Err(e),
         }
     }
@@ -111,8 +118,8 @@ fn dummy_request() -> CanonicalRequest {
     }
 }
 
-fn fast_policy(max_attempts: u32) -> RetryPolicy {
-    RetryPolicy {
+fn fast_retry_config(max_attempts: u32) -> RetryConfig {
+    RetryConfig {
         max_attempts,
         initial_backoff_ms: 1,
         multiplier: 2.0,
@@ -134,16 +141,14 @@ fn target(provider: &str) -> BackendTarget {
     }
 }
 
-fn disabled_breaker(n: usize) -> Vec<BreakerPolicy> {
-    (0..n)
-        .map(|_| BreakerPolicy {
-            enabled: false,
-            failure_threshold_pct: 50,
-            min_requests: 5,
-            window: Duration::from_secs(60),
-            open_cooldown: Duration::from_secs(30),
-        })
-        .collect()
+fn disabled_breaker_config() -> BreakerConfig {
+    BreakerConfig {
+        enabled: false,
+        failure_threshold_pct: 50,
+        min_requests: 5,
+        window_secs: 60,
+        open_cooldown_secs: 30,
+    }
 }
 
 fn disabled_limiter() -> Arc<arc_swap::ArcSwap<LimiterRegistry>> {
@@ -152,6 +157,79 @@ fn disabled_limiter() -> Arc<arc_swap::ArcSwap<LimiterRegistry>> {
 
 fn disabled_probe() -> Arc<dyn LatencyProbe> {
     Arc::new(DisabledLatencyProbe)
+}
+
+fn gateway_config_for(chain: &[BackendTarget]) -> GatewayConfig {
+    let mut config = GatewayConfig {
+        server: Default::default(),
+        logging: Default::default(),
+        upstreams: Default::default(),
+        routes: vec![],
+        plugins: Default::default(),
+        auth: Default::default(),
+        rate_limit: Default::default(),
+        copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
+        shutdown: Default::default(),
+        validation: Default::default(),
+    };
+    for target in chain {
+        config.upstreams.insert(
+            target.provider.clone(),
+            UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+                base_url: "http://localhost".into(),
+                api_key: Secret::new("dummy"),
+                default_headers: Default::default(),
+                request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+    }
+    config.routes.push(RouteEntry::singular(
+        "openai_chat",
+        "gpt-4o",
+        chain[0].provider.as_str(),
+        "gpt-4o",
+    ));
+    config
+}
+
+fn admitted_ticket(
+    chain: Vec<BackendTarget>,
+    providers: Arc<dyn ProviderLookup>,
+    breakers: Arc<BreakerRegistry>,
+    limiters: Arc<arc_swap::ArcSwap<LimiterRegistry>>,
+    retry: RetryConfig,
+    breaker: BreakerConfig,
+) -> agent_shim_router::AdmissionTicket {
+    let config = gateway_config_for(&chain);
+    let route = &config.routes[0];
+    let admission = Admission::new(
+        limiters,
+        breakers,
+        providers,
+        Arc::new(DisabledLatencyProbe),
+    );
+    admission
+        .admit(
+            ResolvedRoute {
+                chain,
+                retry,
+                breaker,
+                route_label: Arc::from("openai_chat/gpt-4o"),
+            },
+            route,
+            &config,
+            &dummy_request(),
+            &AgentIdentity::Anonymous,
+            "127.0.0.1",
+            &AnthropicImageEstimator,
+        )
+        .expect("admission should pass")
 }
 
 // ---------------------------------------------------------------------------
@@ -172,24 +250,23 @@ async fn retry_attempt_event_has_standard_fields() {
                         status: 502,
                         body: "bad".into(),
                     }),
-                    Ok(()),
+                    Ok(vec![]),
                 ],
             ) as Arc<_>,
         )]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
-    let result = caller
-        .complete(
-            vec![target("openai")],
-            dummy_request(),
-            vec![fast_policy(3)],
-            disabled_breaker(1),
-            AgentIdentity::Anonymous,
-            "127.0.0.1".into(),
-            "openai_chat/gpt-4o".into(),
-        )
-        .await;
+    let limiters = disabled_limiter();
+    let ticket = admitted_ticket(
+        vec![target("openai")],
+        Arc::clone(&providers),
+        Arc::clone(&breakers),
+        Arc::clone(&limiters),
+        fast_retry_config(3),
+        disabled_breaker_config(),
+    );
+    let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
+    let result = caller.complete(ticket, dummy_request()).await;
     assert!(result.is_ok());
 
     assert!(logs_contain("retry.attempt"));
@@ -227,23 +304,22 @@ async fn fallback_transition_event_has_standard_fields() {
             ),
             (
                 "copilot".to_string(),
-                MockProvider::new("copilot", vec![Ok(())]) as Arc<_>,
+                MockProvider::new("copilot", vec![Ok(vec![])]) as Arc<_>,
             ),
         ]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
-    let result = caller
-        .complete(
-            vec![target("openai"), target("copilot")],
-            dummy_request(),
-            vec![fast_policy(2), fast_policy(2)],
-            disabled_breaker(2),
-            AgentIdentity::Anonymous,
-            "127.0.0.1".into(),
-            "openai_chat/gpt-4o".into(),
-        )
-        .await;
+    let limiters = disabled_limiter();
+    let ticket = admitted_ticket(
+        vec![target("openai"), target("copilot")],
+        Arc::clone(&providers),
+        Arc::clone(&breakers),
+        Arc::clone(&limiters),
+        fast_retry_config(2),
+        disabled_breaker_config(),
+    );
+    let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
+    let result = caller.complete(ticket, dummy_request()).await;
     assert!(result.is_ok());
 
     assert!(logs_contain("fallback.transition"));
@@ -261,51 +337,20 @@ async fn breaker_state_change_event_emits_on_trip() {
     // We exercise the breaker via a real chain walk so the registry
     // populates the upstream/model on the BreakerState the same way
     // production would.
-    let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
-        map: HashMap::from([(
-            "openai".to_string(),
-            MockProvider::new(
-                "openai",
-                vec![
-                    Err(ProviderError::Network("a".into())),
-                    Err(ProviderError::Network("b".into())),
-                    Err(ProviderError::Network("c".into())),
-                    Err(ProviderError::Network("d".into())),
-                    Err(ProviderError::Network("e".into())),
-                ],
-            ) as Arc<_>,
-        )]),
-    });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let policy = BreakerPolicy {
+    let breaker = BreakerConfig {
         enabled: true,
         failure_threshold_pct: 50,
         min_requests: 5,
-        window: Duration::from_secs(60),
-        open_cooldown: Duration::from_secs(30),
+        window_secs: 60,
+        open_cooldown_secs: 30,
     };
+    let policy = BreakerPolicy::from(&breaker);
     // Five failures via the registry (matches the path used by the chain
     // walker after each retry-loop outcome).
     for _ in 0..5 {
         breakers.record("openai", "gpt-4o", false, &policy);
     }
-
-    // Now trigger a chain walk so `complete()` is in scope (not strictly
-    // required for the event — the event was already emitted on the 5th
-    // record() call — but exercising the real path makes the test reflect
-    // production behavior).
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
-    let _ = caller
-        .complete(
-            vec![target("openai")],
-            dummy_request(),
-            vec![fast_policy(1)],
-            vec![policy.clone()],
-            AgentIdentity::Anonymous,
-            "127.0.0.1".into(),
-            "openai_chat/gpt-4o".into(),
-        )
-        .await;
 
     assert!(logs_contain("breaker.state_change"));
     assert!(logs_contain("from_state=\"closed\""));
@@ -354,19 +399,30 @@ async fn rate_limit_rejected_event_has_standard_fields() {
         )]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
-    let result = caller
-        .complete(
-            vec![target("openai")],
-            dummy_request(),
-            vec![fast_policy(1)],
-            disabled_breaker(1),
-            AgentIdentity::Anonymous,
-            "127.0.0.1".into(),
-            "openai_chat/gpt-4o".into(),
-        )
-        .await;
-    assert!(result.is_err());
+    let chain = vec![target("openai")];
+    let config = gateway_config_for(&chain);
+    let route = &config.routes[0];
+    let admission = Admission::new(
+        limiters,
+        breakers,
+        providers,
+        Arc::new(DisabledLatencyProbe),
+    );
+    let result = admission.admit(
+        ResolvedRoute {
+            chain,
+            retry: fast_retry_config(1),
+            breaker: disabled_breaker_config(),
+            route_label: Arc::from("openai_chat/gpt-4o"),
+        },
+        route,
+        &config,
+        &dummy_request(),
+        &AgentIdentity::Anonymous,
+        "127.0.0.1",
+        &AnthropicImageEstimator,
+    );
+    assert!(matches!(result, Err(AdmissionError::RateLimited { .. })));
 
     assert!(logs_contain("rate_limit.rejected"));
     assert!(logs_contain("dimension=\"per_key\""));
@@ -380,27 +436,26 @@ async fn request_completed_event_emits_on_success() {
     let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
         map: HashMap::from([(
             "openai".to_string(),
-            MockProvider::new("openai", vec![Ok(())]) as Arc<_>,
+            MockProvider::new("openai", vec![Ok(vec![])]) as Arc<_>,
         )]),
     });
     let breakers = Arc::new(BreakerRegistry::with_system_clock());
-    let caller = ResilientCaller::new(providers, breakers, disabled_limiter(), disabled_probe());
-    let result = caller
-        .complete(
-            vec![target("openai")],
-            dummy_request(),
-            vec![fast_policy(1)],
-            disabled_breaker(1),
-            AgentIdentity::Anonymous,
-            "127.0.0.1".into(),
-            "openai_chat/gpt-4o".into(),
-        )
-        .await;
+    let limiters = disabled_limiter();
+    let ticket = admitted_ticket(
+        vec![target("openai")],
+        Arc::clone(&providers),
+        Arc::clone(&breakers),
+        Arc::clone(&limiters),
+        fast_retry_config(1),
+        disabled_breaker_config(),
+    );
+    let caller = ResilientCaller::new(providers, breakers, limiters, disabled_probe());
+    let result = caller.complete(ticket, dummy_request()).await;
     assert!(result.is_ok());
 
     assert!(logs_contain("request.completed"));
     assert!(logs_contain("outcome=\"success\""));
     assert!(logs_contain("total_elapsed_ms="));
-    assert!(logs_contain("identity=anonymous"));
+    assert!(logs_contain("identity=\"admitted\""));
     assert!(logs_contain("frontend_model=openai_chat/gpt-4o"));
 }

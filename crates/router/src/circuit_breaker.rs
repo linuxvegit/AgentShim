@@ -71,6 +71,40 @@ pub enum BreakerDecision {
     Probe,
 }
 
+/// RAII handle for one chain element's breaker authorization.
+///
+/// `consume(success)` records the actual call outcome. Dropping without
+/// consume records an abandoned authorization as a failure, which preserves
+/// the existing half-open probe invariant that every `Probe` decision must
+/// eventually be paired with `record(...)`.
+pub struct BreakerHold {
+    registry: Arc<BreakerRegistry>,
+    provider: String,
+    model: String,
+    policy: BreakerPolicy,
+    consumed: bool,
+}
+
+impl BreakerHold {
+    /// Record the outcome of the call this hold authorized.
+    pub fn consume(mut self, succeeded: bool) {
+        if !self.consumed {
+            self.registry
+                .record(&self.provider, &self.model, succeeded, &self.policy);
+            self.consumed = true;
+        }
+    }
+}
+
+impl Drop for BreakerHold {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.registry
+                .record(&self.provider, &self.model, false, &self.policy);
+        }
+    }
+}
+
 /// Internal state for one breaker. Concurrent access is guarded by the
 /// registry's `RwLock`.
 struct BreakerState {
@@ -426,6 +460,26 @@ impl BreakerRegistry {
         let mut s = state.write().unwrap();
         s.record(succeeded, self.clock.now(), policy);
     }
+
+    /// Returns a breaker hold when the breaker allows this chain element.
+    /// `None` means the breaker is open and the caller should skip it.
+    pub fn try_hold(
+        self: &Arc<Self>,
+        provider: &str,
+        model: &str,
+        policy: &BreakerPolicy,
+    ) -> Option<BreakerHold> {
+        match self.decision(provider, model, policy) {
+            BreakerDecision::Skip => None,
+            BreakerDecision::Allow | BreakerDecision::Probe => Some(BreakerHold {
+                registry: Arc::clone(self),
+                provider: provider.to_string(),
+                model: model.to_string(),
+                policy: policy.clone(),
+                consumed: false,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -496,5 +550,72 @@ mod registry_tests {
         // Distinct key → distinct Arc.
         let c = registry.get_or_create("anthropic", "claude-opus-4-7");
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    fn one_sample_policy() -> BreakerPolicy {
+        BreakerPolicy {
+            enabled: true,
+            failure_threshold_pct: 50,
+            min_requests: 1,
+            window: Duration::from_secs(60),
+            open_cooldown: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn try_hold_returns_none_when_open() {
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let policy = one_sample_policy();
+        registry.record("openai", "gpt-4o", false, &policy);
+
+        assert!(registry.try_hold("openai", "gpt-4o", &policy).is_none());
+    }
+
+    #[test]
+    fn try_hold_consume_success_records() {
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let policy = one_sample_policy();
+        let hold = registry
+            .try_hold("openai", "gpt-4o", &policy)
+            .expect("closed breaker should allow hold");
+
+        hold.consume(true);
+
+        assert_eq!(
+            registry.decision("openai", "gpt-4o", &policy),
+            BreakerDecision::Allow
+        );
+    }
+
+    #[test]
+    fn try_hold_drop_without_consume_records_failure() {
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let policy = one_sample_policy();
+        let hold = registry
+            .try_hold("openai", "gpt-4o", &policy)
+            .expect("closed breaker should allow hold");
+
+        drop(hold);
+
+        assert_eq!(
+            registry.decision("openai", "gpt-4o", &policy),
+            BreakerDecision::Skip
+        );
+    }
+
+    #[test]
+    fn try_hold_consume_then_drop_is_idempotent() {
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let policy = one_sample_policy();
+        let hold = registry
+            .try_hold("openai", "gpt-4o", &policy)
+            .expect("closed breaker should allow hold");
+
+        hold.consume(true);
+
+        assert_eq!(
+            registry.decision("openai", "gpt-4o", &policy),
+            BreakerDecision::Allow
+        );
     }
 }

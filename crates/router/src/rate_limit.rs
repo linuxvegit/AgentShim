@@ -45,6 +45,25 @@ pub enum LimitOutcome {
     Limited { retry_after_secs: u32 },
 }
 
+/// RAII handle representing a rate-limit slot reserved for a request.
+///
+/// PR 2 of ADR-0009 intentionally ships this as observation-only: the
+/// underlying `governor::RateLimiter::check()` has already deducted from
+/// the bucket by the time this handle exists, and there is no refund path.
+/// PR 4 replaces the limiter internals with reservation-aware semantics;
+/// callers should already be shaped around consume-on-first-byte and
+/// drop-on-early-exit by then.
+pub struct RateLimitReservation {}
+
+impl RateLimitReservation {
+    /// PR 2: no-op. PR 4: commit the reservation against the underlying bucket.
+    pub fn consume(self) {}
+}
+
+impl Drop for RateLimitReservation {
+    fn drop(&mut self) {}
+}
+
 /// Top-level limiter registry. Holds one `governor::RateLimiter` per
 /// `(dimension, key)`. Buckets are created on first use.
 pub struct LimiterRegistry {

@@ -88,8 +88,8 @@ pub struct FilterOutcome {
 ///
 /// `image_estimator` supplies the per-frontend image-token math used by
 /// the cost-cap axis. Plan v0.6.1 P04 (M-8): the gateway selects the
-/// concrete impl from the inbound `FrontendKind` and threads it here
-/// via `CostFilterInputs::image_estimator`.
+/// concrete impl from the inbound `FrontendKind`; `Admission::admit`
+/// threads it here.
 pub fn filter_chain(
     chain: Vec<BackendTarget>,
     route: &RouteEntry,

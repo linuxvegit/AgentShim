@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod auth;
 pub mod circuit_breaker;
 pub mod cost_estimate;
@@ -9,7 +10,6 @@ pub mod fallback;
 pub mod image_estimators;
 pub mod latency_probe;
 pub mod model_index;
-mod policy_vec;
 pub mod rate_limit;
 pub mod resilient_caller;
 pub mod resolver;
@@ -80,8 +80,11 @@ pub trait Router: Send + Sync {
     }
 }
 
+pub use admission::{Admission, AdmissionError, AdmissionTicket};
 pub use auth::{extract_identity_from_headers, hash_key, AgentIdentity};
-pub use circuit_breaker::{BreakerDecision, BreakerPolicy, BreakerRegistry, Clock, SystemClock};
+pub use circuit_breaker::{
+    BreakerDecision, BreakerHold, BreakerPolicy, BreakerRegistry, Clock, SystemClock,
+};
 pub use cost_estimate::{estimate_request_cost, CostEstimate};
 pub use cost_filter::{filter_chain, FilterOutcome, FilterReason, Note, Skip};
 pub use errors::{RateLimitDimension, ResilienceError, TriedUpstream};
@@ -92,8 +95,8 @@ pub use image_estimators::{
     AnthropicImageEstimator, OpenAiImageEstimator, ResponsesImageEstimator,
 };
 pub use latency_probe::{DisabledLatencyProbe, LatencyProbe, MockLatencyProbe};
-pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry};
-pub use resilient_caller::{CostFilterInputs, ProviderLookup, ResilientCaller};
+pub use rate_limit::{BucketConfig, LimitOutcome, LimiterRegistry, RateLimitReservation};
+pub use resilient_caller::{ProviderLookup, ResilientCaller};
 pub use resolver::ModelResolver;
 pub use retry::{compute_backoff, retry_with_policy, RetryOutcome, RetryPolicy};
 pub use static_routes::StaticRouter;

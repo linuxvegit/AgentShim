@@ -23,12 +23,9 @@ use bytes::Bytes;
 use futures::StreamExt;
 use parking_lot::Mutex;
 
-use agent_shim_core::{
-    BackendTarget, CanonicalRequest, CanonicalStream, ContentBlock, StreamEvent, Usage,
-};
+use agent_shim_core::{CanonicalRequest, CanonicalStream, StreamEvent, Usage};
 use agent_shim_frontends::{FrontendProtocol, FrontendResponse};
-use agent_shim_providers::{ProviderCapabilities, ProviderError};
-use agent_shim_router::{AgentIdentity, BreakerPolicy, CostFilterInputs, RetryPolicy};
+use agent_shim_router::{AdmissionError, AdmissionTicket, AgentIdentity};
 
 use crate::handlers::{collect_stream, frontend_response_to_axum, HandlerError};
 use crate::state::AppState;
@@ -237,6 +234,34 @@ fn handler_error_from_plugin_error(
     }
 }
 
+fn handler_error_from_admission(
+    err: AdmissionError,
+    kind: agent_shim_core::FrontendKind,
+) -> HandlerError {
+    match err {
+        AdmissionError::RateLimited {
+            dimension,
+            retry_after_secs,
+        } => HandlerError::RateLimited {
+            kind,
+            dimension,
+            retry_after_secs,
+        },
+        AdmissionError::NoEligibleUpstream { filtered } => {
+            HandlerError::NoEligibleUpstream { kind, filtered }
+        }
+        AdmissionError::CapabilityMismatch(message) => {
+            tracing::warn!(error = %message, "capability mismatch - rejecting before upstream call");
+            HandlerError::CapabilityMismatch { kind, message }
+        }
+        AdmissionError::AllBreakersOpen { tried } => HandlerError::AllBreakersOpen {
+            kind,
+            tried_count: tried.len(),
+        },
+        AdmissionError::Provider(error) => HandlerError::Provider(error),
+    }
+}
+
 /// Body of [`dispatch`], pulled into a separate async fn so the parent can
 /// wrap it with `.instrument(root_span)` rather than holding an `Entered`
 /// guard across `.await` (Plan 03 P03 T3 followup, IMPORTANT-1).
@@ -378,21 +403,6 @@ async fn dispatch_inner(
     )
     .increment(0);
 
-    let route_len = resolved_route.chain.len();
-
-    // Plan 04 P02 D2: route-level retry block governs every chain element
-    // uniformly. Build one `RetryPolicy` and clone it per chain position so
-    // `ResilientCaller::complete` can apply it independently to each
-    // upstream's retry budget.
-    let retry_policy = RetryPolicy::from(&resolved_route.retry);
-    let policies: Vec<RetryPolicy> = vec![retry_policy; route_len];
-
-    // Plan 04 P03 T4: parallel breaker policies — same uniform-per-route
-    // shape as retry, fed into `ResilientCaller::complete` alongside the
-    // retry policies.
-    let breaker_policy = BreakerPolicy::from(&resolved_route.breaker);
-    let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; route_len];
-
     // Plan 04 P04 T4: build `client_ip` and `frontend_model` for the
     // rate-limit gates. These depend on `model_alias`, so they're built
     // AFTER the auth.required check but BEFORE the chain walk.
@@ -412,16 +422,14 @@ async fn dispatch_inner(
     // Per-route bucket key: `<frontend_kind>/<model_alias>`. Matches
     // the format the YAML config uses for `rate_limit.per_route` keys
     // (see Plan 04 P04 T3).
-    let frontend_model = resolved_route.route_label.to_string();
-    let chain = resolved_route.chain;
-
     // The chain is non-empty by router invariant (singular routes produce
     // 1-element vecs; array routes are validated to be non-empty by
     // `validate_routes`). The capability gate, the request log line, and
     // the proxy_raw short-circuit all run against `chain[0]`'s provider —
     // chain-element-aware capability checking is intentionally out of
     // scope for v0.4 (potential P03+ extension).
-    let first_target = chain
+    let first_target = resolved_route
+        .chain
         .first()
         .expect("ModelResolver::resolve never returns an empty chain on Ok")
         .clone();
@@ -601,24 +609,33 @@ async fn dispatch_inner(
         .await
         .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
 
-    // Capability gate. Reject before any network call when the request asks
-    // for a feature the target provider can't deliver — today this is just
-    // vision (image blocks against a text-only backend). The check has to
-    // run after decode (so we can scan content blocks) but before the chain
-    // walk (so we never reach the upstream). The check inspects only
-    // `chain[0]`'s capabilities; chain-element-aware gating is out of
-    // scope for v0.4.
-    check_capabilities(&canonical, first_provider.capabilities()).map_err(|e| {
-        tracing::warn!(
-            provider = %first_target.provider,
-            error = %e,
-            "capability mismatch — rejecting before upstream call"
-        );
-        HandlerError::CapabilityMismatch {
-            kind: spec.frontend.kind(),
-            message: e.to_string(),
-        }
-    })?;
+    let frontend_kind = spec.frontend.kind();
+    let route_entry =
+        find_route_entry(&snapshot.config, frontend_kind, &model_alias).ok_or_else(|| {
+            tracing::warn!(
+                frontend = ?frontend_kind,
+                model = %model_alias,
+                "resolved route missing from hot-reload snapshot"
+            );
+            HandlerError::Route(agent_shim_router::RouteError::NoRoute {
+                frontend: frontend_kind,
+                model: model_alias.clone(),
+            })
+        })?;
+    let image_estimator = crate::image_estimator_selector::select_image_estimator(frontend_kind);
+    let ticket = state
+        .core
+        .admission
+        .admit(
+            resolved_route,
+            route_entry,
+            &snapshot.config,
+            &canonical,
+            &identity,
+            &client_ip,
+            image_estimator,
+        )
+        .map_err(|e| handler_error_from_admission(e, frontend_kind))?;
 
     let is_stream = canonical.stream;
     let max_tokens = canonical.generation.max_tokens;
@@ -697,33 +714,17 @@ async fn dispatch_inner(
             .unwrap_or_default(),
     );
 
-    // Walk the chain via `ResilientCaller`: per-element retry, eligible
-    // errors fall through to the next chain element, terminal errors
-    // short-circuit. All resilience-shaped errors flow through the
+    // Walk the admitted chain via `ResilientCaller`: per-element retry,
+    // eligible errors fall through to the next chain element, terminal
+    // errors short-circuit. All resilience-shaped errors flow through the
     // `from_resilience_error` bridge so the response envelope is shaped
     // by the inbound frontend dialect.
-    //
-    // Plan 06 P04 T4: the cost-filter pre-pass runs INSIDE
-    // `complete_with_cost_filter`. We pass the matching route entry +
-    // gateway config so the filter can read `min_tier` /
-    // `max_cost_usd` / per-upstream `tier` / `cost` /
-    // `p95_latency_budget_ms`. The route lookup walks
-    // `snapshot.config.routes` once; if no entry matches the route
-    // (wildcard-only routes have model `*` so the linear scan
-    // intentionally falls through to wildcard semantics) we pass
-    // `None` and the filter step is skipped.
-    let frontend_kind = spec.frontend.kind();
     if is_stream {
         run_stream(
             spec,
             state,
             canonical,
-            chain,
-            policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
+            ticket,
             snapshot.clone(),
             RunContext {
                 model_alias,
@@ -738,12 +739,7 @@ async fn dispatch_inner(
             spec,
             state,
             canonical,
-            chain,
-            policies,
-            breaker_policies,
-            identity,
-            client_ip,
-            frontend_model,
+            ticket,
             snapshot.clone(),
             RunContext {
                 model_alias,
@@ -776,12 +772,7 @@ async fn run_stream(
     spec: PipelineSpec<'_>,
     state: &AppState,
     canonical: CanonicalRequest,
-    chain: Vec<BackendTarget>,
-    policies: Vec<RetryPolicy>,
-    breaker_policies: Vec<BreakerPolicy>,
-    identity: AgentIdentity,
-    client_ip: String,
-    frontend_model: String,
+    ticket: AdmissionTicket,
     snapshot: Arc<crate::state::AppSnapshot>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
@@ -808,55 +799,11 @@ async fn run_stream(
         format!("{:?}/{}", frontend_kind, model_alias),
     );
 
-    // Plan 06 P04 T4: dispatch through the cost-filter-aware entry
-    // point when we can locate the matching `RouteEntry`. Wildcard
-    // routes and routes without `min_tier` / `max_cost_usd` /
-    // per-upstream budgets pay the filter cost but skip every axis
-    // — the filter degenerates to the identity function.
-    let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
-    let upstream_stream_result = match route_entry {
-        Some(route) => {
-            // Plan v0.6.1 P04 T7 (M-8): pick the per-frontend image-token
-            // estimator so the cost-cap pre-pass charges image blocks at
-            // the same rate the upstream will bill.
-            let image_estimator =
-                crate::image_estimator_selector::select_image_estimator(frontend_kind);
-            state
-                .core
-                .resilient_caller
-                .complete_with_cost_filter(
-                    chain,
-                    canonical,
-                    policies,
-                    breaker_policies,
-                    identity,
-                    client_ip,
-                    frontend_model.clone(),
-                    CostFilterInputs {
-                        route,
-                        config: &snapshot.config,
-                        route_label: frontend_model,
-                        image_estimator,
-                    },
-                )
-                .await
-        }
-        None => {
-            state
-                .core
-                .resilient_caller
-                .complete(
-                    chain,
-                    canonical,
-                    policies,
-                    breaker_policies,
-                    identity,
-                    client_ip,
-                    frontend_model,
-                )
-                .await
-        }
-    };
+    let upstream_stream_result = state
+        .core
+        .resilient_caller
+        .complete(ticket, canonical)
+        .await;
     // Walk the chain. `ResilientCaller::complete` returns a single
     // `CanonicalStream` from whichever upstream succeeded; downstream
     // encoding is unchanged from the pre-T6 single-upstream world.
@@ -1001,12 +948,7 @@ async fn run_unary(
     spec: PipelineSpec<'_>,
     state: &AppState,
     canonical: CanonicalRequest,
-    chain: Vec<BackendTarget>,
-    policies: Vec<RetryPolicy>,
-    breaker_policies: Vec<BreakerPolicy>,
-    identity: AgentIdentity,
-    client_ip: String,
-    frontend_model: String,
+    ticket: AdmissionTicket,
     snapshot: Arc<crate::state::AppSnapshot>,
     ctx: RunContext,
 ) -> Result<Response, HandlerError> {
@@ -1028,52 +970,11 @@ async fn run_unary(
         format!("{:?}/{}", frontend_kind, model_alias),
     );
 
-    // Plan 06 P04 T4: see `run_stream` — cost filter pre-pass via
-    // `complete_with_cost_filter` when a route entry is locatable.
-    let route_entry = find_route_entry(&snapshot.config, frontend_kind, &model_alias);
-    let stream_result = match route_entry {
-        Some(route) => {
-            // Plan v0.6.1 P04 T7 (M-8): per-frontend image-token estimator
-            // selection — see `run_stream` for the matching wiring on the
-            // streaming path.
-            let image_estimator =
-                crate::image_estimator_selector::select_image_estimator(frontend_kind);
-            state
-                .core
-                .resilient_caller
-                .complete_with_cost_filter(
-                    chain,
-                    canonical,
-                    policies,
-                    breaker_policies,
-                    identity,
-                    client_ip,
-                    frontend_model.clone(),
-                    CostFilterInputs {
-                        route,
-                        config: &snapshot.config,
-                        route_label: frontend_model,
-                        image_estimator,
-                    },
-                )
-                .await
-        }
-        None => {
-            state
-                .core
-                .resilient_caller
-                .complete(
-                    chain,
-                    canonical,
-                    policies,
-                    breaker_policies,
-                    identity,
-                    client_ip,
-                    frontend_model,
-                )
-                .await
-        }
-    };
+    let stream_result = state
+        .core
+        .resilient_caller
+        .complete(ticket, canonical)
+        .await;
     let stream = stream_result.map_err(|e| {
         tracing::error!(error = %e, "resilient call failed");
         HandlerError::from_resilience_error(e, frontend_kind)
@@ -1231,39 +1132,6 @@ fn extract_model_from_body(body: &[u8]) -> Result<String, HandlerError> {
     Ok(m.model)
 }
 
-/// Reject the request before dispatch when the inbound canonical body asks
-/// for a feature the target provider cannot service. Today this is just
-/// vision (any `ContentBlock::Image` against a backend whose
-/// `capabilities.vision == false`); future capability mismatches add new
-/// branches here.
-///
-/// Plan 04 D6: the check runs at the gateway boundary, not inside each
-/// provider, so the error envelope is shaped by the inbound frontend (not
-/// whichever upstream happened to be wired). Returning `Err` here aborts
-/// before any network I/O, which is also what the mockito-based test in
-/// Plan 04 T9 asserts (zero hits on the upstream mock).
-fn check_capabilities(
-    req: &CanonicalRequest,
-    caps: &ProviderCapabilities,
-) -> Result<(), ProviderError> {
-    if request_has_image(req) && !caps.vision {
-        return Err(ProviderError::CapabilityMismatch(
-            "target provider does not support vision (image blocks present in request)".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Scan every message's content blocks for an `Image` variant. Used by the
-/// capability gate; pulled out so unit tests can exercise the predicate
-/// against handcrafted requests without spinning up a full pipeline.
-fn request_has_image(req: &CanonicalRequest) -> bool {
-    req.messages
-        .iter()
-        .flat_map(|m| m.content.iter())
-        .any(|b| matches!(b, ContentBlock::Image(_)))
-}
-
 /// Plan 07 P04 T6/T7: universal H7 guard. Fires `run_on_response_complete`
 /// on the registry when the SSE stream finishes (or is dropped early by
 /// client disconnect). Replaces the Anthropic-only `StreamLogger` of v0.6
@@ -1395,112 +1263,5 @@ mod tests {
         assert!(!names.iter().any(|n| n.contains("api-key")));
         assert!(!names.iter().any(|n| n.contains("auth-token")));
         assert!(!names.contains(&"content-type"));
-    }
-
-    // ── capability gate ───────────────────────────────────────────────
-
-    use agent_shim_core::{
-        media::BinarySource, request::RequestMetadata, ContentBlock, ExtensionMap, FrontendInfo,
-        FrontendKind, FrontendModel, GenerationOptions, ImageBlock, Message, MessageRole,
-        RequestId, ResolvedPolicy,
-    };
-
-    /// Build a CanonicalRequest carrying a single user message whose content
-    /// blocks come from the caller. Keeps every other field at its default
-    /// — the gate only inspects `messages[*].content`, so this is enough.
-    fn req_with_content(blocks: Vec<ContentBlock>) -> CanonicalRequest {
-        CanonicalRequest {
-            id: RequestId::new(),
-            frontend: FrontendInfo {
-                kind: FrontendKind::AnthropicMessages,
-                requested_model: FrontendModel::from("test-model"),
-            },
-            model: FrontendModel::from("test-model"),
-            system: vec![],
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: blocks,
-                name: None,
-                extensions: ExtensionMap::new(),
-            }],
-            tools: vec![],
-            tool_choice: Default::default(),
-            generation: GenerationOptions::default(),
-            response_format: None,
-            stream: false,
-            metadata: RequestMetadata::default(),
-            inbound_anthropic_headers: vec![],
-            resolved_policy: ResolvedPolicy::default(),
-            extensions: ExtensionMap::new(),
-        }
-    }
-
-    fn img_block() -> ContentBlock {
-        ContentBlock::Image(ImageBlock {
-            source: BinarySource::Url {
-                url: "https://example.com/cat.png".into(),
-            },
-            extensions: Default::default(),
-        })
-    }
-
-    #[test]
-    fn request_has_image_detects_image_block() {
-        let req = req_with_content(vec![ContentBlock::text("hi"), img_block()]);
-        assert!(request_has_image(&req));
-    }
-
-    #[test]
-    fn request_has_image_returns_false_for_text_only() {
-        let req = req_with_content(vec![ContentBlock::text("hi")]);
-        assert!(!request_has_image(&req));
-    }
-
-    #[test]
-    fn check_capabilities_passes_when_no_image_and_no_vision() {
-        // Provider without vision is still fine for a text-only request.
-        let caps = ProviderCapabilities {
-            streaming: true,
-            tool_use: false,
-            vision: false,
-            json_mode: false,
-            accepts_xhigh: false,
-        };
-        let req = req_with_content(vec![ContentBlock::text("hi")]);
-        assert!(check_capabilities(&req, &caps).is_ok());
-    }
-
-    #[test]
-    fn check_capabilities_passes_when_image_and_vision() {
-        let caps = ProviderCapabilities {
-            streaming: true,
-            tool_use: false,
-            vision: true,
-            json_mode: false,
-            accepts_xhigh: false,
-        };
-        let req = req_with_content(vec![ContentBlock::text("describe"), img_block()]);
-        assert!(check_capabilities(&req, &caps).is_ok());
-    }
-
-    #[test]
-    fn check_capabilities_rejects_image_against_text_only_provider() {
-        let caps = ProviderCapabilities {
-            streaming: true,
-            tool_use: false,
-            vision: false,
-            json_mode: false,
-            accepts_xhigh: false,
-        };
-        let req = req_with_content(vec![img_block()]);
-        let err = check_capabilities(&req, &caps).unwrap_err();
-        // Variant + message both observable so future refactors can't quietly
-        // turn this into a different error class.
-        match err {
-            ProviderError::CapabilityMismatch(msg) => {
-                assert!(msg.contains("vision"), "message must mention vision: {msg}");
-            }
-            other => panic!("expected CapabilityMismatch, got {other:?}"),
-        }
     }
 }

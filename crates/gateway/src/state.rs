@@ -18,8 +18,8 @@ use agent_shim_providers::{
 };
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
-    BreakerRegistry, Clock, LimiterRegistry, ModelResolver, ProviderLookup, ResilientCaller,
-    StaticRouter, SystemClock,
+    Admission, BreakerRegistry, Clock, LimiterRegistry, ModelResolver, ProviderLookup,
+    ResilientCaller, StaticRouter, SystemClock,
 };
 
 /// Adapter that lets `ResilientCaller` (in the router crate) look up
@@ -89,6 +89,9 @@ pub struct AppCore {
     /// behind a `ProviderLookup` adapter, then walks the chain from the
     /// resolver per request, applying retry+fallback per chain element.
     pub resilient_caller: Arc<ResilientCaller>,
+    /// Admission-layer entry point. Runs rate-limit checks, cost filter,
+    /// capability gate, and breaker holds before the resilient caller.
+    pub admission: Arc<Admission>,
     /// Per-`(provider, model)` circuit breakers. State, not policy — the
     /// breaker map survives reload (spec §2.2). Future admin/introspection
     /// endpoints will read through this Arc.
@@ -369,9 +372,15 @@ impl AppState {
         );
 
         let resilient_caller = Arc::new(ResilientCaller::new(
-            provider_lookup,
+            Arc::clone(&provider_lookup),
             Arc::clone(&breaker_registry),
             Arc::clone(&limiter_registry),
+            Arc::clone(&latency_probe),
+        ));
+        let admission = Arc::new(Admission::new(
+            Arc::clone(&limiter_registry),
+            Arc::clone(&breaker_registry),
+            provider_lookup,
             Arc::clone(&latency_probe),
         ));
 
@@ -411,6 +420,7 @@ impl AppState {
             providers,
             resolver,
             resilient_caller,
+            admission,
             breaker_registry,
             limiter_registry,
             metrics,
@@ -471,6 +481,7 @@ routes:
         let _: &Arc<arc_swap::ArcSwap<agent_shim_router::LimiterRegistry>> =
             &state.core.limiter_registry;
         let _: &Arc<agent_shim_router::ResilientCaller> = &state.core.resilient_caller;
+        let _: &Arc<agent_shim_router::Admission> = &state.core.admission;
         let _: &Option<agent_shim_config::AdminConfig> = &state.core.admin_config;
 
         let snap = state.snapshot.load_full();
