@@ -553,24 +553,33 @@ crates/
   protocol-tests/ # Golden SSE tests, cross-protocol tests, fuzz, vision matrix
 ```
 
-## What's NOT in v0.8.0
+## What's NOT in v0.9.0
 
-v0.8 adds per-route reasoning effort mapping, a public `/v1/models`
-catalog endpoint, and the operator-side observability shaped around it
-(admin `/admin/catalog`, `agent-shim show-catalog` CLI, optional strict
-typo detection, optional startup catalog print). v0.8 still does **not**
-ship:
+v0.9 unifies the four admission gates (rate-limit, cost-filter,
+capability, breaker) behind one `Admission::admit` entry point that
+returns a single RAII `AdmissionTicket`, closes the
+"passthrough bypasses the gates" KNOWN GAP, and accepts the
+rate-limit reservation asymmetry permanently as a documented
+trade-off (ADR-0010). It also lands the Copilot `/models` enrichment
+work (rich `agent-shim copilot models` table + `ModelMetadata.{adaptive_thinking,
+thinking_budget_min/max, supports.reasoning_effort_values}`). v0.9
+still does **not** ship:
 
 - **`POST /admin/discover` atomic catalog refresh.** Currently returns
   `501 Not Implemented`; use `POST /admin/reload` or `SIGHUP` to
   re-discover catalog metadata as part of a full config reload.
-  v0.9+ candidate.
+  v0.10+ candidate.
 - **Learned realised-cost tracking (rolling EWMA).** The cost filter
   still uses an upper-bound estimate; observed token counts don't
-  feed back into the filter. v0.9+ candidate.
+  feed back into the filter. v0.10+ candidate.
 - **Distributed cost-filter state.** Each gateway instance applies
   the filter independently; multi-instance deployments don't share
-  filter counts. v0.9+ candidate.
+  filter counts. v0.10+ candidate.
+- **Reservation-aware rate-limit.** The originally planned PR 4 of
+  ADR-0009 is **cancelled** by ADR-0010. `governor`'s
+  consume-on-check semantics stay; `RateLimitReservation` stays
+  observation-only by intent. Could reopen on real ops signal — see
+  ADR-0010 revisit triggers.
 - **Agent-driven routing hints** (e.g. `agent-shim-budget: low`
   headers) — explicitly out of scope. The policy decision belongs to
   the operator, not the agent. Rationale in
@@ -580,20 +589,36 @@ ship:
 - **k8s manifests / Helm chart** — operators write their own.
 - **Redacted request/response capture** — too disk-heavy for a default.
 - **New providers, new frontends, new model alias features** — out of
-  scope for v0.8.
-- **Audio / file content end-to-end** — v0.9+ if at all.
+  scope for v0.9.
+- **Audio / file content end-to-end** — v0.10+ if at all.
 
 Phase 4's `ResilientCaller` orchestrator + Phase 5's observability
 layer + Phase 6's cost filter + Phase 7's plugin system + v0.8's
-model catalog are the foundation that distributed state and
-realised-cost tracking will plug into in v0.9+.
+model catalog + v0.9's unified admission module are the foundation
+that distributed state and realised-cost tracking will plug into in
+v0.10+.
 
 See the [design spec](docs/superpowers/specs/2026-04-28-agent-shim-design.md) for the full roadmap.
 
 ## Releases
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version release log. Current:
-**v0.8.0** — Per-route reasoning effort mapping + public `/v1/models`
+**v0.9.0** — Unified admission module + accepted rate-limit reservation
+asymmetry. One `Admission::admit` entry point composes rate-limit,
+cost-filter, capability, and breaker gates; returns a single RAII
+`AdmissionTicket` that the pipeline canonical path AND the
+`try_proxy_raw` passthrough path both route through (closing the v0.4
+"passthrough bypasses the gates" KNOWN GAP). First-byte consume rule
+ensures budget-deducting gates commit only when an upstream packet
+arrives. Capability gate now iterates every cost-filter-survivor chain
+element (not just chain[0]). Rich `agent-shim copilot models` table
+output with `ModelMetadata.{adaptive_thinking, thinking_budget_min/max,
+supports.reasoning_effort_values}` flowing through `/v1/models`,
+`/admin/catalog`, and `show-catalog` automatically. ADR-0009 +
+ADR-0010 record the design and the accepted asymmetry trade-off.
+Full release notes: [docs/release-notes-0.9.0.md](docs/release-notes-0.9.0.md).
+
+Previous: **v0.8.0** — Per-route reasoning effort mapping + public `/v1/models`
 catalog. New six-value canonical effort enum
 (`minimal/low/medium/high/xhigh/max`), per-route `reasoning_mapping:
 [{ match, set }]` rewrite table, OpenAI-shape `/v1/models` with

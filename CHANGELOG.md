@@ -7,7 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [0.9.0] — 2026-05-29
+
+Unified admission module + accepted rate-limit reservation asymmetry,
+plus the Copilot `/models` enrichment work that was sitting in the
+Unreleased section of the v0.8 changelog.
+
+This release lands two ADRs:
+
+- **[ADR-0009](docs/adr/0009-unified-admission.md)** — `Admission` Module
+  composing rate-limit, cost-filter, capability, and breaker gates
+  behind one `Admission::admit` entry point that returns a single
+  RAII `AdmissionTicket`. The pipeline canonical path AND the
+  `try_proxy_raw` passthrough path both route through admission — no
+  more "passthrough bypasses the gates" KNOWN GAP.
+- **[ADR-0010](docs/adr/0010-accept-rate-limit-asymmetry.md)** —
+  cancels the originally planned PR 4 of the ADR-0009 landing
+  sequence. The §3 design contract between `BreakerHold` (true RAII)
+  and `RateLimitReservation` (observation-only) is honored at the
+  interface level; the implementation gap on the rate-limit side
+  stays as a bounded, documented trade-off.
+
+`crates/core/` diff is zero against the v0.8.0 baseline — ADR-0007's
+frozen-core invariant continues to apply.
+
+### Added (unified admission — ADR-0009)
+
+- **`ResolvedRoute` thin value.** `ModelResolver::resolve_route(frontend,
+  model)` returns one cheap-to-clone `Arc`-wrapped value carrying the
+  fallback chain, retry config, breaker config, and route label. The
+  three startup-frozen lookups (`Router::resolve`, `find_retry_policy`,
+  `find_breaker_policy`) collapse to one. `find_route_entry` survives
+  as the snapshot reader for hot-reloadable cost-filter fields (the
+  routes-table reload split documented in CONTEXT.md is preserved).
+- **`Admission::admit` + `AdmissionTicket`.** Single entry point
+  composing rate-limit pre-chain + per-upstream check, cost-filter pass,
+  capability gate against **every** surviving chain element (not just
+  `chain[0]` — closing a v0.8 gap), and per-element `BreakerRegistry::
+  try_hold` reservations. Returns an `AdmissionTicket` bundling the
+  cost-filter-survivor chain, an `Arc<ResolvedRoute>`, the
+  `AgentIdentity`, per-element `BreakerHold`s (true RAII), and
+  rate-limit reservations (observation-only — see ADR-0010).
+- **First-byte consume rule.** Budget-deducting gates commit on
+  first-byte-from-upstream rather than at admit time or stream end.
+  `AdmissionTicket::consume(chain_index, succeeded)` is idempotent;
+  the selected chain element's breaker hold records `succeeded`, all
+  other holds are dropped as abandoned probes. Stream-level errors on
+  the first event count as failures (both transport `Err` and in-band
+  `StreamEvent::Error`).
+- **Passthrough on the ticket.** The `try_proxy_raw` branch goes
+  through `Admission::admit` before `provider.proxy_raw`. The
+  `ConsumeOnFirstByteStream` wrapper consumes the ticket on first
+  `Poll::Ready(Some(Ok(_)))` or `Poll::Ready(Some(Err(_)))`. Closes
+  the L492-505 KNOWN GAP comment that v0.4 carried.
+- **Plugin mutation safety guard.** If H2 (`on_decoded_request`) or H3
+  (`on_resolved`) plugins mutate the canonical request, passthrough is
+  skipped — otherwise the byte body and the mutated canonical would
+  diverge and upstream behavior would drift. The guard is conditional
+  on the route actually having a subscriber for the anchor, so the
+  deep-clone cost stays out of the hot path when no plugins care.
+
+### Added (Copilot `/models` enrichment)
 
 - **`agent-shim copilot models` table output.** The subcommand now
   prints a fixed-width table with model id, family, context window,
@@ -33,15 +93,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (4 new) cover the parser and table formatter against the captured
   real-world fixture.
 
-### Notes
+### Changed
 
-- These fields flow through the existing catalog surface (the public
-  `GET /v1/models` payload, `GET /admin/catalog`, and
+- **`ResilientCaller::complete` signature collapsed** to
+  `complete(ticket: AdmissionTicket, req: CanonicalRequest)`. Old
+  `complete_with_cost_filter`, `CostFilterInputs<'a>`, and `PolicyVec<T>`
+  are removed — call sites move to building a ticket via
+  `Admission::admit` first.
+- **Capability gate now iterates the full cost-filter-survivor chain**
+  rather than just `chain[0]`. A vision request whose chain head
+  breaker is open no longer surfaces as an upstream 4xx — admission
+  rejects it as `CapabilityMismatch` before any upstream call.
+- **`AdmissionTicket` carries `AgentIdentity`** through to
+  `ResilientCaller`, restoring the real identity field (`anonymous` /
+  `sha256:...`) on `request.completed` events instead of the placeholder
+  `"admitted"`.
+
+### Removed
+
+- `Router::find_retry_policy` / `find_breaker_policy` methods.
+- `ResilientCaller::complete_with_cost_filter`.
+- `CostFilterInputs<'a>`.
+- `PolicyVec<T>` length-invariant wrapper (replaced by ticket-internal
+  per-element cloning).
+- The L492-505 KNOWN GAP comment block in `pipeline.rs` explaining
+  why passthrough bypassed rate-limit + breaker. Both gates now apply
+  uniformly.
+
+### Internal
+
+- **Workspace tests: ~1024 passing.** +~23 new tests against the v0.8
+  baseline (admission unit + integration, passthrough-on-ticket byte
+  stream, capability-gate full-chain, plugin-registry subscriber
+  predicates, passthrough rate-limit envelope, first-byte stream-error
+  discrimination, identity threading).
+- **`ConsumeOnFirstByteStream`** in `crates/gateway/src/pipeline.rs`
+  is the byte-stream wrapper that fires `AdmissionTicket::consume`
+  on the first poll yielding `Ok(_)` or `Err(_)`.
+- **Doc comments updated** wherever they previously said "PR 4 closes
+  this" or "see admission.rs PR 2 implementation window" — those now
+  point at ADR-0010 instead.
+
+### Notes (Copilot catalog flow)
+
+- The new `ModelMetadata` fields flow through the existing catalog
+  surface (`GET /v1/models`, `GET /admin/catalog`, and
   `agent-shim show-catalog`) automatically — every consumer that
   reads `ModelMetadata` benefits. `serde(default, skip_serializing_if =
   "Option::is_none")` keeps payloads backwards-compatible: clients
   parsing v0.8 catalog JSON will see new fields appear when the
   upstream supplies them, never when it doesn't.
+
+### Migration notes
+
+- **Operators**: drop in the new binary. All admission behavior
+  changes are internal — every existing YAML config continues to load
+  and behaves identically on the happy path. The only operator-visible
+  change is the new `passthrough` log line carrying the same
+  gate-derived rejection envelopes as the canonical path.
+- **`BackendProvider` implementors (internal crate consumers)**: no
+  trait changes. `Admission` and `AdmissionTicket` are new types in
+  `agent-shim-router`; existing `BackendProvider` impls don't see them.
+- **`agent-shim-router` consumers (custom dispatch loops, none today
+  outside this repo)**: see `ResilientCaller::complete` signature
+  change above.
+- **Plugin developers**: no plugin-API changes. The PluginRegistry,
+  four hook anchors (H2/H3/H5/H7), and per-route hook plans are
+  unchanged.
 
 ## [0.8.0] — 2026-05-29
 
