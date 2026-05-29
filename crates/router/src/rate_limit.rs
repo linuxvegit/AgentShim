@@ -47,16 +47,24 @@ pub enum LimitOutcome {
 
 /// RAII handle representing a rate-limit slot reserved for a request.
 ///
-/// PR 2 of ADR-0009 intentionally ships this as observation-only: the
-/// underlying `governor::RateLimiter::check()` has already deducted from
-/// the bucket by the time this handle exists, and there is no refund path.
-/// PR 4 replaces the limiter internals with reservation-aware semantics;
-/// callers should already be shaped around consume-on-first-byte and
-/// drop-on-early-exit by then.
+/// This handle is **observation-only by design** and stays that way
+/// permanently. `governor::RateLimiter::check()` has already deducted
+/// from the bucket by the time this handle exists, and there is no
+/// refund path. ADR-0010 accepts the resulting asymmetry between
+/// `BreakerHold` (true RAII) and `RateLimitReservation` (no-op
+/// `consume()`/`Drop`) as a permanent trade-off: the over-charge is
+/// bounded to one token per request rejected at a post-rate-limit
+/// gate, and operators have not reported real harm.
+///
+/// The type is kept in the public API for symmetry with `BreakerHold`
+/// and to leave the door open for a future reversal without an API
+/// break. See ADR-0010 for the revisit triggers.
 pub struct RateLimitReservation {}
 
 impl RateLimitReservation {
-    /// PR 2: no-op. PR 4: commit the reservation against the underlying bucket.
+    /// No-op by design (ADR-0010). Kept on the type so the calling
+    /// convention matches `BreakerHold::consume` and admission code
+    /// reads symmetrically.
     pub fn consume(self) {}
 }
 

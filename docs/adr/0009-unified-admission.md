@@ -207,33 +207,30 @@ upstream A failing and `ResilientCaller` falling back to upstream B
 would only deduct once for B, hiding A's load on the upstream-side
 metrics that operators rely on for capacity planning.
 
-**PR 2 implementation asymmetry — rate-limit vs breaker.** The v0.4
-rate-limit gate wraps `governor::RateLimiter`, whose `check()`
-decrements the token bucket immediately and has no refund path.
-Implementing true first-byte consume on the rate-limit side requires
-either replacing `governor` or wrapping it with a separate
-reservation ledger; both are structural changes outside PR 2's scope.
-PR 2 ships with the following asymmetry, and the PR 4 entry in the
-landing sequence below closes it:
+**Rate-limit vs breaker implementation asymmetry — accepted, see
+ADR-0010.** The rate-limit gate wraps `governor::RateLimiter`, whose
+`check()` decrements the token bucket immediately and has no refund
+path. The shipped asymmetry is:
 
-| Dimension | PR 2 semantics | Rule honored? |
+| Dimension | Semantics | Rule honored? |
 |---|---|---|
 | Breaker holds (`circuit_breaker::record`) | True RAII — `consume()` records success/failure, Drop without consume is the "abandoned probe" path the breaker already handles | yes |
-| Rate-limit reservations | Observation-only RAII — Drop is a no-op; the rate-limit decrement happens at `admit` time | **no, deferred to PR 4** |
+| Rate-limit reservations | Observation-only RAII — Drop is a no-op; the rate-limit decrement happens at `admit` time | **no, accepted permanently — see ADR-0010** |
 
-This means PR 2's `AdmissionTicket::consume()` is well-defined for the
-breaker side and a no-op for the rate-limit side. A request rejected
-by cost filter or capability gate inside `admit` does **not** refund
-the rate-limit token it just consumed — same as v0.7 behavior on the
+`AdmissionTicket::consume()` is well-defined for the breaker side and
+a no-op for the rate-limit side. A request rejected by cost filter or
+capability gate inside `admit` does **not** refund the rate-limit
+token it just consumed — same as v0.7 baseline behavior on the
 canonical path. The interface stays correct (callers always call
 `consume()` on first byte); only the rate-limit implementation is
-incomplete. Doc comments on `AdmissionTicket` and `Admission::admit`
-must call this out so the next reader knows what holds and what
-doesn't.
+intentionally incomplete. Doc comments on `AdmissionTicket` and
+`Admission::admit` call this out so the next reader knows what holds
+and what doesn't.
 
 The design contract — first-byte consume for all four gates — is
-unchanged. Only the implementation window inside PR 2 is partial.
-PR 4 closes the gap (see Landing sequence below).
+unchanged. The rate-limit side's partial implementation is accepted
+as a permanent trade-off in ADR-0010; PR 4 of the landing sequence
+below is cancelled.
 
 ### (4) Capability gate is skipped on byte-identity dialect match
 
@@ -299,7 +296,7 @@ Four PRs, each independently reviewable and bisect-friendly:
    uses the v0.7 short-circuit (KNOWN GAP comment preserved). Ships
    with the rate-limit-vs-breaker implementation asymmetry described
    in §3 — interface honors the first-byte consume rule; rate-limit
-   implementation does not yet, deferred to PR 4.
+   implementation is observation-only by intent (accepted in ADR-0010).
 3. **PR 3: Passthrough on the ticket.** Pipeline `try_proxy_raw`
    branch calls `find_route_entry` then `Admission::admit`, then
    `proxy_raw`, then `ticket.consume()` on the first byte. Remove the
@@ -307,18 +304,17 @@ Four PRs, each independently reviewable and bisect-friendly:
    `crates/gateway/tests/rate_limit_per_key_envelope.rs` Anthropic
    test gets an Anthropic→Anthropic passthrough case to cover the
    path it previously had to route through OAI-compat to exercise.
-   The rate-limit-side first-byte consume is still implementation-
-   incomplete after PR 3 — PR 4 is the closer.
-4. **PR 4: Reservation-aware rate-limit (closes the §3 asymmetry).**
-   Replace `governor`'s consume-on-check semantics with a
-   reservation-aware bucket — either by swapping to a library that
-   supports reserve/consume/release natively (e.g. `leaky_bucket`)
-   or by structuring a custom thin wrapper. After PR 4,
-   `AdmissionTicket::consume()` is a real RAII commit on both the
-   breaker and rate-limit sides, and Drop-without-consume truly
-   releases every reservation. Scope is its own ADR / phase spec
-   because the Retry-After computation path and any new dependency
-   need their own design grilling — out of scope to pre-commit here.
+   Final landed PR; the rate-limit-side observation-only behavior is
+   accepted as the design's permanent state per ADR-0010.
+4. **PR 4: Reservation-aware rate-limit — CANCELLED.** Originally
+   planned to replace `governor`'s consume-on-check semantics with a
+   reservation-aware bucket. Cancelled by ADR-0010 after re-examining
+   the actual operational harm of the §3 asymmetry: bounded
+   one-token over-charge per request rejected at a post-rate-limit
+   gate, with no operator-reported signal of real harm and a real
+   3-5 day rewrite cost to close. The asymmetry is accepted as a
+   permanent, documented trade-off. ADR-0010 names the revisit
+   triggers that would reopen the decision.
 
 ## Consequences
 
@@ -342,5 +338,6 @@ Four PRs, each independently reviewable and bisect-friendly:
   signal that operators can use to detect capability/cost rejections
   upstream of the resilient caller. Whether to surface this as a
   separate counter is left to the Phase 8 design spec. The breaker
-  side carries this signal after PR 2; the rate-limit side carries it
-  only after PR 4 (today's `governor` immediately consumes on check).
+  side carries this signal after PR 2; the rate-limit side does not
+  (ADR-0010 accepts this asymmetry — `governor` immediately consumes
+  on check, by design).

@@ -1,10 +1,13 @@
 //! Admission gate for canonical requests.
 //!
 //! `Admission::admit` composes rate-limit checks, the cost filter, capability
-//! gating, and breaker holds into one `AdmissionTicket`. PR 2 of ADR-0009 has
-//! an intentional implementation asymmetry: `BreakerHold` is true RAII, while
-//! `RateLimitReservation` is observation-only because the current governor
-//! limiter consumes on check and cannot refund.
+//! gating, and breaker holds into one `AdmissionTicket`. There is an
+//! intentional implementation asymmetry between the two RAII handles inside
+//! the ticket: `BreakerHold` is true RAII, while `RateLimitReservation` is
+//! observation-only because `governor::RateLimiter::check()` consumes on
+//! check and cannot refund. ADR-0010 accepts this asymmetry as a permanent
+//! trade-off (bounded one-token over-charge per post-rate-limit rejection,
+//! no operator-reported harm); see that ADR for revisit triggers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,10 +29,11 @@ use crate::ResolvedRoute;
 
 /// RAII ticket proving a canonical request passed admission.
 ///
-/// Breaker holds are true RAII in PR 2: consuming a chain index records that
+/// Breaker holds are true RAII: consuming a chain index records that
 /// index's outcome, while dropping unconsumed holds records abandoned probes.
-/// Rate-limit reservations are present only as observation-only handles until
-/// PR 4 replaces governor with reservation-aware buckets.
+/// Rate-limit reservations are present as observation-only handles by design;
+/// `governor::RateLimiter::check()` already consumed the token at admit time
+/// and has no refund path. ADR-0010 accepts this asymmetry as permanent.
 pub struct AdmissionTicket {
     filtered_chain: Vec<BackendTarget>,
     resolved: Arc<ResolvedRoute>,
@@ -63,8 +67,8 @@ impl AdmissionTicket {
     ///
     /// The call is idempotent. The selected breaker hold records `succeeded`;
     /// all other breaker holds are dropped as abandoned probes. Rate-limit
-    /// reservation consume is a PR 2 no-op, but the caller-facing lifecycle is
-    /// already shaped for PR 4.
+    /// reservation consume is a no-op by design (ADR-0010); the symmetric
+    /// caller-facing lifecycle is kept for API consistency with `BreakerHold`.
     pub fn consume(&mut self, chain_index: usize, succeeded: bool) {
         if self.consumed.swap(true, Ordering::AcqRel) {
             return;
