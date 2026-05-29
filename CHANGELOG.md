@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no unreleased changes yet)
+### Added
+
+- **`agent-shim copilot models` table output.** The subcommand now
+  prints a fixed-width table with model id, family, context window,
+  max output tokens, advertised effort values, thinking-budget shape
+  (adaptive vs static), and vision/tool flags. `--format json`
+  preserves the previous shape (now richer — see below) for piping
+  to `jq`.
+- **Copilot `/models` parser extracts the full reasoning shape.**
+  - `ModelMetadata.supports.reasoning_effort_values: Option<Vec<String>>`
+    captures the upstream-advertised effort list (`["low","medium","high","xhigh"]`
+    on GPT-5/Gemini families; `None` on models without it).
+    `ModelSupports::reasoning_effort: Option<bool>` continues to be
+    the authoritative "does it accept any effort knob" signal, now
+    derived from any of (`reasoning_effort: [...]`, `thinking: true`,
+    `adaptive_thinking: true`).
+  - `ModelMetadata.adaptive_thinking: Option<bool>` flags Anthropic
+    family models' adaptive-thinking mode.
+  - `ModelMetadata.thinking_budget_{min,max}: Option<u32>` capture the
+    numeric range Copilot advertises for thinking-budget-quantified
+    models (typically 1024–32000 for Claude, 128–32768 for Gemini).
+- Per-feature unit tests in `commands::copilot_models::tests` (6) and
+  integration tests in `crates/providers/tests/copilot_models_parse.rs`
+  (4 new) cover the parser and table formatter against the captured
+  real-world fixture.
+
+### Notes
+
+- These fields flow through the existing catalog surface (the public
+  `GET /v1/models` payload, `GET /admin/catalog`, and
+  `agent-shim show-catalog`) automatically — every consumer that
+  reads `ModelMetadata` benefits. `serde(default, skip_serializing_if =
+  "Option::is_none")` keeps payloads backwards-compatible: clients
+  parsing v0.8 catalog JSON will see new fields appear when the
+  upstream supplies them, never when it doesn't.
 
 ## [0.8.0] — 2026-05-29
 

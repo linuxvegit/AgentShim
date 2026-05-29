@@ -29,9 +29,10 @@ async fn main() -> anyhow::Result<()> {
             CopilotCommand::Login { credential_path } => {
                 commands::copilot_login::run(credential_path).await
             }
-            CopilotCommand::Models { credential_path } => {
-                commands::copilot_models::run(credential_path).await
-            }
+            CopilotCommand::Models {
+                credential_path,
+                format,
+            } => commands::copilot_models::run(credential_path, &format).await,
         },
         #[cfg(windows)]
         Commands::Service { sub } => commands::service::run(sub).await,

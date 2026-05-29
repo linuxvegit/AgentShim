@@ -68,6 +68,36 @@ pub fn parse_models_response(raw: &str) -> Result<BTreeMap<String, ModelMetadata
             .and_then(|f| f.as_str())
             .map(|s| s.to_string());
 
+        // Copilot surfaces reasoning capability in two shapes:
+        //   - Anthropic family: `supports.thinking: true` (bool)
+        //   - GPT/Gemini family: `supports.reasoning_effort: ["low","medium",...]`
+        // We collapse both into a single `bool` for the `reasoning_effort`
+        // capability flag while preserving the original array for callers
+        // (e.g. `copilot models` CLI) that want to display the values.
+        let reasoning_effort_values: Option<Vec<String>> = supports
+            .and_then(|s| s.get("reasoning_effort"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty());
+        let reasoning_effort_flag = match (
+            reasoning_effort_values.as_ref(),
+            supports
+                .and_then(|s| s.get("thinking"))
+                .and_then(|v| v.as_bool()),
+            supports
+                .and_then(|s| s.get("adaptive_thinking"))
+                .and_then(|v| v.as_bool()),
+        ) {
+            (Some(values), _, _) if !values.is_empty() => Some(true),
+            (_, Some(b), _) => Some(b),
+            (_, _, Some(b)) => Some(b),
+            _ => None,
+        };
+
         let metadata = ModelMetadata {
             context_window_tokens: limits
                 .and_then(|l| l.get("max_context_window_tokens"))
@@ -91,20 +121,24 @@ pub fn parse_models_response(raw: &str) -> Result<BTreeMap<String, ModelMetadata
                 structured_outputs: supports
                     .and_then(|s| s.get("structured_outputs"))
                     .and_then(|v| v.as_bool()),
-                // Copilot exposes reasoning support as the `thinking` flag
-                // for Claude-family models; for GPT-5 it surfaces as the
-                // `reasoning_effort` array — neither of those is a plain
-                // bool we can read here. Plan default keeps this `None` for
-                // both shapes; future refinement can extract a bool from
-                // the array form.
-                reasoning_effort: supports
-                    .and_then(|s| s.get("thinking"))
-                    .and_then(|v| v.as_bool()),
+                reasoning_effort: reasoning_effort_flag,
+                reasoning_effort_values,
             },
             version: item
                 .get("version")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            adaptive_thinking: supports
+                .and_then(|s| s.get("adaptive_thinking"))
+                .and_then(|v| v.as_bool()),
+            thinking_budget_min: supports
+                .and_then(|s| s.get("min_thinking_budget"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
+            thinking_budget_max: supports
+                .and_then(|s| s.get("max_thinking_budget"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
         };
         out.insert(id.to_string(), metadata);
     }

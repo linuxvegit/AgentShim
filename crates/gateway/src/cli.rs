@@ -67,6 +67,11 @@ pub enum CopilotCommand {
         /// Path to credentials file
         #[arg(long)]
         credential_path: Option<PathBuf>,
+        /// Output format: `table` (default) is a fixed-width aligned
+        /// summary with one row per model; `json` prints the full
+        /// upstream response shape so callers can pipe to jq.
+        #[arg(long, default_value = "table")]
+        format: String,
     },
 }
 

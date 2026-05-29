@@ -50,6 +50,20 @@ pub struct ModelMetadata {
     pub supports: ModelSupports,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Whether the upstream's "adaptive thinking" mode is available
+    /// (Anthropic family on Copilot exposes `adaptive_thinking: true`
+    /// alongside a budget range; `None` for upstreams that don't
+    /// surface the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_thinking: Option<bool>,
+    /// Minimum tokens the upstream accepts for a thinking budget.
+    /// `None` when the model doesn't take a numeric budget at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_min: Option<u32>,
+    /// Maximum tokens the upstream accepts for a thinking budget.
+    /// `None` when the model doesn't take a numeric budget at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_max: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,8 +77,18 @@ pub struct ModelSupports {
     pub streaming: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_outputs: Option<bool>,
+    /// Bool form: whether the model accepts a reasoning-effort knob at
+    /// all. Derived by upstream parsers — typically `Some(true)` when
+    /// `reasoning_effort_values` is a non-empty list, `Some(false)`
+    /// when the upstream explicitly says so, `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<bool>,
+    /// The list of effort strings the upstream advertises (e.g.
+    /// `["low","medium","high","xhigh"]`). Empty / missing when the
+    /// upstream doesn't surface the list; the bool above remains the
+    /// authoritative "does it accept any" signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_values: Option<Vec<String>>,
 }
 
 pub type ModelCatalog = Vec<ModelRecord>;
@@ -105,8 +129,12 @@ mod tests {
                 streaming: Some(true),
                 structured_outputs: None,
                 reasoning_effort: Some(true),
+                reasoning_effort_values: Some(vec!["low".into(), "medium".into(), "high".into()]),
             },
             version: None,
+            adaptive_thinking: Some(true),
+            thinking_budget_min: Some(1024),
+            thinking_budget_max: Some(32000),
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: ModelMetadata = serde_json::from_str(&json).unwrap();

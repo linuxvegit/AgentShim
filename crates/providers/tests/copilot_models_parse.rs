@@ -74,3 +74,52 @@ fn invalid_json_is_a_decode_error() {
     let msg = format!("{err}");
     assert!(msg.contains("models response"), "got: {msg}");
 }
+
+#[test]
+fn parses_reasoning_effort_array_for_gpt_family() {
+    // Bump in v0.8.0: parser now extracts the `reasoning_effort: [...]`
+    // array Copilot exposes for GPT-5 family models.
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    let m = parsed.get("gpt-5.5").expect("entry for gpt-5.5");
+    // Confirms the array is captured verbatim (canonical 6-value vocabulary).
+    assert_eq!(
+        m.supports.reasoning_effort_values.as_deref(),
+        Some(&vec![
+            "none".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "xhigh".to_string(),
+        ][..])
+    );
+    // Bool form derived from the array — non-empty means yes.
+    assert_eq!(m.supports.reasoning_effort, Some(true));
+}
+
+#[test]
+fn parses_adaptive_thinking_and_budget_for_claude_family() {
+    // Anthropic family on Copilot reports its thinking shape via
+    // `adaptive_thinking: true` + min/max budget tokens.
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    let m = parsed
+        .get("claude-opus-4.6")
+        .expect("entry for claude-opus-4.6");
+    assert_eq!(m.adaptive_thinking, Some(true));
+    assert_eq!(m.thinking_budget_min, Some(1024));
+    assert_eq!(m.thinking_budget_max, Some(32000));
+    // Adaptive thinking also implies reasoning effort capability.
+    assert_eq!(m.supports.reasoning_effort, Some(true));
+}
+
+#[test]
+fn entries_without_reasoning_keep_none() {
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    let m = parsed.get("gpt-4o").expect("entry for gpt-4o");
+    assert_eq!(m.supports.reasoning_effort_values, None);
+    assert_eq!(m.adaptive_thinking, None);
+    assert_eq!(m.thinking_budget_min, None);
+    assert_eq!(m.thinking_budget_max, None);
+}
