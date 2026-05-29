@@ -12,7 +12,9 @@
 //! re-implemented across three handlers (with subtle drift) now sits behind
 //! [`dispatch`] and can be tested through it once.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
@@ -45,10 +47,9 @@ pub struct PipelineSpec<'a> {
     /// and threaded through to the provider via the resolved policy. Today
     /// only the Anthropic frontend uses this.
     pub capture_anthropic_headers: bool,
-    /// If true, attempt `provider.proxy_raw` before decoding the body. Today
-    /// only the OpenAI Responses frontend uses this — its raw passthrough
-    /// avoids a parse/re-encode round-trip when the upstream natively speaks
-    /// the Responses API.
+    /// If true, attempt `provider.proxy_raw` after admission. Anthropic
+    /// Messages and OpenAI Responses use this to avoid a re-encode round-trip
+    /// when the upstream natively speaks the same wire dialect.
     pub try_proxy_raw: bool,
     /// If true, emit a final usage log line when the streaming response is
     /// dropped. The Anthropic handler did this with a drop-guard for
@@ -286,9 +287,9 @@ async fn dispatch_inner(
         agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
     };
 
-    // Resolve the route up front. The Responses passthrough path needs the
-    // target before it has decoded the body, so route resolution has to come
-    // first regardless of which path we take.
+    // Resolve the route up front. Raw passthrough needs the target before
+    // dispatching, so route resolution has to come first regardless of which
+    // path we take.
     let model_alias = if spec.try_proxy_raw {
         // For raw passthrough we have to peek at the body for the model.
         extract_model_from_body(&body)?
@@ -424,10 +425,9 @@ async fn dispatch_inner(
     // (see Plan 04 P04 T3).
     // The chain is non-empty by router invariant (singular routes produce
     // 1-element vecs; array routes are validated to be non-empty by
-    // `validate_routes`). The capability gate, the request log line, and
-    // the proxy_raw short-circuit all run against `chain[0]`'s provider —
-    // chain-element-aware capability checking is intentionally out of
-    // scope for v0.4 (potential P03+ extension).
+    // `validate_routes`). Route policy and request logging still use the
+    // configured chain head; admission validates and filters the full chain
+    // before any provider call.
     let first_target = resolved_route
         .chain
         .first()
@@ -435,135 +435,23 @@ async fn dispatch_inner(
         .clone();
     let upstream_model = first_target.model.clone();
 
-    let first_provider = state
-        .core
-        .providers
-        .get(&first_target.provider)
-        .ok_or_else(|| {
-            tracing::error!(provider = %first_target.provider, "provider not registered");
-            HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
-                first_target.provider.clone(),
-            ))
-        })?;
-
-    // Raw-passthrough short-circuit: only the Responses frontend uses this.
-    // We don't know reasoning_effort etc. without decoding the body, so log
-    // the route default as the best approximation. The passthrough path is
-    // single-upstream by nature: it bypasses the canonical decode/encode
-    // round-trip and so cannot itself participate in chain fallback.
-    //
-    // Plan 04 P02 T6: when proxy_raw returns `Err`, fall through to the
-    // canonical decode path so the chain walk (`ResilientCaller`) gets the
-    // chance to try chain[1..]. The cost is an extra attempt at chain[0]
-    // via `complete()` — likely also failing — before fallback fires, but
-    // proxy_raw failures are rare and the alternative (terminating on
-    // chain[0]'s passthrough error and skipping fallback) violates the
-    // user-visible contract that a non-empty `upstreams: [...]` chain
-    // tries every element on eligible failures.
-    //
-    // `Ok(None)` (proxy_raw not applicable for this frontend) and `Err(_)`
-    // both fall through. Successful proxy_raw returns the stream as-is —
-    // resilience-layer handling for that case is intentionally out of
-    // scope for v0.4.
-    //
-    // Plan 04 P04 T5 — KNOWN GAP (v0.5): when proxy_raw returns
-    // `Ok(Some(...))` and serves the response without a canonical
-    // round-trip, the rate-limit and breaker gates are bypassed
-    // entirely. Both gates live inside `ResilientCaller::complete`,
-    // which the proxy_raw fast path skips. Gating at the top of the
-    // `try_proxy_raw` block double-consumes when proxy_raw falls
-    // through to the canonical path; gating only inside `Ok(Some(...))`
-    // means proxy_raw has already committed upstream resources by the
-    // time we'd reject. Either fix needs a small refactor (e.g. an
-    // explicit RateLimitTicket value that's only consumed when the
-    // request actually completes) — out of scope for v0.4. The
-    // `crates/gateway/tests/rate_limit_per_key_envelope.rs` Anthropic
-    // test routes through an OAI-compat upstream specifically to
-    // exercise the canonical-path gate.
-    if spec.try_proxy_raw {
-        // Don't pre-emit the request log here: when proxy_raw returns
-        // `Ok(None)` or `Err(_)` we fall through to the canonical
-        // decode path, which emits a full structured log line
-        // including inbound/outbound effort and ctxWindow. Emitting a
-        // shorter line here would just duplicate the line for every
-        // non-raw-passthrough request (Anthropic-to-Copilot is the
-        // common case — no Copilot upstream implements Anthropic
-        // raw passthrough today). Successful passthrough emits its
-        // own log line in the `Ok(Some(...))` arm below.
-
-        match first_provider
-            .proxy_raw(body.clone(), first_target.clone(), spec.frontend.kind())
-            .await
-        {
-            Ok(Some((content_type, byte_stream))) => {
-                // Passthrough succeeded — emit a single log line
-                // tagged with the route default effort and (where
-                // available) the upstream context window. We don't
-                // know the inbound effort here without decoding the
-                // body, so the inbound side reads "(unknown)".
-                let upstream_ctx_log: Option<u32> = state
-                    .core
-                    .resolver
-                    .model_index()
-                    .metadata(&first_target.provider, &upstream_model)
-                    .and_then(|m| m.context_window_tokens);
-                tracing::info!(
-                    "→ {} (passthrough) | model: {} → {} | bodyBytes: {} | ctxWindow: {} | reasoning_default: {}",
-                    spec.endpoint_label,
-                    model_alias,
-                    upstream_model,
-                    body_bytes,
-                    upstream_ctx_log
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "?".to_string()),
-                    first_target
-                        .policy
-                        .default_reasoning_effort
-                        .map(|e| e.as_str())
-                        .unwrap_or("none"),
-                );
-                tracing::info!(
-                    "← {} (passthrough) | model: {} → {} | {:.1}s",
-                    spec.endpoint_label,
-                    model_alias,
-                    upstream_model,
-                    started.elapsed().as_secs_f64()
-                );
-                let body_stream =
-                    Body::from_stream(byte_stream.map(|r| r.map_err(|e| e.to_string())));
-                let mut r = Response::new(body_stream);
-                r.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_str(&content_type)
-                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
-                );
-                return Ok(r);
-            }
-            Ok(None) => {
-                // Frontend not supported by this provider's passthrough —
-                // continue to canonical decode below.
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "proxy_raw failed; falling through to canonical chain walk"
-                );
-            }
-        }
-
-        // Passthrough not used (or failed) — fall through with a fresh decode.
-        let canonical = spec
+    // Passthrough still decodes once before admission: the raw inbound bytes
+    // remain the outbound body, but Admission needs canonical facts for
+    // cost and capability gates. This takes ADR-0009 PR 3's decode-for-gates
+    // option instead of relying on the byte-identity capability skip.
+    let mut canonical = match decoded.take() {
+        Some(canonical) => canonical,
+        None => spec
             .frontend
             .decode_request(&body)
-            .map_err(HandlerError::Frontend)?;
-        decoded = Some(canonical);
-    }
-
-    let mut canonical = decoded.expect("canonical request was decoded above");
+            .map_err(HandlerError::Frontend)?,
+    };
 
     if spec.capture_anthropic_headers {
         canonical.inbound_anthropic_headers = capture_anthropic_headers(&headers);
     }
+
+    let mut passthrough_blocked_by_plugin_mutation = false;
 
     // ── Plan 07 P04 spec §6.6 anchor 1: H2 (on_decoded_request) ───────
     // After decode + header capture, before route resolution. The
@@ -575,6 +463,11 @@ async fn dispatch_inner(
         frontend_kind_for_hooks,
         format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
     );
+    let needs_h2_guard = spec.try_proxy_raw
+        && snapshot
+            .plugins
+            .has_on_decoded_request_subscriber((frontend_kind_for_hooks, model_alias.as_str()));
+    let before_h2 = needs_h2_guard.then(|| canonical.clone());
     canonical = snapshot
         .plugins
         .run_on_decoded_request(
@@ -584,6 +477,9 @@ async fn dispatch_inner(
         )
         .await
         .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
+    if let Some(before_h2) = before_h2 {
+        passthrough_blocked_by_plugin_mutation |= canonical != before_h2;
+    }
 
     // Snapshot the merged route policy onto the canonical request. Providers
     // and logging both read from `resolved_policy` so the merge rule lives in
@@ -598,6 +494,16 @@ async fn dispatch_inner(
     // can adapt to per-upstream context (e.g., target-specific prompt
     // shaping). Failure semantics identical to H2 (PluginFailed → 502;
     // Aborted → 400).
+    let needs_h3_guard = spec.try_proxy_raw
+        && snapshot
+            .plugins
+            .has_on_resolved_subscriber((frontend_kind_for_hooks, model_alias.as_str()));
+    // Note: `before_h3` snapshots the canonical AFTER H2, so this strictly
+    // checks whether H3 itself mutated. Combined with the H2 check above
+    // (which OR-s into the same flag), the cumulative semantic is "any
+    // plugin between decode and admission mutated canonical" -- which is
+    // what passthrough cares about (byte body must match what we'd send).
+    let before_h3 = needs_h3_guard.then(|| canonical.clone());
     canonical = snapshot
         .plugins
         .run_on_resolved(
@@ -608,6 +514,9 @@ async fn dispatch_inner(
         )
         .await
         .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
+    if let Some(before_h3) = before_h3 {
+        passthrough_blocked_by_plugin_mutation |= canonical != before_h3;
+    }
 
     let frontend_kind = spec.frontend.kind();
     let route_entry =
@@ -636,6 +545,101 @@ async fn dispatch_inner(
             image_estimator,
         )
         .map_err(|e| handler_error_from_admission(e, frontend_kind))?;
+    let mut ticket = Some(ticket);
+
+    fn unwrap_ticket(ticket: Option<AdmissionTicket>) -> AdmissionTicket {
+        ticket.expect("ticket invariant: present until canonical chain walk consumes")
+    }
+
+    // Raw passthrough is admitted before `provider.proxy_raw`; successful
+    // byte streams consume the ticket on first byte, while fall-through keeps
+    // the same live ticket for the canonical chain walk.
+    if spec.try_proxy_raw && !passthrough_blocked_by_plugin_mutation {
+        let passthrough_target = ticket
+            .as_ref()
+            .and_then(|ticket| ticket.chain().first())
+            .expect("Admission::admit returned an empty chain")
+            .clone();
+        let passthrough_provider = state
+            .core
+            .providers
+            .get(&passthrough_target.provider)
+            .ok_or_else(|| {
+                tracing::error!(provider = %passthrough_target.provider, "provider not registered");
+                HandlerError::Provider(agent_shim_providers::ProviderError::UnknownProvider(
+                    passthrough_target.provider.clone(),
+                ))
+            })?;
+        let passthrough_upstream_model = passthrough_target.model.clone();
+        let passthrough_ticket = unwrap_ticket(ticket.take());
+
+        match passthrough_provider
+            .proxy_raw(
+                body.clone(),
+                passthrough_target.clone(),
+                spec.frontend.kind(),
+            )
+            .await
+        {
+            Ok(Some((content_type, byte_stream))) => {
+                let upstream_ctx_log: Option<u32> = state
+                    .core
+                    .resolver
+                    .model_index()
+                    .metadata(&passthrough_target.provider, &passthrough_upstream_model)
+                    .and_then(|m| m.context_window_tokens);
+                tracing::info!(
+                    "→ {} (passthrough) | model: {} → {} | bodyBytes: {} | ctxWindow: {} | reasoning_default: {}",
+                    spec.endpoint_label,
+                    model_alias,
+                    passthrough_upstream_model,
+                    body_bytes,
+                    upstream_ctx_log
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    passthrough_target
+                        .policy
+                        .default_reasoning_effort
+                        .map(|e| e.as_str())
+                        .unwrap_or("none"),
+                );
+                tracing::info!(
+                    "← {} (passthrough) | model: {} → {} | {:.1}s",
+                    spec.endpoint_label,
+                    model_alias,
+                    passthrough_upstream_model,
+                    started.elapsed().as_secs_f64()
+                );
+                let admitted_byte_stream =
+                    ConsumeOnFirstByteStream::new(byte_stream, passthrough_ticket, 0);
+                let body_stream =
+                    Body::from_stream(admitted_byte_stream.map(|r| r.map_err(|e| e.to_string())));
+                let mut r = Response::new(body_stream);
+                r.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(&content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream")),
+                );
+                return Ok(r);
+            }
+            Ok(None) => {
+                ticket = Some(passthrough_ticket);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proxy_raw failed; falling through to canonical chain walk"
+                );
+                ticket = Some(passthrough_ticket);
+            }
+        }
+    } else if spec.try_proxy_raw && passthrough_blocked_by_plugin_mutation {
+        tracing::info!(
+            route = %model_alias,
+            "proxy_raw skipped: plugins mutated canonical request; falling through to canonical chain walk"
+        );
+    }
+    let ticket = unwrap_ticket(ticket);
 
     let is_stream = canonical.stream;
     let max_tokens = canonical.generation.max_tokens;
@@ -1199,6 +1203,45 @@ impl<S: futures::Stream + Unpin> futures::Stream for GuardedStream<S> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+struct ConsumeOnFirstByteStream {
+    inner: agent_shim_providers::RawByteStream,
+    ticket: Option<AdmissionTicket>,
+    chain_index: usize,
+}
+
+impl ConsumeOnFirstByteStream {
+    fn new(
+        inner: agent_shim_providers::RawByteStream,
+        ticket: AdmissionTicket,
+        chain_index: usize,
+    ) -> Self {
+        Self {
+            inner,
+            ticket: Some(ticket),
+            chain_index,
+        }
+    }
+}
+
+impl futures::Stream for ConsumeOnFirstByteStream {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        let first_byte_succeeded = match &poll {
+            Poll::Ready(Some(Ok(_))) => Some(true),
+            Poll::Ready(Some(Err(_))) => Some(false),
+            _ => None,
+        };
+        if let Some(succeeded) = first_byte_succeeded {
+            if let Some(mut ticket) = self.ticket.take() {
+                ticket.consume(self.chain_index, succeeded);
+            }
+        }
+        poll
     }
 }
 

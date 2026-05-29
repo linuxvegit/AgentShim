@@ -33,6 +33,7 @@ use crate::ResolvedRoute;
 pub struct AdmissionTicket {
     filtered_chain: Vec<BackendTarget>,
     resolved: Arc<ResolvedRoute>,
+    identity: AgentIdentity,
     breaker_holds: Vec<Option<BreakerHold>>,
     rate_limit_reservations: Vec<RateLimitReservation>,
     consumed: AtomicBool,
@@ -45,6 +46,10 @@ impl AdmissionTicket {
 
     pub fn resolved(&self) -> &ResolvedRoute {
         &self.resolved
+    }
+
+    pub fn identity(&self) -> &AgentIdentity {
+        &self.identity
     }
 
     pub(crate) fn breaker_allowed(&self, chain_index: usize) -> bool {
@@ -88,6 +93,7 @@ impl AdmissionTicket {
         Self {
             filtered_chain,
             resolved: Arc::new(resolved),
+            identity: AgentIdentity::Anonymous,
             breaker_holds,
             rate_limit_reservations: Vec::new(),
             consumed: AtomicBool::new(false),
@@ -213,7 +219,9 @@ impl Admission {
             rate_limit_reservations.push(RateLimitReservation {});
         }
 
-        self.check_capability(&filtered_chain[0], request)?;
+        for target in &filtered_chain {
+            self.check_capability(target, request)?;
+        }
 
         let breaker_policy = BreakerPolicy::from(&resolved.breaker);
         let mut breaker_holds = Vec::with_capacity(filtered_chain.len());
@@ -240,6 +248,7 @@ impl Admission {
         Ok(AdmissionTicket {
             filtered_chain,
             resolved: Arc::new(resolved),
+            identity: identity.clone(),
             breaker_holds,
             rate_limit_reservations,
             consumed: AtomicBool::new(false),

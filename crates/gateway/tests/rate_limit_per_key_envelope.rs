@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 
 use agent_shim_config::{
     schema::{
-        AuthConfig, AuthKeyEntry, BreakerConfig, BucketConfigYaml, LoggingConfig,
-        OpenAiCompatibleUpstream, PerKeyConfig, RateLimitConfig, RetryConfig, RouteEntry,
-        ServerConfig, Tier, UpstreamConfig, UpstreamRef,
+        AnthropicUpstream, AuthConfig, AuthKeyEntry, BreakerConfig, BucketConfigYaml,
+        LoggingConfig, OpenAiCompatibleUpstream, PerKeyConfig, RateLimitConfig, RetryConfig,
+        RouteEntry, ServerConfig, Tier, UpstreamConfig, UpstreamRef,
     },
     GatewayConfig, Secret,
 };
@@ -157,18 +157,9 @@ fn make_chat_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
 }
 
 /// Build a single-upstream Anthropic Messages config gated by the
-/// per-key bucket. We deliberately back the route with an
-/// OpenAI-compatible upstream rather than an Anthropic upstream:
-/// `AnthropicProvider::proxy_raw` returns `Some(_)` for inbound
-/// AnthropicMessages and the pipeline streams the bytes back without
-/// entering `ResilientCaller::complete`, which is where the per-key
-/// rate-limit gate lives. Routing the Anthropic-shaped inbound to an
-/// OAI-compat upstream forces the canonical decode + chain walk path
-/// (proxy_raw returns `None` for non-Responses inbound dialects),
-/// which is what fires the per-key bucket. The 429 envelope is still
-/// shaped per the inbound `anthropic_messages` frontend, which is the
-/// load-bearing assertion for this test (envelope shape, not upstream
-/// wire format).
+/// per-key bucket. This route uses an OpenAI-compatible upstream, so
+/// `proxy_raw` is not applicable and the canonical path exercises the
+/// same Anthropic-shaped 429 envelope.
 fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
     let mut upstreams = BTreeMap::new();
     upstreams.insert(
@@ -231,6 +222,138 @@ fn make_anthropic_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
     }
 }
 
+/// Build a native Anthropic route where `AnthropicProvider::proxy_raw`
+/// returns `Some(_)`. PR 3 routes this passthrough path through
+/// `Admission::admit`, so the third request must be rejected by the same
+/// per-key bucket before it can reach the upstream.
+fn make_anthropic_passthrough_config(anthropic_url: &str, key_hash: &str) -> GatewayConfig {
+    let mut upstreams = BTreeMap::new();
+    upstreams.insert(
+        "anthropic".to_string(),
+        UpstreamConfig::Anthropic(AnthropicUpstream {
+            base_url: anthropic_url.to_string(),
+            api_key: Secret::new("test-key"),
+            anthropic_version: "2023-06-01".to_string(),
+            default_headers: BTreeMap::new(),
+            request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
+        }),
+    );
+
+    let (auth, rate_limit) = auth_and_rate_limit_for(key_hash);
+
+    GatewayConfig {
+        server: ServerConfig::default(),
+        logging: LoggingConfig::default(),
+        upstreams,
+        routes: vec![RouteEntry {
+            frontend: "anthropic_messages".to_string(),
+            model: "claude-opus-4-7".to_string(),
+            upstream: None,
+            upstream_model: None,
+            upstreams: vec![UpstreamRef {
+                name: "anthropic".to_string(),
+                model: "claude-opus-4-7-up".to_string(),
+            }],
+            reasoning_effort: None,
+            anthropic_beta: None,
+            retry: RetryConfig {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                multiplier: 2.0,
+                jitter_pct: 0.0,
+                total_budget_ms: 100,
+                retry_on: vec![
+                    "network".into(),
+                    "upstream_5xx".into(),
+                    "upstream_429".into(),
+                ],
+            },
+            breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
+            plugins: None,
+            reasoning_mapping: vec![],
+        }],
+        plugins: ::std::collections::BTreeMap::new(),
+        auth,
+        rate_limit,
+        copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
+        shutdown: Default::default(),
+        validation: Default::default(),
+    }
+}
+
+/// Build a native OpenAI Responses route where `OpenAiCompatibleProvider`
+/// returns raw `/v1/responses` bytes. This covers the PR 3 passthrough gate
+/// for the Responses dialect in parallel with the Anthropic native case.
+fn make_responses_passthrough_config(oai_url: &str, key_hash: &str) -> GatewayConfig {
+    let mut upstreams = BTreeMap::new();
+    upstreams.insert(
+        "oai".to_string(),
+        UpstreamConfig::OpenAiCompatible(OpenAiCompatibleUpstream {
+            base_url: oai_url.to_string(),
+            api_key: Secret::new("test-key"),
+            default_headers: BTreeMap::new(),
+            request_timeout_secs: 30,
+            tier: Tier::Standard,
+            cost: None,
+            p95_latency_budget_ms: None,
+        }),
+    );
+
+    let (auth, rate_limit) = auth_and_rate_limit_for(key_hash);
+
+    GatewayConfig {
+        server: ServerConfig::default(),
+        logging: LoggingConfig::default(),
+        upstreams,
+        routes: vec![RouteEntry {
+            frontend: "openai_responses".to_string(),
+            model: "gpt-4o".to_string(),
+            upstream: None,
+            upstream_model: None,
+            upstreams: vec![UpstreamRef {
+                name: "oai".to_string(),
+                model: "gpt-4o-up".to_string(),
+            }],
+            reasoning_effort: None,
+            anthropic_beta: None,
+            retry: RetryConfig {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                multiplier: 2.0,
+                jitter_pct: 0.0,
+                total_budget_ms: 100,
+                retry_on: vec![
+                    "network".into(),
+                    "upstream_5xx".into(),
+                    "upstream_429".into(),
+                ],
+            },
+            breaker: BreakerConfig::default(),
+            min_tier: None,
+            max_cost_usd: None,
+            plugins: None,
+            reasoning_mapping: vec![],
+        }],
+        plugins: ::std::collections::BTreeMap::new(),
+        auth,
+        rate_limit,
+        copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
+        shutdown: Default::default(),
+        validation: Default::default(),
+    }
+}
+
 async fn spawn_with_config(
     config: GatewayConfig,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
@@ -250,7 +373,7 @@ async fn spawn_with_config(
 }
 
 #[tokio::test]
-async fn per_key_rate_limit_returns_429_with_openai_envelope_chat() {
+async fn rate_limit_per_key_envelope_returns_429_with_openai_envelope_chat() {
     let key_hash = hash_key(PLAINTEXT_KEY);
 
     // Upstream returns 200 for every chat-completions POST. With
@@ -358,16 +481,14 @@ async fn per_key_rate_limit_returns_429_with_openai_envelope_chat() {
 }
 
 #[tokio::test]
-async fn per_key_rate_limit_uses_anthropic_envelope_for_messages_dialect() {
+async fn rate_limit_per_key_envelope_uses_anthropic_envelope_for_messages_dialect() {
     let key_hash = hash_key(PLAINTEXT_KEY);
 
     // Upstream is OpenAI-compatible (chat completions). The route is
     // `anthropic_messages → oai-compat`, so the gateway decodes the
     // Anthropic-shaped inbound, calls the OAI-compat upstream, and
     // re-encodes the canonical response back into Anthropic shape on
-    // the way out. proxy_raw doesn't apply (only OpenAI Responses uses
-    // it), so the canonical chain walk runs for every request — which
-    // is the only path that consults the per-key rate-limit gate.
+    // the way out. proxy_raw does not apply to this provider/frontend pair.
     let mut server = mockito::Server::new_async().await;
     let upstream = server
         .mock("POST", "/v1/chat/completions")
@@ -452,6 +573,162 @@ async fn per_key_rate_limit_uses_anthropic_envelope_for_messages_dialect() {
     // Critical D9 invariant: Anthropic dialect must NOT carry an
     // `error.code` field. A regression that copies the OpenAI body
     // builder onto the Anthropic path would surface here.
+    assert!(
+        body["error"].get("code").is_none(),
+        "Anthropic envelope must NOT carry error.code; got: {body}"
+    );
+
+    upstream.assert_async().await;
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn rate_limit_per_key_envelope_gates_responses_native_passthrough() {
+    let key_hash = hash_key(PLAINTEXT_KEY);
+
+    let mut server = mockito::Server::new_async().await;
+    let upstream = server
+        .mock("POST", "/v1/responses")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n")
+        .expect(2)
+        .create_async()
+        .await;
+
+    let cfg = make_responses_passthrough_config(&server.url(), &key_hash);
+    let (addr, tx) = spawn_with_config(cfg).await;
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "stream": true
+    });
+    let url = format!("http://{}/v1/responses", addr);
+    let client = reqwest::Client::new();
+
+    for i in 0..2 {
+        let resp = client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", PLAINTEXT_KEY))
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("request {i} failed: {e}"));
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i}: expected 200 (burst not yet consumed); body: {}",
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {}", PLAINTEXT_KEY))
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .expect("request 3 send failed");
+    assert_eq!(resp.status(), 429, "request 3: expected 429");
+
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    assert!(
+        retry_after.is_some(),
+        "request 3: missing Retry-After header"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("request 3 json body");
+    assert_eq!(
+        body["error"]["type"], "rate_limit_error",
+        "OpenAI envelope error.type mismatch: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"], "rate_limited_per_key",
+        "OpenAI envelope error.code mismatch: {body}"
+    );
+
+    upstream.assert_async().await;
+    let _ = tx.send(());
+}
+
+#[tokio::test]
+async fn rate_limit_per_key_envelope_gates_anthropic_native_passthrough_messages_dialect() {
+    let key_hash = hash_key(PLAINTEXT_KEY);
+
+    let mut server = mockito::Server::new_async().await;
+    let upstream = server
+        .mock("POST", "/v1/messages")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"msg_1","type":"message","role":"assistant","content":[]}"#)
+        .expect(2)
+        .create_async()
+        .await;
+
+    let cfg = make_anthropic_passthrough_config(&server.url(), &key_hash);
+    let (addr, tx) = spawn_with_config(cfg).await;
+
+    let request_body = serde_json::json!({
+        "model": "claude-opus-4-7",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let url = format!("http://{}/v1/messages", addr);
+    let client = reqwest::Client::new();
+
+    for i in 0..2 {
+        let resp = client
+            .post(&url)
+            .header("authorization", format!("Bearer {}", PLAINTEXT_KEY))
+            .header("content-type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("request {i} failed: {e}"));
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i}: expected 200 (burst not yet consumed); body: {}",
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {}", PLAINTEXT_KEY))
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .expect("request 3 send failed");
+    assert_eq!(resp.status(), 429, "request 3: expected 429");
+
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    assert!(
+        retry_after.is_some(),
+        "request 3: missing Retry-After header"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("request 3 json body");
+    assert_eq!(
+        body["type"], "error",
+        "Anthropic envelope outer type mismatch: {body}"
+    );
+    assert_eq!(
+        body["error"]["type"], "rate_limit_error",
+        "Anthropic envelope error.type mismatch: {body}"
+    );
     assert!(
         body["error"].get("code").is_none(),
         "Anthropic envelope must NOT carry error.code; got: {body}"

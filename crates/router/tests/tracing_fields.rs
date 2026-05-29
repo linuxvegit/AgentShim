@@ -432,7 +432,7 @@ async fn rate_limit_rejected_event_has_standard_fields() {
 
 #[tokio::test]
 #[traced_test]
-async fn request_completed_event_emits_on_success() {
+async fn tracing_fields_request_completed_event_emits_on_success() {
     let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
         map: HashMap::from([(
             "openai".to_string(),
@@ -456,6 +456,6 @@ async fn request_completed_event_emits_on_success() {
     assert!(logs_contain("request.completed"));
     assert!(logs_contain("outcome=\"success\""));
     assert!(logs_contain("total_elapsed_ms="));
-    assert!(logs_contain("identity=\"admitted\""));
+    assert!(logs_contain("identity=anonymous"));
     assert!(logs_contain("frontend_model=openai_chat/gpt-4o"));
 }

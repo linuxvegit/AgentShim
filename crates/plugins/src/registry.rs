@@ -325,6 +325,16 @@ impl PluginRegistry {
         fp.wildcard.as_ref()
     }
 
+    pub fn has_on_decoded_request_subscriber(&self, route: (FrontendKind, &str)) -> bool {
+        self.lookup(route.0, route.1)
+            .is_some_and(|plan| !plan.on_decoded_request.is_empty())
+    }
+
+    pub fn has_on_resolved_subscriber(&self, route: (FrontendKind, &str)) -> bool {
+        self.lookup(route.0, route.1)
+            .is_some_and(|plan| !plan.on_resolved.is_empty())
+    }
+
     /// H2 hook chain walk. Spec §6.2 / §6.3 / §6.4 / §4.5.
     ///
     /// Walks the route's `on_decoded_request` list in declaration order.
@@ -1816,6 +1826,37 @@ mod tests {
             PluginRegistry::build(vec![], &[], &[], crate::FactoryDependencies::empty()).unwrap();
         assert!(reg.plugins.is_empty());
         assert!(reg.plans.is_empty());
+    }
+
+    #[test]
+    fn subscriber_predicates_report_route_hook_presence() {
+        let empty = PluginRegistry::empty();
+        assert!(!empty.has_on_decoded_request_subscriber((FrontendKind::OpenAiResponses, "x")));
+        assert!(!empty.has_on_resolved_subscriber((FrontendKind::OpenAiResponses, "x")));
+
+        struct H2Only;
+        #[async_trait]
+        impl crate::Plugin for H2Only {
+            fn kind_name(&self) -> &'static str {
+                "h2_only"
+            }
+
+            fn hooks(&self) -> crate::HookSet {
+                crate::HookSet::DECODED_REQUEST
+            }
+        }
+
+        let registry = PluginRegistry::for_testing_single_plugin(
+            "h2",
+            Arc::new(H2Only),
+            OnError::Skip,
+            Hook::DecodedRequest,
+            FrontendKind::OpenAiResponses,
+            "x",
+        );
+
+        assert!(registry.has_on_decoded_request_subscriber((FrontendKind::OpenAiResponses, "x")));
+        assert!(!registry.has_on_resolved_subscriber((FrontendKind::OpenAiResponses, "x")));
     }
 
     #[test]

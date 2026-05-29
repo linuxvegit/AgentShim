@@ -102,6 +102,7 @@ impl ResilientCaller {
         let request_id = uuid::Uuid::new_v4().to_string();
         let start = Instant::now();
         let frontend_model = ticket.resolved().route_label.to_string();
+        let identity = ticket.identity().log_id().to_string();
 
         // Run the chain walk in an inner async block so we can emit the
         // `request.completed` summary on every exit path.
@@ -146,7 +147,7 @@ impl ResilientCaller {
                 target: "agent_shim::resilience",
                 event_name = "request.completed",
                 request_id = %request_id,
-                identity = "admitted",
+                identity = %identity,
                 frontend_model = %frontend_model,
                 outcome = outcome,
                 total_elapsed_ms = total_elapsed_ms,
@@ -158,7 +159,7 @@ impl ResilientCaller {
                 target: "agent_shim::resilience",
                 event_name = "request.completed",
                 request_id = %request_id,
-                identity = "admitted",
+                identity = %identity,
                 frontend_model = %frontend_model,
                 outcome = outcome,
                 total_elapsed_ms = total_elapsed_ms,
@@ -340,9 +341,15 @@ impl Stream for ConsumeOnFirstEventStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.inner.as_mut().poll_next(cx);
-        if matches!(poll, Poll::Ready(Some(_))) {
+        let first_event_succeeded = match &poll {
+            Poll::Ready(Some(Ok(StreamEvent::Error { .. }))) => Some(false),
+            Poll::Ready(Some(Ok(_))) => Some(true),
+            Poll::Ready(Some(Err(_))) => Some(false),
+            _ => None,
+        };
+        if let Some(succeeded) = first_event_succeeded {
             if let Some(mut ticket) = self.ticket.take() {
-                ticket.consume(self.chain_index, true);
+                ticket.consume(self.chain_index, succeeded);
             }
         }
         poll
@@ -808,6 +815,75 @@ mod tests {
         assert_eq!(
             registry.decision("a", "gpt-4o", &policy),
             BreakerDecision::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_records_failure_on_first_stream_error_event() {
+        let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
+            map: HashMap::from([(
+                "a".to_string(),
+                MockProvider::new(
+                    "a",
+                    vec![Ok(vec![StreamEvent::Error {
+                        message: "upstream error chunk".into(),
+                    }])],
+                ) as Arc<_>,
+            )]),
+        });
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let breaker = open_on_single_failure_breaker_config();
+        let policy = BreakerPolicy::from(&breaker);
+        let chain = vec![target("a")];
+        let ticket = ticket_for(chain, &registry, fast_retry_config(1), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+
+        let mut stream = caller.complete(ticket, dummy_request()).await.unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Ok(StreamEvent::Error { .. })
+        ));
+        drop(stream);
+
+        assert_eq!(
+            registry.decision("a", "gpt-4o", &policy),
+            BreakerDecision::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_records_failure_on_empty_stream() {
+        let providers: Arc<dyn ProviderLookup> = Arc::new(InMemoryProviders {
+            map: HashMap::from([(
+                "a".to_string(),
+                MockProvider::new("a", vec![Ok(vec![])]) as Arc<_>,
+            )]),
+        });
+        let registry = Arc::new(BreakerRegistry::with_system_clock());
+        let breaker = open_on_single_failure_breaker_config();
+        let policy = BreakerPolicy::from(&breaker);
+        let chain = vec![target("a")];
+        let ticket = ticket_for(chain, &registry, fast_retry_config(1), breaker);
+        let caller = ResilientCaller::new(
+            providers,
+            Arc::clone(&registry),
+            disabled_limiter(),
+            disabled_probe(),
+        );
+
+        let mut stream = caller.complete(ticket, dummy_request()).await.unwrap();
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        assert_eq!(
+            registry.decision("a", "gpt-4o", &policy),
+            BreakerDecision::Skip,
+            "empty-stream first-byte case must record as abandoned-probe failure"
         );
     }
 

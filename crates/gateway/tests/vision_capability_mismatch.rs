@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_shim_config::GatewayConfig;
+use agent_shim_config::{schema::UpstreamRef, BreakerConfig, GatewayConfig, RetryConfig};
 use agent_shim_core::{
     BackendTarget, CanonicalRequest, CanonicalStream, FrontendKind, RoutePolicy,
 };
@@ -34,7 +34,8 @@ use agent_shim_providers::{
 };
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
-    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, StaticRouter,
+    BreakerDecision, BreakerPolicy, BreakerRegistry, ModelResolver, ProviderLookup,
+    ResilientCaller, StaticRouter,
 };
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
@@ -90,6 +91,45 @@ impl BackendProvider for TextOnlyStubProvider {
             "TextOnlyStubProvider::complete called — the capability gate must reject \
              image-bearing requests BEFORE provider dispatch (Plan 04 T1)"
         );
+    }
+}
+
+/// Vision-capable chain head used by the fallback regression. Its breaker is
+/// pre-opened, so dispatch must never reach this provider during the test.
+struct VisionStubProvider {
+    capabilities: ProviderCapabilities,
+}
+
+impl VisionStubProvider {
+    fn new() -> Self {
+        Self {
+            capabilities: ProviderCapabilities {
+                streaming: true,
+                tool_use: false,
+                vision: true,
+                json_mode: false,
+                accepts_xhigh: false,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl BackendProvider for VisionStubProvider {
+    fn name(&self) -> &'static str {
+        "vision-stub"
+    }
+
+    fn capabilities(&self) -> &ProviderCapabilities {
+        &self.capabilities
+    }
+
+    async fn complete(
+        &self,
+        _req: CanonicalRequest,
+        _target: BackendTarget,
+    ) -> Result<CanonicalStream, ProviderError> {
+        panic!("VisionStubProvider::complete called — its breaker should be open")
     }
 }
 
@@ -223,6 +263,157 @@ fn make_app_state() -> AppState {
     }
 }
 
+fn open_on_single_failure_breaker() -> BreakerConfig {
+    BreakerConfig {
+        enabled: true,
+        failure_threshold_pct: 100,
+        min_requests: 1,
+        window_secs: 60,
+        open_cooldown_secs: 30,
+    }
+}
+
+fn make_fallback_app_state_with_open_head_breaker() -> AppState {
+    let keepalive = Some(Duration::from_secs(15));
+    let anthropic = Arc::new(AnthropicMessages { keepalive });
+    let openai = Arc::new(OpenAiChat {
+        keepalive,
+        clock_override: None,
+    });
+    let openai_responses = Arc::new(OpenAiResponses {
+        keepalive,
+        clock_override: None,
+    });
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(
+        "vision-head".into(),
+        Arc::new(VisionStubProvider::new()) as Arc<dyn BackendProvider>,
+    );
+    registry.register(
+        "text-fallback".into(),
+        Arc::new(TextOnlyStubProvider::new()) as Arc<dyn BackendProvider>,
+    );
+
+    let breaker = open_on_single_failure_breaker();
+    let cfg = GatewayConfig {
+        server: Default::default(),
+        logging: Default::default(),
+        upstreams: Default::default(),
+        routes: vec![agent_shim_config::RouteEntry {
+            frontend: "openai_chat".to_string(),
+            model: "fallback-vision-model".to_string(),
+            upstream: None,
+            upstream_model: None,
+            upstreams: vec![
+                UpstreamRef {
+                    name: "vision-head".to_string(),
+                    model: "gpt-4o".to_string(),
+                },
+                UpstreamRef {
+                    name: "text-fallback".to_string(),
+                    model: "gpt-4o".to_string(),
+                },
+            ],
+            reasoning_effort: None,
+            anthropic_beta: None,
+            retry: RetryConfig {
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                multiplier: 2.0,
+                jitter_pct: 0.0,
+                total_budget_ms: 100,
+                retry_on: vec![
+                    "network".into(),
+                    "upstream_5xx".into(),
+                    "upstream_429".into(),
+                ],
+            },
+            breaker: breaker.clone(),
+            min_tier: None,
+            max_cost_usd: None,
+            plugins: None,
+            reasoning_mapping: vec![],
+        }],
+        plugins: ::std::collections::BTreeMap::new(),
+        auth: Default::default(),
+        rate_limit: Default::default(),
+        copilot: None,
+        admin: None,
+        metrics: Default::default(),
+        otel: None,
+        shutdown: Default::default(),
+        validation: Default::default(),
+    };
+    let static_router = Arc::new(StaticRouter::from_config(&cfg));
+    let model_index = Arc::new(ModelIndex::new(Default::default()));
+    let resolver = Arc::new(ModelResolver::new(static_router, model_index));
+    let chain = resolver
+        .resolve(FrontendKind::OpenAiChat, "fallback-vision-model")
+        .expect("test setup: fallback route must resolve");
+    assert_eq!(chain[0].provider, "vision-head");
+    assert_eq!(chain[1].provider, "text-fallback");
+
+    let providers = Arc::new(registry);
+    struct Lookup(Arc<ProviderRegistry>);
+    impl ProviderLookup for Lookup {
+        fn get(&self, name: &str) -> Option<Arc<dyn BackendProvider>> {
+            self.0.get(name)
+        }
+    }
+    let provider_lookup: Arc<dyn ProviderLookup> = Arc::new(Lookup(Arc::clone(&providers)));
+    let breaker_registry = Arc::new(BreakerRegistry::with_system_clock());
+    let breaker_policy = BreakerPolicy::from(&breaker);
+    breaker_registry.record("vision-head", "gpt-4o", false, &breaker_policy);
+    assert_eq!(
+        breaker_registry.decision("vision-head", "gpt-4o", &breaker_policy),
+        BreakerDecision::Skip
+    );
+    let limiter_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+        agent_shim_router::LimiterRegistry::disabled(),
+    ));
+    let latency_probe = Arc::new(agent_shim_router::DisabledLatencyProbe)
+        as Arc<dyn agent_shim_router::LatencyProbe>;
+    let admission = Arc::new(agent_shim_router::Admission::new(
+        Arc::clone(&limiter_registry),
+        Arc::clone(&breaker_registry),
+        Arc::clone(&provider_lookup),
+        Arc::clone(&latency_probe),
+    ));
+    let resilient_caller = Arc::new(ResilientCaller::new(
+        provider_lookup,
+        Arc::clone(&breaker_registry),
+        Arc::clone(&limiter_registry),
+        Arc::clone(&latency_probe),
+    ));
+
+    AppState {
+        core: Arc::new(AppCore {
+            config_path: None,
+            server_config: cfg.server.clone(),
+            admin_config: cfg.admin.clone(),
+            anthropic,
+            openai,
+            openai_responses,
+            providers,
+            resolver,
+            resilient_caller,
+            admission,
+            breaker_registry,
+            limiter_registry,
+            metrics: agent_shim_observability::install_metrics(&Default::default()),
+            reload_tx: tokio::sync::mpsc::channel(1).0,
+        }),
+        snapshot: Arc::new(arc_swap::ArcSwap::new(Arc::new(AppSnapshot {
+            config: Arc::new(cfg),
+            auth_enabled: false,
+            auth_required: false,
+            configured_key_hashes: Arc::new(std::collections::HashSet::new()),
+            plugins: Arc::new(agent_shim_plugins::PluginRegistry::empty()),
+        }))),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 /// Anthropic-style request body carrying a single image block. Uses the
@@ -306,6 +497,46 @@ async fn openai_image_against_text_only_provider_rejected_before_upstream() {
     // Body shape: OpenAI envelope.
     //   {"error":{"message":...,"type":"invalid_request_error","code":"capability_mismatch"}}
     assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "capability_mismatch");
+    let msg = body["error"]["message"].as_str().expect("message present");
+    assert!(
+        msg.contains("vision"),
+        "expected message to mention vision, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn vision_capability_mismatch_rejects_text_only_fallback_even_when_head_breaker_open() {
+    let app = build_router(make_fallback_app_state_with_open_head_breaker());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "model": "fallback-vision-model",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+                    ]
+                }]
+            }"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "capability mismatch must reject before breaker fallback reaches text-only provider"
+    );
+
+    let body_bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["error"]["code"], "capability_mismatch");
     let msg = body["error"]["message"].as_str().expect("message present");
     assert!(
