@@ -8,3 +8,6 @@
 
 # Local Claude Code worktrees (project-local isolated branches)
 .claude/worktrees/
+# Local Claude Code state (cron locks, per-machine settings)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
