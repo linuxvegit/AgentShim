@@ -19,7 +19,7 @@ use agent_shim_providers::{
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
     BreakerRegistry, Clock, LimiterRegistry, ModelResolver, ProviderLookup, ResilientCaller,
-    Router, StaticRouter, SystemClock,
+    StaticRouter, SystemClock,
 };
 
 /// Adapter that lets `ResilientCaller` (in the router crate) look up
@@ -302,7 +302,7 @@ impl AppState {
             }
         };
 
-        let static_router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&config));
+        let static_router = Arc::new(StaticRouter::from_config(&config));
 
         let mut discovered: std::collections::HashMap<
             String,

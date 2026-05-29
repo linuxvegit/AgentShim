@@ -3,8 +3,9 @@
 //! [`ModelResolver`] is the deep module callers actually want. It owns the
 //! `Router` trait (static config table) and the `ModelIndex` (fuzzy match
 //! against the upstream's discovered model list) as **internal seams**, and
-//! exposes a single [`ModelResolver::resolve`] method. Two-step composition
-//! that used to live in the gateway pipeline now lives behind the interface.
+//! exposes [`ModelResolver::resolve`] / [`ModelResolver::resolve_route`].
+//! Two-step composition that used to live in the gateway pipeline now lives
+//! behind the interface.
 //!
 //! Tests for the static and fuzzy halves still live with their respective
 //! types ([`crate::static_routes`], [`crate::model_index`]) — those interfaces
@@ -13,22 +14,21 @@
 
 use std::sync::Arc;
 
-use agent_shim_config::RetryConfig;
 use agent_shim_core::{BackendTarget, FrontendKind};
 
 use crate::model_index::ModelIndex;
-use crate::{RouteError, Router};
+use crate::{ResolvedRoute, RouteError, Router, StaticRouter};
 
 /// The single entry point for turning `(frontend, model_alias)` into a
 /// `BackendTarget`. Composes the static route table with fuzzy model-name
 /// matching against discovered upstream models.
 pub struct ModelResolver {
-    static_router: Arc<dyn Router>,
+    static_router: Arc<StaticRouter>,
     model_index: Arc<ModelIndex>,
 }
 
 impl ModelResolver {
-    pub fn new(static_router: Arc<dyn Router>, model_index: Arc<ModelIndex>) -> Self {
+    pub fn new(static_router: Arc<StaticRouter>, model_index: Arc<ModelIndex>) -> Self {
         Self {
             static_router,
             model_index,
@@ -60,7 +60,21 @@ impl ModelResolver {
         frontend: FrontendKind,
         model_alias: &str,
     ) -> Result<Vec<BackendTarget>, RouteError> {
-        let mut chain = self.static_router.resolve(frontend, model_alias)?;
+        self.resolve_route(frontend, model_alias)
+            .map(|route| route.chain)
+    }
+
+    pub fn resolve_route(
+        &self,
+        frontend: FrontendKind,
+        model_alias: &str,
+    ) -> Result<ResolvedRoute, RouteError> {
+        let mut resolved = self.static_router.resolve_route(frontend, model_alias)?;
+        self.apply_fuzzy_upgrades(&mut resolved.chain);
+        Ok(resolved)
+    }
+
+    fn apply_fuzzy_upgrades(&self, chain: &mut [BackendTarget]) {
         for target in chain.iter_mut() {
             if let Some(canonical) = self.model_index.resolve(&target.provider, &target.model) {
                 if canonical != target.model {
@@ -74,30 +88,6 @@ impl ModelResolver {
                 }
             }
         }
-        Ok(chain)
-    }
-
-    /// Look up the per-route retry policy. Delegates to the static router.
-    /// Returns `None` if no route entry matched — callers fall back to
-    /// `RetryConfig::default()` (the §4.5/D12 defaults).
-    pub fn find_retry_policy(
-        &self,
-        frontend: FrontendKind,
-        model_alias: &str,
-    ) -> Option<RetryConfig> {
-        self.static_router.find_retry_policy(frontend, model_alias)
-    }
-
-    /// Look up the per-route breaker policy. Delegates to the static
-    /// router. Returns `None` if no route entry matched — callers fall
-    /// back to `BreakerConfig::default()` (the §4.5/D6 defaults).
-    pub fn find_breaker_policy(
-        &self,
-        frontend: FrontendKind,
-        model_alias: &str,
-    ) -> Option<agent_shim_config::BreakerConfig> {
-        self.static_router
-            .find_breaker_policy(frontend, model_alias)
     }
 
     /// Build the public model catalog from the static route table plus the
@@ -128,9 +118,10 @@ impl ModelResolver {
             if alias == "*" {
                 continue;
             }
-            let Ok(chain) = self.static_router.resolve(frontend, &alias) else {
+            let Ok(resolved) = self.resolve_route(frontend, &alias) else {
                 continue;
             };
+            let chain = resolved.chain;
             // For metadata lookup, use the chain head's (provider, model).
             let head = match chain.first() {
                 Some(h) => h,
@@ -261,7 +252,7 @@ mod tests {
     }
 
     fn resolver_with(cfg: GatewayConfig, provider: &str, discovered: &[&str]) -> ModelResolver {
-        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let router = Arc::new(StaticRouter::from_config(&cfg));
         let mut map = HashMap::new();
         let set: BTreeSet<String> = discovered.iter().map(|s| s.to_string()).collect();
         map.insert(provider.to_string(), set);
@@ -365,7 +356,7 @@ mod tests {
             shutdown: Default::default(),
             validation: Default::default(),
         };
-        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let router = Arc::new(StaticRouter::from_config(&cfg));
 
         let mut map = HashMap::new();
         map.insert("openai".to_string(), {
@@ -439,7 +430,7 @@ mod tests {
         use agent_shim_core::{ModelMetadata, ModelSupports};
 
         let cfg = cfg_with_route("openai_chat", "gpt-5.5", "copilot", "gpt-5.5");
-        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let router = Arc::new(StaticRouter::from_config(&cfg));
         let mut all = HashMap::new();
         let mut map = BTreeMap::new();
         map.insert(
@@ -467,7 +458,7 @@ mod tests {
     #[test]
     fn list_catalog_omits_metadata_when_index_is_empty() {
         let cfg = cfg_with_route("openai_chat", "gpt-4o", "openai", "gpt-4o");
-        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let router = Arc::new(StaticRouter::from_config(&cfg));
         let resolver = ModelResolver::new(router, Arc::new(ModelIndex::empty()));
         let cat = resolver.list_catalog();
         assert!(cat[0].metadata.is_none());
@@ -492,7 +483,7 @@ mod tests {
             "copilot",
             "claude-opus-4.7-1m-internal",
         ));
-        let router: Arc<dyn Router> = Arc::new(StaticRouter::from_config(&cfg));
+        let router = Arc::new(StaticRouter::from_config(&cfg));
         let mut all = HashMap::new();
         let mut map = BTreeMap::new();
         map.insert(

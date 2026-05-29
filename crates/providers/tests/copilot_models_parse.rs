@@ -85,13 +85,15 @@ fn parses_reasoning_effort_array_for_gpt_family() {
     // Confirms the array is captured verbatim (canonical 6-value vocabulary).
     assert_eq!(
         m.supports.reasoning_effort_values.as_deref(),
-        Some(&vec![
-            "none".to_string(),
-            "low".to_string(),
-            "medium".to_string(),
-            "high".to_string(),
-            "xhigh".to_string(),
-        ][..])
+        Some(
+            &vec![
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ][..],
+        )
     );
     // Bool form derived from the array — non-empty means yes.
     assert_eq!(m.supports.reasoning_effort, Some(true));

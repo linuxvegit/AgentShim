@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
 use agent_shim_core::{
     policy::MappingRule, request::ReasoningEffort, BackendTarget, FrontendKind, RoutePolicy,
 };
 
-use crate::{RouteError, Router};
+use crate::{ResolvedRoute, RouteError, Router};
 
 /// Key for the route table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,11 +33,9 @@ pub struct StaticRouter {
     /// walk the chain head-to-tail.
     routes: HashMap<RouteKey, Vec<BackendTarget>>,
     wildcards: HashMap<FrontendKind, WildcardTarget>,
-    /// Source `RouteEntry` indexed by `(frontend, model)` so the gateway
-    /// pipeline can recover per-route resilience policy (`retry`, `breaker`)
-    /// after `resolve` collapses a route into a `BackendTarget`. Phase 4
-    /// (Plan 04 P01 T5) — the retry loop in `pipeline.rs` reads from here
-    /// via [`StaticRouter::find_retry_policy`].
+    /// Source `RouteEntry` indexed by `(frontend, model)` so route resolution
+    /// can recover the startup-frozen per-route resilience policy (`retry`,
+    /// `breaker`) alongside the fallback chain.
     route_entries: HashMap<RouteKey, RouteEntry>,
     /// Wildcard variant of `route_entries`. Keyed by frontend only because
     /// wildcards match any model for a frontend.
@@ -159,49 +157,96 @@ impl StaticRouter {
         }
     }
 
-    /// Look up the per-route retry policy for this `(frontend, model)`.
-    ///
-    /// Returns `Some(retry)` if a static route (specific or wildcard) was
-    /// configured for the pair, `None` if no route matches. Callers can fall
-    /// back to `RetryConfig::default()` on `None` — the default policy is the
-    /// §4.5/D12 contract from the Phase 4 design.
-    ///
-    /// Specific `(frontend, model)` routes win over wildcards, mirroring the
-    /// resolution order in `Router::resolve`.
-    pub fn find_retry_policy(&self, frontend: FrontendKind, model: &str) -> Option<RetryConfig> {
-        let key = RouteKey {
-            frontend,
-            model: model.to_string(),
-        };
-        if let Some(entry) = self.route_entries.get(&key) {
-            return Some(entry.retry.clone());
-        }
-        self.wildcard_entries
-            .get(&frontend)
-            .map(|entry| entry.retry.clone())
-    }
-
-    /// Look up the per-route breaker policy for this `(frontend, model)`.
-    ///
-    /// Mirrors `find_retry_policy`: specific routes win over wildcards.
-    /// Returns `None` if no route matches; callers fall back to
-    /// `BreakerConfig::default()` (the §4.5/D6 defaults).
-    pub fn find_breaker_policy(
+    pub fn resolve_route(
         &self,
         frontend: FrontendKind,
         model: &str,
-    ) -> Option<BreakerConfig> {
+    ) -> Result<ResolvedRoute, RouteError> {
         let key = RouteKey {
             frontend,
             model: model.to_string(),
         };
-        if let Some(entry) = self.route_entries.get(&key) {
-            return Some(entry.breaker.clone());
+        if let Some(targets) = self.routes.get(&key) {
+            return Ok(ResolvedRoute {
+                chain: targets.clone(),
+                retry: self.retry_config_for(frontend, &key, model),
+                breaker: self.breaker_config_for(frontend, &key, model),
+                route_label: route_label(frontend, model),
+            });
         }
-        self.wildcard_entries
-            .get(&frontend)
-            .map(|entry| entry.breaker.clone())
+        if let Some(wc) = self.wildcards.get(&frontend) {
+            let upstream_model = if wc.upstream_model == "*" {
+                model.to_string()
+            } else {
+                wc.upstream_model.clone()
+            };
+            return Ok(ResolvedRoute {
+                chain: vec![BackendTarget {
+                    provider: wc.provider.clone(),
+                    model: upstream_model,
+                    policy: wc.policy.clone(),
+                }],
+                retry: self.retry_config_for(frontend, &key, model),
+                breaker: self.breaker_config_for(frontend, &key, model),
+                route_label: route_label(frontend, model),
+            });
+        }
+        Err(RouteError::NoRoute {
+            frontend,
+            model: model.to_string(),
+        })
     }
+
+    fn retry_config_for(&self, frontend: FrontendKind, key: &RouteKey, model: &str) -> RetryConfig {
+        match self
+            .route_entries
+            .get(key)
+            .or_else(|| self.wildcard_entries.get(&frontend))
+        {
+            Some(entry) => entry.retry.clone(),
+            None => {
+                tracing::debug!(
+                    model = %model,
+                    "no route-specific retry policy; using RetryConfig defaults"
+                );
+                RetryConfig::default()
+            }
+        }
+    }
+
+    fn breaker_config_for(
+        &self,
+        frontend: FrontendKind,
+        key: &RouteKey,
+        model: &str,
+    ) -> BreakerConfig {
+        match self
+            .route_entries
+            .get(key)
+            .or_else(|| self.wildcard_entries.get(&frontend))
+        {
+            Some(entry) => entry.breaker.clone(),
+            None => {
+                tracing::debug!(
+                    model = %model,
+                    "no route-specific breaker policy; using BreakerConfig defaults"
+                );
+                BreakerConfig::default()
+            }
+        }
+    }
+}
+
+fn frontend_kind_str(frontend: FrontendKind) -> &'static str {
+    match frontend {
+        FrontendKind::AnthropicMessages => "anthropic_messages",
+        FrontendKind::OpenAiChat => "openai_chat",
+        FrontendKind::OpenAiResponses => "openai_responses",
+    }
+}
+
+fn route_label(frontend: FrontendKind, model: &str) -> Arc<str> {
+    Arc::from(format!("{}/{}", frontend_kind_str(frontend), model))
 }
 
 impl Router for StaticRouter {
@@ -210,37 +255,7 @@ impl Router for StaticRouter {
         frontend: FrontendKind,
         model: &str,
     ) -> Result<Vec<BackendTarget>, RouteError> {
-        let key = RouteKey {
-            frontend,
-            model: model.to_string(),
-        };
-        if let Some(targets) = self.routes.get(&key) {
-            return Ok(targets.clone());
-        }
-        if let Some(wc) = self.wildcards.get(&frontend) {
-            let upstream_model = if wc.upstream_model == "*" {
-                model.to_string()
-            } else {
-                wc.upstream_model.clone()
-            };
-            return Ok(vec![BackendTarget {
-                provider: wc.provider.clone(),
-                model: upstream_model,
-                policy: wc.policy.clone(),
-            }]);
-        }
-        Err(RouteError::NoRoute {
-            frontend,
-            model: model.to_string(),
-        })
-    }
-
-    fn find_retry_policy(&self, frontend: FrontendKind, model: &str) -> Option<RetryConfig> {
-        StaticRouter::find_retry_policy(self, frontend, model)
-    }
-
-    fn find_breaker_policy(&self, frontend: FrontendKind, model: &str) -> Option<BreakerConfig> {
-        StaticRouter::find_breaker_policy(self, frontend, model)
+        self.resolve_route(frontend, model).map(|route| route.chain)
     }
 
     fn list_routes(&self) -> Vec<(FrontendKind, String)> {
@@ -403,67 +418,84 @@ mod tests {
     }
 
     #[test]
-    fn find_retry_policy_returns_route_specific_config() {
+    fn resolve_route_returns_specific_chain_retry_and_breaker() {
         let mut cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
         cfg.routes[0].retry.max_attempts = 7;
-        let router = StaticRouter::from_config(&cfg);
-        let retry = router
-            .find_retry_policy(FrontendKind::OpenAiChat, "gpt-4o")
-            .expect("specific route must yield its retry config");
-        assert_eq!(retry.max_attempts, 7);
-    }
-
-    #[test]
-    fn find_retry_policy_falls_back_to_wildcard() {
-        let mut cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
-        cfg.routes[0].retry.max_attempts = 5;
-        let router = StaticRouter::from_config(&cfg);
-        let retry = router
-            .find_retry_policy(FrontendKind::AnthropicMessages, "any-model")
-            .expect("wildcard route must yield its retry config for any model");
-        assert_eq!(retry.max_attempts, 5);
-    }
-
-    #[test]
-    fn find_retry_policy_returns_none_when_no_match() {
-        let cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
-        let router = StaticRouter::from_config(&cfg);
-        // Different frontend, no wildcard for it → no policy.
-        assert!(router
-            .find_retry_policy(FrontendKind::AnthropicMessages, "claude-foo")
-            .is_none());
-    }
-
-    #[test]
-    fn find_breaker_policy_returns_route_specific_config() {
-        let mut cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
         cfg.routes[0].breaker.failure_threshold_pct = 99;
         let router = StaticRouter::from_config(&cfg);
-        let breaker = router
-            .find_breaker_policy(FrontendKind::OpenAiChat, "gpt-4o")
-            .expect("specific route must yield its breaker config");
-        assert_eq!(breaker.failure_threshold_pct, 99);
+        let resolved = router
+            .resolve_route(FrontendKind::OpenAiChat, "gpt-4o")
+            .expect("specific route must resolve");
+        assert_eq!(resolved.chain.len(), 1);
+        assert_eq!(resolved.chain[0].provider, "u");
+        assert_eq!(resolved.chain[0].model, "gpt-4o");
+        assert_eq!(resolved.retry.max_attempts, 7);
+        assert_eq!(resolved.breaker.failure_threshold_pct, 99);
     }
 
     #[test]
-    fn find_breaker_policy_falls_back_to_wildcard() {
+    fn resolve_route_uses_wildcard_chain_retry_and_breaker() {
         let mut cfg = cfg_with_route("anthropic_messages", "*", "copilot", "*");
+        cfg.routes[0].retry.max_attempts = 5;
         cfg.routes[0].breaker.failure_threshold_pct = 77;
         let router = StaticRouter::from_config(&cfg);
-        let breaker = router
-            .find_breaker_policy(FrontendKind::AnthropicMessages, "any-model")
-            .expect("wildcard route must yield its breaker config for any model");
-        assert_eq!(breaker.failure_threshold_pct, 77);
+        let resolved = router
+            .resolve_route(FrontendKind::AnthropicMessages, "any-model")
+            .expect("wildcard route must resolve any model");
+        assert_eq!(resolved.chain.len(), 1);
+        assert_eq!(resolved.chain[0].provider, "copilot");
+        assert_eq!(resolved.chain[0].model, "any-model");
+        assert_eq!(resolved.retry.max_attempts, 5);
+        assert_eq!(resolved.breaker.failure_threshold_pct, 77);
     }
 
     #[test]
-    fn find_breaker_policy_returns_none_when_no_match() {
+    fn resolve_route_returns_no_route_when_no_match() {
         let cfg = cfg_with_route("openai_chat", "gpt-4o", "u", "gpt-4o");
         let router = StaticRouter::from_config(&cfg);
-        // Different frontend, no wildcard for it → no policy.
-        assert!(router
-            .find_breaker_policy(FrontendKind::AnthropicMessages, "claude-foo")
-            .is_none());
+        let err = router
+            .resolve_route(FrontendKind::AnthropicMessages, "claude-foo")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RouteError::NoRoute {
+                frontend: FrontendKind::AnthropicMessages,
+                model
+            } if model == "claude-foo"
+        ));
+    }
+
+    #[test]
+    fn resolve_route_label_uses_frontend_kind_string_and_alias() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude", "a", "claude-upstream");
+        cfg.routes.push(RouteEntry::singular(
+            "openai_chat",
+            "gpt-chat",
+            "b",
+            "gpt-chat-upstream",
+        ));
+        cfg.routes.push(RouteEntry::singular(
+            "openai_responses",
+            "gpt-responses",
+            "c",
+            "gpt-responses-upstream",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let anthropic = router
+            .resolve_route(FrontendKind::AnthropicMessages, "claude")
+            .unwrap();
+        let chat = router
+            .resolve_route(FrontendKind::OpenAiChat, "gpt-chat")
+            .unwrap();
+        let responses = router
+            .resolve_route(FrontendKind::OpenAiResponses, "gpt-responses")
+            .unwrap();
+        assert_eq!(anthropic.route_label.as_ref(), "anthropic_messages/claude");
+        assert_eq!(chat.route_label.as_ref(), "openai_chat/gpt-chat");
+        assert_eq!(
+            responses.route_label.as_ref(),
+            "openai_responses/gpt-responses"
+        );
     }
 
     #[test]

@@ -34,8 +34,7 @@ use agent_shim_providers::{
 };
 use agent_shim_router::model_index::ModelIndex;
 use agent_shim_router::{
-    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, Router as RouterTrait,
-    StaticRouter,
+    BreakerRegistry, ModelResolver, ProviderLookup, ResilientCaller, StaticRouter,
 };
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
@@ -150,7 +149,7 @@ fn make_app_state() -> AppState {
         shutdown: Default::default(),
         validation: Default::default(),
     };
-    let static_router: Arc<dyn RouterTrait> = Arc::new(StaticRouter::from_config(&cfg));
+    let static_router = Arc::new(StaticRouter::from_config(&cfg));
     let model_index = Arc::new(ModelIndex::new(Default::default()));
     let resolver = Arc::new(ModelResolver::new(static_router, model_index));
 

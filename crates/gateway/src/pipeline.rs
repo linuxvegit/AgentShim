@@ -350,12 +350,12 @@ async fn dispatch_inner(
     root_span.record("agent_shim.identity", identity_str);
 
     // Plan 03 P03 T3: `route.resolve` child span wrapping the resolver call.
-    let chain = {
+    let resolved_route = {
         let _span = tracing::info_span!("route.resolve").entered();
         state
             .core
             .resolver
-            .resolve(spec.frontend.kind(), &model_alias)
+            .resolve_route(spec.frontend.kind(), &model_alias)
             .map_err(|e| {
                 tracing::warn!(model = %model_alias, error = %e, "no route");
                 HandlerError::Route(e)
@@ -378,47 +378,20 @@ async fn dispatch_inner(
     )
     .increment(0);
 
+    let route_len = resolved_route.chain.len();
+
     // Plan 04 P02 D2: route-level retry block governs every chain element
     // uniformly. Build one `RetryPolicy` and clone it per chain position so
     // `ResilientCaller::complete` can apply it independently to each
     // upstream's retry budget.
-    let route_retry_config = match state
-        .core
-        .resolver
-        .find_retry_policy(spec.frontend.kind(), &model_alias)
-    {
-        Some(c) => c,
-        None => {
-            tracing::debug!(
-                model = %model_alias,
-                "no route-specific retry policy; using RetryConfig defaults"
-            );
-            Default::default()
-        }
-    };
-    let retry_policy = RetryPolicy::from(&route_retry_config);
-    let policies: Vec<RetryPolicy> = vec![retry_policy; chain.len()];
+    let retry_policy = RetryPolicy::from(&resolved_route.retry);
+    let policies: Vec<RetryPolicy> = vec![retry_policy; route_len];
 
     // Plan 04 P03 T4: parallel breaker policies — same uniform-per-route
     // shape as retry, fed into `ResilientCaller::complete` alongside the
-    // retry policies. Falls back to `BreakerConfig::default()` (the §4.5/D6
-    // defaults) when the route doesn't override.
-    let route_breaker_config = match state
-        .core
-        .resolver
-        .find_breaker_policy(spec.frontend.kind(), &model_alias)
-    {
-        Some(c) => c,
-        None => {
-            tracing::debug!(
-                model = %model_alias,
-                "no route-specific breaker policy; using BreakerConfig defaults"
-            );
-            Default::default()
-        }
-    };
-    let breaker_policy = BreakerPolicy::from(&route_breaker_config);
-    let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; chain.len()];
+    // retry policies.
+    let breaker_policy = BreakerPolicy::from(&resolved_route.breaker);
+    let breaker_policies: Vec<BreakerPolicy> = vec![breaker_policy; route_len];
 
     // Plan 04 P04 T4: build `client_ip` and `frontend_model` for the
     // rate-limit gates. These depend on `model_alias`, so they're built
@@ -439,12 +412,8 @@ async fn dispatch_inner(
     // Per-route bucket key: `<frontend_kind>/<model_alias>`. Matches
     // the format the YAML config uses for `rate_limit.per_route` keys
     // (see Plan 04 P04 T3).
-    let frontend_kind_str = match spec.frontend.kind() {
-        agent_shim_core::FrontendKind::AnthropicMessages => "anthropic_messages",
-        agent_shim_core::FrontendKind::OpenAiChat => "openai_chat",
-        agent_shim_core::FrontendKind::OpenAiResponses => "openai_responses",
-    };
-    let frontend_model = format!("{frontend_kind_str}/{model_alias}");
+    let frontend_model = resolved_route.route_label.to_string();
+    let chain = resolved_route.chain;
 
     // The chain is non-empty by router invariant (singular routes produce
     // 1-element vecs; array routes are validated to be non-empty by

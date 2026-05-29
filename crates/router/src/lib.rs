@@ -30,9 +30,11 @@ pub(crate) mod metric_names {
     pub const COST_FILTERED_TOTAL: &str = "agent_shim_cost_filtered_total";
 }
 
+use std::sync::Arc;
+
 use thiserror::Error;
 
-use agent_shim_config::RetryConfig;
+use agent_shim_config::{BreakerConfig, RetryConfig};
 use agent_shim_core::{BackendTarget, FrontendKind};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -42,6 +44,14 @@ pub enum RouteError {
         frontend: FrontendKind,
         model: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRoute {
+    pub chain: Vec<BackendTarget>,
+    pub retry: RetryConfig,
+    pub breaker: BreakerConfig,
+    pub route_label: Arc<str>,
 }
 
 pub trait Router: Send + Sync {
@@ -57,30 +67,6 @@ pub trait Router: Send + Sync {
         frontend: FrontendKind,
         model: &str,
     ) -> Result<Vec<BackendTarget>, RouteError>;
-
-    /// Look up the per-route retry policy. Returns `None` if no route entry
-    /// matched (callers should fall back to `RetryConfig::default()`).
-    ///
-    /// Default impl returns `None` so existing test routers (and any future
-    /// dynamic router impl) keep compiling without retry support; the static
-    /// router overrides this with a real lookup against the config table.
-    fn find_retry_policy(&self, _frontend: FrontendKind, _model: &str) -> Option<RetryConfig> {
-        None
-    }
-
-    /// Look up the per-route breaker policy. Returns `None` if no route entry
-    /// matched (callers should fall back to `BreakerConfig::default()`).
-    ///
-    /// Default impl returns `None` for parity with `find_retry_policy` —
-    /// keeps test routers compiling while `StaticRouter` overrides with a
-    /// real lookup.
-    fn find_breaker_policy(
-        &self,
-        _frontend: FrontendKind,
-        _model: &str,
-    ) -> Option<agent_shim_config::BreakerConfig> {
-        None
-    }
 
     /// Enumerate explicit `(frontend, alias)` pairs for the catalog
     /// endpoints. Wildcard routes (`model: "*"`) are excluded — they don't
