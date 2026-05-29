@@ -103,6 +103,28 @@ The Rust implementation of a plugin behavior. Built from a `PluginFactory` at st
 **Hook**
 One of four well-defined points in the request lifecycle where plugins run: `on_decoded_request`, `on_resolved`, `on_stream_event`, `on_response_complete`. Each plugin subscribes to a subset of hooks; route YAML attaches plugins to a hook in a chosen order.
 
+## Admission unification (Phase 8 candidate)
+
+**Resolved route** *(`ResolvedRoute`)*
+The output of `ModelResolver::resolve_route(frontend, model_alias)`. One value carrying the route-resolution facts the immutable `ModelResolver` owns: the fallback `chain: Vec<BackendTarget>`, the route-uniform `retry: RetryConfig`, the route-uniform `breaker: BreakerConfig`, and the `route_label: Arc<str>` (`<frontend_kind>/<alias>`, used by metric labels). Replaces the v0.7 pattern of `resolve` + `find_retry_policy` + `find_breaker_policy` as three parallel lookups on the same `(frontend, model)` pair. Lives in `agent-shim-router`. Catalog (`list_catalog`) shares the same constructor.
+
+The cost-filter route fields (`min_tier`, `max_cost_usd`, `latency_budget_ms`) are deliberately **not** carried on `ResolvedRoute` because they live on a different reload epoch — see the routes-table reload split below.
+
+**Routes-table reload split**
+The `routes:` table in `gateway.yaml` is read from two reload epochs depending on the field. The fields the immutable `ModelResolver` owns (`provider`, `model`, `upstream`, `upstreams`, `policy`, `retry`, `breaker`) are startup-frozen: `ModelResolver` lives on `AppCore` and is never rebuilt on reload. The cost-filter fields (`min_tier`, `max_cost_usd`, `latency_budget_ms`) are hot-reloadable: they are read from `snapshot.config.routes` via the `find_route_entry` helper at request time, and pick up changes on the next `POST /admin/reload` or SIGHUP. Operators who change a route's `provider` or `upstream` chain mid-process must restart; cost caps tune live. Documented here because the split is field-level on the same record and easy to miss.
+
+**Admission**
+The Module that decides "may this request reach an upstream, and if so which subset of the chain." Composes the v0.4 rate-limit gate, the v0.6 cost filter, and the capability gate behind one Interface: `Admission::admit(resolved, request, identity, client_ip) -> Result<AdmissionTicket, AdmissionError>`. Lives in `agent-shim-router`. Replaces the v0.7 split where canonical requests went through `ResilientCaller::complete_with_cost_filter` while passthrough requests skipped both rate-limit and breaker gates (the KNOWN GAP previously documented at `crates/gateway/src/pipeline.rs` L492–505).
+
+**Admission ticket** *(`AdmissionTicket`)*
+The RAII value `Admission::admit` returns on success. Carries the cost-filter-survivor `chain`, an `Arc<ResolvedRoute>`, and private RAII handles for the rate-limit reservation and per-element breaker holds. The reserved budget is **not consumed at admit time**: a Drop without `consume()` releases every slot. `AdmissionTicket::consume()` is called by `ResilientCaller` (or the passthrough fast path) when the first byte arrives from the upstream — at that point rate-limit and breaker budgets are deducted. This is the seam that makes passthrough and canonical share admission guarantees without paying twice when passthrough falls through to canonical translation.
+
+**First-byte consume rule**
+Budget-deducting gates (rate-limit, breaker) commit on first-byte-from-upstream rather than at admit time or at stream-end. Rationale: gates protect upstreams, not user fairness — a request killed by capability, cost, or auth before any upstream packet is sent should not deduct upstream-protection budget. Cancellations after first byte still count, matching the v0.4 ResilientCaller semantics.
+
+**Byte-identity dialect skip**
+The capability gate inside `Admission::admit` is skipped when the inbound frontend dialect equals the chain head's provider native dialect (today: Anthropic Messages → Anthropic provider; OpenAI Responses → openai_compatible Responses-shape upstream). The assumption is that a provider speaking its native dialect is a capability superset of that dialect's frontend. Holds today; documented assumption to revisit if e.g. Anthropic Messages frontend grows a feature the Anthropic provider doesn't yet implement. Distinct from the existing **capability gate** entry above, which describes the v0.3 check; this is the v0.8 predicate that gates *whether* that check runs.
+
 ## Glossary maintenance
 
 When introducing a new domain concept, add it here in the same paragraph it gets named. Don't rename existing terms without a search-and-replace across the codebase.
