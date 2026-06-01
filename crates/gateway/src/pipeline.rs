@@ -304,10 +304,7 @@ async fn dispatch_inner(
     let model_alias = if spec.try_proxy_raw {
         model_alias
     } else {
-        let canonical = spec
-            .frontend
-            .decode_request(&body)
-            .map_err(HandlerError::Frontend)?;
+        let canonical = decode_or_dump(spec.frontend, &body, &snapshot)?;
         let alias = canonical.model.as_str().to_string();
         decoded = Some(canonical);
         alias
@@ -441,10 +438,7 @@ async fn dispatch_inner(
     // option instead of relying on the byte-identity capability skip.
     let mut canonical = match decoded.take() {
         Some(canonical) => canonical,
-        None => spec
-            .frontend
-            .decode_request(&body)
-            .map_err(HandlerError::Frontend)?,
+        None => decode_or_dump(spec.frontend, &body, &snapshot)?,
     };
 
     if spec.capture_anthropic_headers {
@@ -1134,6 +1128,83 @@ fn extract_model_from_body(body: &[u8]) -> Result<String, HandlerError> {
         )))
     })?;
     Ok(m.model)
+}
+
+/// Diagnostic helper: wraps `frontend.decode_request(body)` so that on
+/// failure the raw inbound bytes are dumped to disk and the dump path
+/// is woven into both a `tracing::error!` event and the returned
+/// `FrontendError::InvalidBody` message. This lets operators recover
+/// the exact wire shape that broke decode without re-running the
+/// failing client under instrumentation. Intentionally chatty: we'd
+/// rather emit one error line and one ~50 KB JSON dump per failure
+/// than ship blind to the next codex shape change.
+///
+/// Dump location, in priority order:
+/// 1. `<logging.file.path.parent>/decode-failures/` when file logging
+///    is configured (most common production setup).
+/// 2. `std::env::temp_dir()/agent-shim-decode-failures/` otherwise.
+///
+/// Dump filename: `<frontend-kind>-<short-uuid>.json`. The dump may
+/// contain PII -- treat the directory as sensitive and rotate / clear
+/// after triage.
+fn decode_or_dump(
+    frontend: &dyn agent_shim_frontends::FrontendProtocol,
+    body: &Bytes,
+    snapshot: &crate::state::AppSnapshot,
+) -> Result<agent_shim_core::CanonicalRequest, HandlerError> {
+    match frontend.decode_request(body) {
+        Ok(canonical) => Ok(canonical),
+        Err(original_err) => {
+            let frontend_label = match frontend.kind() {
+                agent_shim_core::FrontendKind::AnthropicMessages => "anthropic-messages",
+                agent_shim_core::FrontendKind::OpenAiChat => "openai-chat",
+                agent_shim_core::FrontendKind::OpenAiResponses => "openai-responses",
+            };
+            let dump_dir = snapshot
+                .config
+                .logging
+                .file
+                .as_ref()
+                .and_then(|f| f.path.parent().map(|p| p.to_path_buf()))
+                .map(|p| p.join("decode-failures"))
+                .unwrap_or_else(|| std::env::temp_dir().join("agent-shim-decode-failures"));
+            let suffix = uuid::Uuid::new_v4().to_string();
+            let dump_path = dump_dir.join(format!(
+                "{frontend_label}-{}.json",
+                &suffix[..suffix.len().min(8)]
+            ));
+            let dump_result = std::fs::create_dir_all(&dump_dir)
+                .and_then(|_| std::fs::write(&dump_path, body.as_ref()));
+            match dump_result {
+                Ok(_) => {
+                    tracing::error!(
+                        frontend = frontend_label,
+                        body_bytes = body.len(),
+                        dump_path = %dump_path.display(),
+                        error = %original_err,
+                        "decode failed; raw body dumped for diagnosis"
+                    );
+                    Err(HandlerError::Frontend(
+                        agent_shim_frontends::FrontendError::InvalidBody(format!(
+                            "{original_err} (body dumped to {})",
+                            dump_path.display()
+                        )),
+                    ))
+                }
+                Err(io_err) => {
+                    tracing::error!(
+                        frontend = frontend_label,
+                        body_bytes = body.len(),
+                        dump_path = %dump_path.display(),
+                        error = %original_err,
+                        io_error = %io_err,
+                        "decode failed AND body dump failed"
+                    );
+                    Err(HandlerError::Frontend(original_err))
+                }
+            }
+        }
+    }
 }
 
 /// Plan 07 P04 T6/T7: universal H7 guard. Fires `run_on_response_complete`
