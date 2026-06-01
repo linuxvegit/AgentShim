@@ -359,8 +359,15 @@ fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBl
         Some(InputMessageContent::Text(t)) => vec![ContentBlock::text(t)],
         Some(InputMessageContent::Parts(parts)) => parts
             .into_iter()
-            .map(|p| match p {
-                InputContentPart::InputText { text } => ContentBlock::text(text),
+            .filter_map(|p| match p {
+                InputContentPart::InputText { text } => Some(ContentBlock::text(text)),
+                // Assistant-side `output_text` parts (echoed back into input
+                // from a prior turn) carry plain text content -- treat them
+                // as a canonical text block. The canonical model collapses
+                // user/assistant content into the same `ContentBlock::Text`
+                // shape; the message's `role` carries the speaker
+                // distinction, not the part's `type`.
+                InputContentPart::OutputText { text } => Some(ContentBlock::text(text)),
                 InputContentPart::InputImage { image_url } => {
                     // Plan 04 T4: input_image parts must surface as canonical
                     // `ContentBlock::Image` so providers' outbound encoders
@@ -368,7 +375,7 @@ fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBl
                     // `image`, Gemini `fileData`/`inlineData`, OAI-compat
                     // `image_url`). Wrapping as `Unsupported` would silently
                     // drop the image at the provider boundary.
-                    match image_url_to_binary_source(&image_url) {
+                    let block = match image_url_to_binary_source(&image_url) {
                         Some(source) => ContentBlock::Image(ImageBlock {
                             source,
                             extensions: ExtensionMap::new(),
@@ -380,8 +387,13 @@ fn decode_message_content(content: Option<InputMessageContent>) -> Vec<ContentBl
                                 "image_url": image_url
                             }),
                         }),
-                    }
+                    };
+                    Some(block)
                 }
+                // Forward-compatibility catch-all (see wire.rs). Drop unknown
+                // content part types on the canonical path; passthrough still
+                // forwards the original bytes verbatim.
+                InputContentPart::Other => None,
             })
             .collect(),
     }
@@ -677,6 +689,121 @@ mod tests {
         // items are silently dropped on the canonical path.
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, MessageRole::User);
+    }
+
+    /// Codex 0.5+ echoes prior assistant turns back into `input` with their
+    /// original `output_text` content parts intact. Before this fix, those
+    /// parts didn't match any `InputContentPart` variant, failing the
+    /// `Messages` and `Items` decode passes and cascading up `InputField`
+    /// as the now-infamous "untagged enum InputField" 400.
+    #[test]
+    fn decode_assistant_message_with_output_text_part_is_accepted() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"q"}]},
+                {"type":"message","role":"assistant","phase":"commentary","content":[
+                    {"type":"output_text","text":"reasoning aloud"}
+                ]},
+                {"type":"message","role":"assistant","phase":"final_answer","content":[
+                    {"type":"output_text","text":"final"}
+                ]}
+            ]
+        }"#;
+        let req = decode(body).expect("output_text parts should be accepted");
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[0].role, MessageRole::User);
+        assert_eq!(req.messages[1].role, MessageRole::Assistant);
+        assert_eq!(req.messages[2].role, MessageRole::Assistant);
+        // Assistant texts round-trip as ContentBlock::Text.
+        match &req.messages[1].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "reasoning aloud"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+        match &req.messages[2].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "final"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    /// Forward-compat for unknown content part types (future Responses
+    /// additions). Mirrors the InputItem::Other story one level down.
+    #[test]
+    fn decode_unknown_content_part_type_is_skipped() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"keep"},
+                    {"type":"some_future_part","payload":"drop me"}
+                ]}
+            ]
+        }"#;
+        let req = decode(body).expect("unknown content part types should not hard-fail");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].content.len(), 1);
+        match &req.messages[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "keep"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+    }
+
+    /// End-to-end regression: a verbatim codex 0.5+ wire capture that
+    /// triggered the recurring `untagged enum InputField` 400. Combines
+    /// every shape variation that landed in v0.9 patch series:
+    /// `output_text` parts on assistant messages with `phase` metadata,
+    /// `reasoning` items with `encrypted_content`, `web_search_call`
+    /// (unknown InputItem type), `namespace` / `custom` / `tool_search`
+    /// tools (unknown tool types). All must round-trip without error.
+    #[test]
+    fn decode_codex_0_5_full_capture_round_trips() {
+        // Synthetic capture covering the same surface as the 100 KB
+        // real-world body that produced openai-responses-26b54d46.json.
+        // Inlined so the test stays self-contained.
+        let body = br#"{
+            "model": "gpt-5.5",
+            "instructions": "you are a helpful assistant",
+            "input": [
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"sys"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"q1"}]},
+                {"type":"reasoning","summary":[],"content":null,"encrypted_content":"opaque"},
+                {"type":"message","role":"assistant","phase":"commentary","content":[
+                    {"type":"output_text","text":"thinking aloud"}
+                ]},
+                {"type":"web_search_call","status":"completed","action":{"type":"search","query":"x"}},
+                {"type":"reasoning","summary":[],"content":null,"encrypted_content":"opaque2"},
+                {"type":"message","role":"assistant","phase":"final_answer","content":[
+                    {"type":"output_text","text":"answer"}
+                ]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"q2"}]}
+            ],
+            "tools": [
+                {"type":"function","name":"exec_command","description":"d","parameters":{}},
+                {"type":"namespace","name":"agent"},
+                {"type":"custom","name":"x","description":"y"},
+                {"type":"tool_search"},
+                {"type":"web_search"}
+            ],
+            "parallel_tool_calls": true,
+            "store": false,
+            "prompt_cache_key": "k",
+            "client_metadata": {"x":1}
+        }"#;
+        let req = decode(body).expect("codex 0.5+ full capture must decode without error");
+        // Six message-bearing items (4 messages + 2 reasoning-on-assistant + 1
+        // web_search_call dropped): we don't pin the exact message count so
+        // this stays robust to attachment-order tweaks, but we do require
+        // user/assistant roles to be present.
+        let roles: Vec<_> = req.messages.iter().map(|m| m.role).collect();
+        assert!(roles.contains(&MessageRole::User));
+        assert!(roles.contains(&MessageRole::Assistant));
+        // Tools: `function` and `custom` survive as canonical tools; the
+        // other three (namespace/tool_search/web_search) become builtin
+        // passthrough JSON on `extensions.builtin_tools`.
+        assert_eq!(req.tools.len(), 2);
+        let names: Vec<_> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"exec_command"));
+        assert!(names.contains(&"x"));
     }
 
     #[test]

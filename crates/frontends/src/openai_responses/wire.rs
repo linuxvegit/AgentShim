@@ -71,6 +71,18 @@ pub enum InputMessageContent {
 pub enum InputContentPart {
     InputText { text: String },
     InputImage { image_url: String },
+    /// Assistant-side text part. OpenAI Responses uses `output_text` for
+    /// content emitted by the model; codex 0.5+ feeds prior assistant
+    /// messages back into `input` with their original `output_text`
+    /// parts intact. Decoded into a canonical text block on the canonical
+    /// path; passthrough preserves the original bytes.
+    OutputText { text: String },
+    /// Forward-compatibility catch-all for content part types we don't
+    /// enumerate (future OpenAI Responses additions). Without this,
+    /// `Items(Vec<InputItem>)` decoding cascades up the untagged
+    /// `InputField` enum and 400's the request before admission.
+    #[serde(other)]
+    Other,
 }
 
 /// Typed input items for multi-turn conversations.
