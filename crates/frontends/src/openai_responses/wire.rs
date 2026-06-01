@@ -107,6 +107,21 @@ pub enum InputItem {
         #[serde(default)]
         status: Option<String>,
     },
+    /// Forward-compatibility catch-all for input item types we don't
+    /// enumerate (e.g. `mcp_call`, `mcp_list_tools`, `web_search_call`,
+    /// `local_shell_call`, `image_generation_call`, `namespace`, future
+    /// OpenAI Responses additions).
+    ///
+    /// Without this variant, a single unknown `type` in the input array
+    /// would fail the entire `InputItem` deserialization, which then
+    /// cascades up the untagged `InputField` enum and 400's the request
+    /// before admission. With it, the byte-passthrough path forwards the
+    /// original body verbatim to an OpenAI-Responses-native upstream
+    /// (which is the authority on whether the type is valid), while the
+    /// canonical chain walk drops these items because they have no
+    /// canonical representation.
+    #[serde(other)]
+    Other,
 }
 
 /// Inbound part inside a `reasoning` item's `summary` array.

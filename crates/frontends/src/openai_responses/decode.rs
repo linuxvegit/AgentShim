@@ -298,6 +298,11 @@ fn decode_items(
                     }
                 }
             }
+            // Forward-compatibility catch-all (see `InputItem::Other` doc in
+            // wire.rs). The canonical model can't express these items, so
+            // we drop them on the canonical chain walk; the byte-passthrough
+            // path still forwards the original body verbatim.
+            InputItem::Other => continue,
         }
     }
     Ok((system, out))
@@ -547,6 +552,34 @@ mod tests {
         let body = br#"{"model":"gpt-4o","input":"Hi","max_output_tokens":1024}"#;
         let req = decode(body).unwrap();
         assert_eq!(req.generation.max_tokens, Some(1024));
+    }
+
+    /// Forward-compatibility: codex 0.5+ and future OpenAI Responses clients
+    /// emit input item types we don't enumerate (`mcp_call`,
+    /// `mcp_list_tools`, `local_shell_call`, `image_generation_call`,
+    /// `namespace`, etc.). The wire enum's `#[serde(other)]` catch-all must
+    /// keep the whole request from failing untagged-enum decoding -- the
+    /// byte-passthrough path then forwards the original body verbatim to
+    /// the upstream, which is the authority on whether the item is valid.
+    /// The canonical chain walk drops these items (they have no canonical
+    /// representation), the same way the unknown-tool-type fix handled it.
+    #[test]
+    fn decode_unknown_input_item_type_is_skipped_not_rejected() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"mcp_call","id":"mcp_1","name":"search","arguments":"{}"},
+                {"type":"local_shell_call","id":"sh_1","action":{"command":"ls"}},
+                {"type":"namespace","id":"ns_1","name":"agent"},
+                {"type":"image_generation_call","id":"img_1","result":"..."}
+            ]
+        }"#;
+        let req = decode(body).expect("unknown input item types should not hard-fail");
+        // Only the message survives the canonical decode; the four unknown
+        // items are silently dropped on the canonical path.
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::User);
     }
 
     #[test]
