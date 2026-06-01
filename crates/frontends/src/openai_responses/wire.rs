@@ -87,11 +87,19 @@ pub enum InputItem {
         id: Option<String>,
         call_id: String,
         name: String,
-        arguments: String,
+        /// `arguments` is typed as `Value` because OpenAI Responses clients
+        /// (codex 0.5+) sometimes emit it as a JSON object directly rather
+        /// than the spec-canonical JSON-encoded string. Both shapes are
+        /// accepted here; the decoder normalizes downstream.
+        arguments: Value,
     },
     FunctionCallOutput {
         call_id: String,
-        output: String,
+        /// Same rationale as `arguments` above -- accept both String and
+        /// structured shapes so tool outputs containing JSON don't get
+        /// double-encoded by the client (which would then fail strict
+        /// String deserialization).
+        output: Value,
     },
     /// Reasoning item from a previous turn (multi-turn input). Mirrors the
     /// real OpenAI Responses shape: `summary` and `content` are part-arrays,
@@ -129,6 +137,12 @@ pub enum InputItem {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningSummaryPart {
     SummaryText { text: String },
+    /// Forward-compatibility catch-all (same rationale as `InputItem::Other`).
+    /// Reasoning summaries occasionally carry vendor-specific part types
+    /// (`encrypted_content`, etc.) that we drop on the canonical path
+    /// while passthrough preserves the original bytes.
+    #[serde(other)]
+    Other,
 }
 
 /// Inbound part inside a `reasoning` item's `content` array.
@@ -136,6 +150,9 @@ pub enum ReasoningSummaryPart {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningContentPart {
     ReasoningText { text: String },
+    /// Forward-compatibility catch-all (same rationale as `InputItem::Other`).
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Deserialize)]

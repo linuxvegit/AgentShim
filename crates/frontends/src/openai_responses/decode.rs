@@ -242,8 +242,17 @@ fn decode_items(
                 name,
                 arguments,
             } => {
-                let args: Value =
-                    serde_json::from_str(&arguments).unwrap_or(Value::String(arguments));
+                // `arguments` can arrive as either a JSON-encoded string
+                // (spec-canonical) or as a structured value (codex 0.5+
+                // sometimes emits the object directly). Normalize: if it's
+                // a string, try to parse; on failure, keep it as a string.
+                // If it's already structured, use it as-is.
+                let args = match arguments {
+                    Value::String(s) => {
+                        serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s))
+                    }
+                    other => other,
+                };
                 out.push(Message {
                     role: MessageRole::Assistant,
                     content: vec![ContentBlock::ToolCall(ToolCallBlock {
@@ -261,7 +270,10 @@ fn decode_items(
                     role: MessageRole::Tool,
                     content: vec![ContentBlock::ToolResult(ToolResultBlock {
                         tool_call_id: ToolCallId::from_provider(call_id),
-                        content: Value::String(output),
+                        // `output` is already a `Value` -- accept both
+                        // String shapes (spec-canonical) and structured
+                        // shapes (codex 0.5+ may send the object directly).
+                        content: output,
                         is_error: false,
                         extensions: ExtensionMap::new(),
                     })],
@@ -319,8 +331,11 @@ fn extract_reasoning_text(
     let from_content: String = content
         .into_iter()
         .flatten()
-        .map(|p| match p {
-            ReasoningContentPart::ReasoningText { text } => text,
+        .filter_map(|p| match p {
+            ReasoningContentPart::ReasoningText { text } => Some(text),
+            // Forward-compatibility catch-all (see wire.rs). Drop unknown
+            // reasoning content parts on the canonical path.
+            ReasoningContentPart::Other => None,
         })
         .collect();
     if !from_content.is_empty() {
@@ -329,8 +344,11 @@ fn extract_reasoning_text(
     summary
         .into_iter()
         .flatten()
-        .map(|p| match p {
-            ReasoningSummaryPart::SummaryText { text } => text,
+        .filter_map(|p| match p {
+            ReasoningSummaryPart::SummaryText { text } => Some(text),
+            // Forward-compatibility catch-all (see wire.rs). Drop unknown
+            // reasoning summary parts on the canonical path.
+            ReasoningSummaryPart::Other => None,
         })
         .collect()
 }
@@ -552,6 +570,85 @@ mod tests {
         let body = br#"{"model":"gpt-4o","input":"Hi","max_output_tokens":1024}"#;
         let req = decode(body).unwrap();
         assert_eq!(req.generation.max_tokens, Some(1024));
+    }
+
+    /// Codex 0.5+ sometimes emits `function_call.arguments` as a JSON
+    /// object directly rather than a JSON-encoded string. The spec is
+    /// String, but accepting both is a permissive forward-compat move
+    /// (the canonical model carries it as a parsed `Value` anyway).
+    #[test]
+    fn decode_function_call_arguments_as_structured_value() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"function_call","call_id":"c1","name":"x","arguments":{"a":1,"b":[2,3]}}
+            ]
+        }"#;
+        let req = decode(body).expect("structured `arguments` should be accepted");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::Assistant);
+    }
+
+    /// Spec-canonical string-form arguments still work (legacy shape).
+    #[test]
+    fn decode_function_call_arguments_as_string_still_works() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"function_call","call_id":"c1","name":"x","arguments":"{\"a\":1}"}
+            ]
+        }"#;
+        let req = decode(body).expect("string `arguments` should still work");
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    /// Same forward-compat story for `function_call_output.output`: codex
+    /// 0.5+ may send structured output rather than a String.
+    #[test]
+    fn decode_function_call_output_as_structured_value() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"function_call_output","call_id":"c1","output":{"result":"ok","count":7}}
+            ]
+        }"#;
+        let req = decode(body).expect("structured `output` should be accepted");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::Tool);
+    }
+
+    /// `reasoning.summary` may carry vendor-specific part types like
+    /// `encrypted_content`. Drop them silently on the canonical path
+    /// rather than hard-failing the whole request decode.
+    #[test]
+    fn decode_reasoning_summary_with_unknown_part_type_is_skipped() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"reasoning","summary":[
+                    {"type":"summary_text","text":"first"},
+                    {"type":"encrypted_content","content":"opaque"}
+                ]}
+            ]
+        }"#;
+        let req = decode(body).expect("unknown summary part types should not hard-fail");
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    /// `reasoning.content` mirrors `summary` for unknown part types.
+    #[test]
+    fn decode_reasoning_content_with_unknown_part_type_is_skipped() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type":"reasoning","content":[
+                    {"type":"reasoning_text","text":"hello"},
+                    {"type":"something_new","payload":"x"}
+                ]}
+            ]
+        }"#;
+        let req = decode(body).expect("unknown content part types should not hard-fail");
+        assert_eq!(req.messages.len(), 1);
     }
 
     /// Forward-compatibility: codex 0.5+ and future OpenAI Responses clients
