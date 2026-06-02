@@ -1,3 +1,6 @@
+pub mod lifecycle;
+pub mod sse_fixtures;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;

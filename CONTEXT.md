@@ -71,6 +71,12 @@ An `anthropic-beta` HTTP header value (e.g. `context-1m-2025-08-07`) that toggle
 **Interleaved reasoning**
 The canonical model carries reasoning as `ContentBlock::Reasoning` blocks ordered alongside `Text` and `ToolCall` blocks in the *same* `Vec<ContentBlock>`. Providers parse upstream output with an `in_reasoning: bool` state machine and emit `ContentBlockStart`/`ContentBlockStop` events around each reasoning↔text transition. Anthropic's `thinking → text → tool_use → thinking` pattern round-trips losslessly. DeepSeek's "all reasoning, then all content" is the degenerate case (one reasoning block, then one text block). Gemini's `thoughts: bool` flag on `parts` uses the same machinery. Lives in `agent-shim-providers::oai_chat_wire::interleaved_reasoning`.
 
+**Canonical lifecycle**
+The ordering contract every `CanonicalStream` must satisfy: exactly one `ResponseStart` followed by `MessageStart` before any block events; every `ContentBlockStart { index: i }` paired with a `ContentBlockStop { index: i }` and never reused; `ToolCallStop` before `ContentBlockStop` for tool blocks; `MessageStop` before `ResponseStop`; no content/delta events after `MessageStop` (only `UsageDelta` and `ResponseStop` may follow). The contract is shared by every Provider parser and every Frontend encoder.
+
+**Canonical lifecycle validator** *(`CanonicalLifecycleValidator`)*
+The test-only function that enforces the **canonical lifecycle** on any `&[StreamEvent]` sequence and panics with the failing event index and the rule violated. Lives in `agent-shim-protocol-tests`. Production paths never invoke it; it exists so every parser/encoder test (and any future cross-dialect harness) anchors against one shared definition of "well-formed" instead of eyeballing event sequences per-test.
+
 ## Phase 2 architecture
 
 **Native provider**
