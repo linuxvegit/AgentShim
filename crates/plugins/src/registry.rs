@@ -205,6 +205,17 @@ pub struct PluginRegistry {
     pub(crate) supervisor: Arc<crate::supervisor::PluginSupervisor>,
 }
 
+/// Differentiator for `walk_request_hook` between the two H2/H3 chains
+/// that share its body. `DecodedRequest` calls `Plugin::on_decoded_request`,
+/// `Resolved` calls `Plugin::on_resolved` and carries the `BackendTarget`
+/// to forward.
+enum RequestHookKind<'a> {
+    DecodedRequest,
+    Resolved {
+        target: &'a agent_shim_core::BackendTarget,
+    },
+}
+
 impl PluginRegistry {
     /// Build an empty registry — no plugins, no plans. Used as the
     /// fast-path default in tests and in YAML configs that omit
@@ -335,49 +346,64 @@ impl PluginRegistry {
             .is_some_and(|plan| !plan.on_resolved.is_empty())
     }
 
-    /// H2 hook chain walk. Spec §6.2 / §6.3 / §6.4 / §4.5.
+    /// Shared driver for the H2 (`on_decoded_request`) and H3
+    /// (`on_resolved`) hook chains. The two hooks have byte-identical
+    /// per-plugin shape — clone the request, invoke the plugin through
+    /// `invoke()` (which owns the timeout / span / on_error envelope),
+    /// then match on the outcome with the protected-field diff applied
+    /// on success. The only differences are *which* `Vec<Arc<PluginEntry>>`
+    /// to walk and *which* plugin method to call (with what arguments);
+    /// both surface here as parameters so the two public hooks reduce to
+    /// their own differentiator.
     ///
-    /// Walks the route's `on_decoded_request` list in declaration order.
-    /// Each plugin sees the request as left by the previous successful
-    /// plugin (clone-then-swap on every iteration). Errors are routed
-    /// through the per-plugin `on_error` policy by `invoke()`; `Aborted`
-    /// always propagates. The protected-field diff (`id`, `frontend`,
-    /// `model`, `stream`) runs after every successful call.
+    /// The lookup + empty-list short-circuit stays at the call site
+    /// rather than inside this driver — the zero-overhead fast path
+    /// (verified by T12) needs to skip both the entry-slice borrow and
+    /// any per-iteration setup.
     ///
-    /// Fast path: when `lookup()` returns `None` or the route's
-    /// `on_decoded_request` list is empty, the function returns `Ok(req)`
-    /// without cloning. This is the zero-overhead case verified by the
-    /// integration test in T12.
-    pub async fn run_on_decoded_request(
+    /// `RequestHookKind` is an enum rather than a closure because each
+    /// arm calls a different `Plugin` trait method (with different
+    /// arguments and different upstream lifetimes), and enum dispatch
+    /// keeps the call-site signatures honest without dragging closure
+    /// lifetime / HRTB gymnastics into the runner.
+    async fn walk_request_hook(
         &self,
-        route: (FrontendKind, &str),
         ctx: &crate::PluginContext,
         mut req: agent_shim_core::CanonicalRequest,
+        hook: Hook,
+        entries: &[Arc<PluginEntry>],
+        kind: RequestHookKind<'_>,
     ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
-        let Some(plan) = self.lookup(route.0, route.1) else {
-            return Ok(req);
-        };
-        if plan.on_decoded_request.is_empty() {
-            return Ok(req);
-        }
-        for entry in &plan.on_decoded_request {
+        let hook_str = hook.as_str();
+        for entry in entries {
             if !entry.enabled {
                 continue;
             }
             let candidate = req.clone();
             let plugin = entry.plugin.clone();
             let plugin_name = entry.name.clone();
-            let hook_str = Hook::DecodedRequest.as_str();
-            let outcome = crate::invoke::invoke(
-                crate::invoke::InvokeArgs::from_entry(
-                    entry,
-                    Hook::DecodedRequest,
-                    crate::invoke::SpanMode::PerInvocation,
-                ),
-                ctx,
-                plugin.on_decoded_request(ctx, candidate),
-            )
-            .await;
+            let outcome = match kind {
+                RequestHookKind::DecodedRequest => crate::invoke::invoke(
+                    crate::invoke::InvokeArgs::from_entry(
+                        entry,
+                        hook,
+                        crate::invoke::SpanMode::PerInvocation,
+                    ),
+                    ctx,
+                    plugin.on_decoded_request(ctx, candidate),
+                )
+                .await,
+                RequestHookKind::Resolved { target } => crate::invoke::invoke(
+                    crate::invoke::InvokeArgs::from_entry(
+                        entry,
+                        hook,
+                        crate::invoke::SpanMode::PerInvocation,
+                    ),
+                    ctx,
+                    plugin.on_resolved(ctx, candidate, target),
+                )
+                .await,
+            };
             match outcome {
                 crate::invoke::InvokeOutcome::Success(new_req) => {
                     // Protected-field diff: id / frontend / model / stream
@@ -408,21 +434,56 @@ impl PluginRegistry {
         Ok(req)
     }
 
+    /// H2 hook chain walk. Spec §6.2 / §6.3 / §6.4 / §4.5.
+    ///
+    /// Walks the route's `on_decoded_request` list in declaration order.
+    /// Each plugin sees the request as left by the previous successful
+    /// plugin (clone-then-swap on every iteration). Errors are routed
+    /// through the per-plugin `on_error` policy by `invoke()`; `Aborted`
+    /// always propagates. The protected-field diff (`id`, `frontend`,
+    /// `model`, `stream`) runs after every successful call.
+    ///
+    /// Fast path: when `lookup()` returns `None` or the route's
+    /// `on_decoded_request` list is empty, the function returns `Ok(req)`
+    /// without cloning. This is the zero-overhead case verified by the
+    /// integration test in T12. The actual per-entry walk lives in
+    /// `walk_request_hook`, shared with H3.
+    pub async fn run_on_decoded_request(
+        &self,
+        route: (FrontendKind, &str),
+        ctx: &crate::PluginContext,
+        req: agent_shim_core::CanonicalRequest,
+    ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
+        let Some(plan) = self.lookup(route.0, route.1) else {
+            return Ok(req);
+        };
+        if plan.on_decoded_request.is_empty() {
+            return Ok(req);
+        }
+        self.walk_request_hook(
+            ctx,
+            req,
+            Hook::DecodedRequest,
+            &plan.on_decoded_request,
+            RequestHookKind::DecodedRequest,
+        )
+        .await
+    }
+
     /// H3 hook chain walk. Spec §6.2 / §6.4 / §4.5.
     ///
-    /// Identical shape to `run_on_decoded_request` but:
-    /// - walks `plan.on_resolved`,
-    /// - passes the resolved `BackendTarget` to each plugin.
-    ///
-    /// Protected-field semantics are the same — including `stream`, even
-    /// though by §6.6 H3 runs after the streaming-vs-unary branch was
-    /// decided (mutating `stream` here would silently inconsistency the
-    /// downstream code path, hence the rejection).
+    /// Identical shape to `run_on_decoded_request` but walks
+    /// `plan.on_resolved` and passes the resolved `BackendTarget` to each
+    /// plugin. Protected-field semantics are the same — including
+    /// `stream`, even though by §6.6 H3 runs after the streaming-vs-unary
+    /// branch was decided (mutating `stream` here would silently
+    /// inconsistency the downstream code path, hence the rejection).
+    /// Shares the actual per-entry walk with H2 via `walk_request_hook`.
     pub async fn run_on_resolved(
         &self,
         route: (FrontendKind, &str),
         ctx: &crate::PluginContext,
-        mut req: agent_shim_core::CanonicalRequest,
+        req: agent_shim_core::CanonicalRequest,
         target: &agent_shim_core::BackendTarget,
     ) -> Result<agent_shim_core::CanonicalRequest, PluginError> {
         let Some(plan) = self.lookup(route.0, route.1) else {
@@ -431,44 +492,14 @@ impl PluginRegistry {
         if plan.on_resolved.is_empty() {
             return Ok(req);
         }
-        for entry in &plan.on_resolved {
-            if !entry.enabled {
-                continue;
-            }
-            let candidate = req.clone();
-            let plugin = entry.plugin.clone();
-            let plugin_name = entry.name.clone();
-            let hook_str = Hook::Resolved.as_str();
-            let outcome = crate::invoke::invoke(
-                crate::invoke::InvokeArgs::from_entry(
-                    entry,
-                    Hook::Resolved,
-                    crate::invoke::SpanMode::PerInvocation,
-                ),
-                ctx,
-                plugin.on_resolved(ctx, candidate, target),
-            )
-            .await;
-            match outcome {
-                crate::invoke::InvokeOutcome::Success(new_req) => {
-                    if let Err(e) = crate::invoke::check_protected_fields(
-                        &plugin_name,
-                        hook_str,
-                        &req,
-                        &new_req,
-                    ) {
-                        match entry.on_error {
-                            OnError::Skip => continue,
-                            OnError::Fail => return Err(e),
-                        }
-                    }
-                    req = new_req;
-                }
-                crate::invoke::InvokeOutcome::Skipped => {}
-                crate::invoke::InvokeOutcome::Propagate(err) => return Err(err),
-            }
-        }
-        Ok(req)
+        self.walk_request_hook(
+            ctx,
+            req,
+            Hook::Resolved,
+            &plan.on_resolved,
+            RequestHookKind::Resolved { target },
+        )
+        .await
     }
 
     /// H5 stream wrapping. Spec §6.5.

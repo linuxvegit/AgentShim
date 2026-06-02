@@ -452,10 +452,15 @@ async fn dispatch_inner(
     // registry walks the route's H2 chain; protected-field violations
     // and `on_error: fail` propagate as `HandlerError::PluginFailed`.
     let frontend_kind_for_hooks = spec.frontend.kind();
+    // Build the route label once; it's reused for the H2 plugin context
+    // below, threaded through `RunContext` for the run_stream/run_unary
+    // helpers to reuse on their own H5/H7 plugin contexts. Earlier code
+    // formatted this string three times for the same route.
+    let route_label = format!("{:?}/{}", frontend_kind_for_hooks, model_alias);
     let plugin_ctx = agent_shim_plugins::PluginContext::new(
         canonical.id.clone(),
         frontend_kind_for_hooks,
-        format!("{:?}/{}", frontend_kind_for_hooks, model_alias),
+        route_label.clone(),
     );
     let needs_h2_guard = spec.try_proxy_raw
         && snapshot
@@ -729,6 +734,7 @@ async fn dispatch_inner(
                 upstream_model,
                 started,
                 frontend_kind,
+                route_label: route_label.clone(),
             },
         )
         .await
@@ -744,6 +750,7 @@ async fn dispatch_inner(
                 upstream_model,
                 started,
                 frontend_kind,
+                route_label: route_label.clone(),
             },
         )
         .await
@@ -759,6 +766,11 @@ struct RunContext {
     /// so resilience-error → HandlerError mapping can shape the response
     /// envelope per the client's expected schema.
     frontend_kind: agent_shim_core::FrontendKind,
+    /// `format!("{:?}/{}", frontend_kind, model_alias)` — built once at
+    /// the top of `dispatch_inner` and threaded through so the H5/H7
+    /// `PluginContext::new` calls in `run_stream`/`run_unary` reuse the
+    /// same label instead of re-formatting it per route.
+    route_label: String,
 }
 
 // `#[allow(clippy::too_many_arguments)]`: matches the signature of
@@ -780,6 +792,7 @@ async fn run_stream(
         upstream_model,
         started,
         frontend_kind,
+        route_label,
     } = ctx;
 
     // Plan 07 P04 T7: build a `PluginContext` once for this streaming
@@ -791,10 +804,13 @@ async fn run_stream(
     //     here from the canonical request because this instance is
     //     scoped to `run_stream`. We clone the id because `canonical` is
     //     consumed later by the chain walk and `RequestId` is not Copy.
+    //
+    // `route_label` is threaded in from `dispatch_inner` instead of
+    // re-formatted here — see `RunContext::route_label`.
     let plugin_ctx_for_run = agent_shim_plugins::PluginContext::new(
         canonical.id.clone(),
         frontend_kind,
-        format!("{:?}/{}", frontend_kind, model_alias),
+        route_label,
     );
 
     let upstream_stream_result = state
@@ -955,17 +971,21 @@ async fn run_unary(
         upstream_model,
         started,
         frontend_kind,
+        route_label,
     } = ctx;
 
     // Plan 07 P04 T10/T11: capture the request ID before the chain walk
     // consumes `canonical` so H5 wrap_stream + H7 inline fire can build
     // `PluginContext` and `ResponseSummary` after the response is
     // collected. `RequestId` is not Copy, so clone explicitly.
+    //
+    // `route_label` is threaded in from `dispatch_inner` instead of
+    // re-formatted here — see `RunContext::route_label`.
     let canonical_id = canonical.id.clone();
     let plugin_ctx_for_unary = agent_shim_plugins::PluginContext::new(
         canonical_id.clone(),
         frontend_kind,
-        format!("{:?}/{}", frontend_kind, model_alias),
+        route_label,
     );
 
     let stream_result = state
