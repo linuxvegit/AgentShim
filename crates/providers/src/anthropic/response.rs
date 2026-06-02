@@ -408,10 +408,17 @@ mod tests {
     use futures::stream;
 
     async fn collect(stream: CanonicalStream) -> Vec<StreamEvent> {
-        stream
+        let out: Vec<StreamEvent> = stream
             .filter_map(|r| async move { r.ok() })
             .collect::<Vec<_>>()
-            .await
+            .await;
+        // PR-B3: every parse_stream / parse_unary test gains free coverage
+        // of the canonical lifecycle invariants — see `CONTEXT.md`
+        // "Canonical lifecycle". The validator's Error-event termination
+        // rule means single-event Error fixtures (e.g.
+        // parse_stream_error_event_propagates) pass without false-positive.
+        agent_shim_protocol_tests::lifecycle::assert_canonical_lifecycle(&out);
+        out
     }
 
     fn sse_chunk(event: &str, data: &str) -> Bytes {

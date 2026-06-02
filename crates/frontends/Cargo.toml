@@ -25,4 +25,5 @@ agent-shim-tokens = { path = "../tokens" }
 tokio-stream.workspace = true
 
 [dev-dependencies]
+agent-shim-protocol-tests = { path = "../protocol-tests" }
 tokio = { workspace = true, features = ["macros", "rt"] }

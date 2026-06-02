@@ -131,6 +131,9 @@ async fn drain(mut stream: agent_shim_core::CanonicalStream) -> Vec<StreamEvent>
             Err(e) => panic!("canonical stream yielded error: {e:?}"),
         }
     }
+    // PR-B3: every DeepSeek streaming test gains free coverage of the
+    // canonical lifecycle invariants — see `CONTEXT.md` "Canonical lifecycle".
+    agent_shim_protocol_tests::lifecycle::assert_canonical_lifecycle(&events);
     events
 }
 

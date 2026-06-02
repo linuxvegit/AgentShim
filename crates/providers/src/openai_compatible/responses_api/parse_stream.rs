@@ -249,3 +249,99 @@ fn parse_event(
 
     events
 }
+
+#[cfg(test)]
+mod tests {
+    //! PR-B3 lifecycle coverage. Each test feeds a hand-crafted SSE byte
+    //! stream into `parse()` and asserts the resulting canonical events
+    //! satisfy `assert_canonical_lifecycle`. The validator is the single
+    //! source of truth for the contract — see `CONTEXT.md`
+    //! "Canonical lifecycle".
+
+    use super::*;
+    use bytes::Bytes;
+    use futures::StreamExt;
+
+    fn byte_stream(
+        body: &'static str,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static {
+        // `Result<Bytes, reqwest::Error>` — `Ok` only. `reqwest::Error` has
+        // no public constructor for synthetic errors, so this fixture stream
+        // can only model happy-path bytes (which is all the lifecycle tests
+        // here need).
+        futures::stream::iter(vec![Ok(Bytes::from_static(body.as_bytes()))])
+    }
+
+    async fn drain(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    ) -> Vec<StreamEvent> {
+        let mut canonical = parse(stream);
+        let mut events = Vec::new();
+        while let Some(item) = canonical.next().await {
+            match item {
+                Ok(e) => events.push(e),
+                Err(e) => panic!("parser yielded error on happy-path fixture: {e:?}"),
+            }
+        }
+        agent_shim_protocol_tests::lifecycle::assert_canonical_lifecycle(&events);
+        events
+    }
+
+    /// Minimal text-only flow: created → output_item.added (message) →
+    /// output_text.delta → output_item.done → completed.
+    #[tokio::test]
+    async fn text_only_lifecycle_is_clean() {
+        const SSE: &str = concat!(
+            "event: response.created\n",
+            "data: {\"id\":\"resp_1\",\"model\":\"gpt-4o\",\"created_at\":1700000000,\"status\":\"in_progress\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"item_id\":\"msg_0\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[]}]}}\n\n",
+            "event: response.completed\n",
+            "data: {\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}\n\n",
+        );
+        let events = drain(byte_stream(SSE)).await;
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Hello");
+    }
+
+    /// Function-call flow: created → output_item.added (function_call) →
+    /// function_call_arguments.delta → output_item.done → completed. Verifies
+    /// the ToolCall block opens, accumulates args, and closes with
+    /// ToolCallStop → ContentBlockStop (rule 4).
+    #[tokio::test]
+    async fn single_function_call_lifecycle_is_clean() {
+        const SSE: &str = concat!(
+            "event: response.created\n",
+            "data: {\"id\":\"resp_1\",\"model\":\"gpt-4o\",\"created_at\":1700000000,\"status\":\"in_progress\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_0\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"item_id\":\"fc_0\",\"output_index\":0,\"delta\":\"{\\\"city\\\":\\\"SF\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_0\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\",\"status\":\"completed\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":4}}\n\n",
+        );
+        let events = drain(byte_stream(SSE)).await;
+        let args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallArgumentsDelta { json_fragment, .. } => {
+                    Some(json_fragment.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"city\":\"SF\"}");
+    }
+}

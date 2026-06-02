@@ -542,7 +542,21 @@ mod tests {
     use futures::stream;
 
     async fn collect_stream(stream: CanonicalStream) -> String {
-        let bytes = encode(stream, None, Some(1))
+        // PR-B3: assert the canonical input itself satisfies the lifecycle
+        // contract — see `CONTEXT.md` "Canonical lifecycle". Buffer the
+        // stream into a Vec first, validate, then re-wrap into a stream for
+        // the encoder so the assertion happens before encoding.
+        let buffered: Vec<Result<StreamEvent, StreamError>> = {
+            use futures_util::StreamExt as _;
+            stream.collect().await
+        };
+        let owned: Vec<StreamEvent> = buffered
+            .iter()
+            .map(|r| r.as_ref().expect("test fixture must be Ok").clone())
+            .collect();
+        agent_shim_protocol_tests::lifecycle::assert_canonical_lifecycle(&owned);
+        let replay: CanonicalStream = Box::pin(stream::iter(buffered));
+        let bytes = encode(replay, None, Some(1))
             .fold(Vec::new(), |mut out, item| async move {
                 out.extend_from_slice(&item.expect("stream item"));
                 out

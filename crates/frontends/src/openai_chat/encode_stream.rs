@@ -272,7 +272,7 @@ mod tests {
     use futures::stream;
 
     fn fake_events() -> Vec<Result<StreamEvent, StreamError>> {
-        vec![
+        let events = vec![
             Ok(StreamEvent::ResponseStart {
                 id: ResponseId("resp_1".to_string()),
                 model: "gpt-4o".to_string(),
@@ -281,16 +281,32 @@ mod tests {
             Ok(StreamEvent::MessageStart {
                 role: MessageRole::Assistant,
             }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                kind: agent_shim_core::ContentBlockKind::Text,
+            }),
             Ok(StreamEvent::TextDelta {
                 index: 0,
                 text: "hi".to_string(),
             }),
+            Ok(StreamEvent::ContentBlockStop { index: 0 }),
             Ok(StreamEvent::MessageStop {
                 stop_reason: StopReason::EndTurn,
                 stop_sequence: None,
             }),
             Ok(StreamEvent::ResponseStop { usage: None }),
-        ]
+        ];
+        // PR-B3: assert the fixture itself satisfies the canonical lifecycle
+        // contract — see `CONTEXT.md` "Canonical lifecycle". An encoder test
+        // that feeds an illegal fixture would be testing a scenario the
+        // encoder is allowed to handle however it wants; this anchors all
+        // encoder behaviour against well-formed input.
+        let owned: Vec<StreamEvent> = events
+            .iter()
+            .map(|r| r.as_ref().unwrap().clone())
+            .collect();
+        agent_shim_protocol_tests::lifecycle::assert_canonical_lifecycle(&owned);
+        events
     }
 
     /// Regression: with keepalive enabled, the encoded SSE stream MUST end
