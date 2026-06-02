@@ -74,6 +74,10 @@ The canonical model carries reasoning as `ContentBlock::Reasoning` blocks ordere
 **Canonical lifecycle**
 The ordering contract every `CanonicalStream` must satisfy: exactly one `ResponseStart` followed by `MessageStart` before any block events; every `ContentBlockStart { index: i }` paired with a `ContentBlockStop { index: i }` and never reused; `ToolCallStop` before `ContentBlockStop` for tool blocks; `MessageStop` before `ResponseStop`; no content/delta events after `MessageStop` (only `UsageDelta` and `ResponseStop` may follow). The contract is shared by every Provider parser and every Frontend encoder.
 
+Producer-side (Provider parsers): MUST emit a lifecycle-conformant stream. silent-drop edge cases are handled by per-parser `finalize` drain tails (see `chat_sse_parser`, `deepseek::response`, `openai_compatible::responses_api::parse_stream`, `gemini::response`).
+
+Consumer-side (Frontend encoders): MAY assume input satisfies this contract; behaviour on illegal input is unspecified. Encoder tests MUST validate their fixtures via `assert_canonical_lifecycle` before feeding them. (Some encoders — e.g. `openai_chat` — happen to tolerate missing `ContentBlockStart`/`ContentBlockStop` because the OpenAI Chat wire format has no equivalent events; this is an implementation detail, not a contract relaxation.)
+
 **Canonical lifecycle validator** *(`CanonicalLifecycleValidator`)*
 The test-only function that enforces the **canonical lifecycle** on any `&[StreamEvent]` sequence and panics with the failing event index and the rule violated. Lives in `agent-shim-protocol-tests`. Production paths never invoke it; it exists so every parser/encoder test (and any future cross-dialect harness) anchors against one shared definition of "well-formed" instead of eyeballing event sequences per-test.
 
