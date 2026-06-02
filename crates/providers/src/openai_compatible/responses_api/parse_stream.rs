@@ -13,70 +13,128 @@ where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 {
     let sse_stream = byte_stream.eventsource();
-
-    let mut emitted_response_start = false;
-    let mut emitted_message_start = false;
-    // Set once we see `response.completed` / `response.failed`. After that,
-    // a transport-level error from the upstream closing the connection is
-    // expected and we drop it instead of forwarding a `StreamError::Upstream`.
-    let mut stream_completed = false;
+    let state = std::sync::Arc::new(std::sync::Mutex::new(ParserState::default()));
+    let state_for_items = std::sync::Arc::clone(&state);
 
     let event_stream = sse_stream.flat_map(move |result| {
-        let events: Vec<Result<StreamEvent, StreamError>> = match result {
-            Err(e) => {
-                if stream_completed {
-                    tracing::debug!(
-                        error = %e,
-                        "ignoring openai-responses transport error after upstream end-of-stream"
-                    );
-                    Vec::new()
-                } else {
-                    tracing::warn!(error = %e, "openai-responses SSE stream error");
-                    vec![Err(StreamError::Upstream(e.to_string()))]
-                }
-            }
-            Ok(sse_event) => {
-                let event_type = sse_event.event.as_str();
-                let data = &sse_event.data;
-
-                if event_type == "response.completed" || event_type == "response.failed" {
-                    stream_completed = true;
-                }
-
-                let parsed: serde_json::Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return futures::stream::iter(vec![Err(StreamError::Decode(format!(
-                            "json parse for {event_type}: {e}"
-                        )))]);
+        let events: Vec<Result<StreamEvent, StreamError>> = {
+            let mut state = state_for_items.lock().expect("state mutex poisoned");
+            match result {
+                Err(e) => {
+                    if state.stream_completed {
+                        tracing::debug!(
+                            error = %e,
+                            "ignoring openai-responses transport error after upstream end-of-stream"
+                        );
+                        Vec::new()
+                    } else {
+                        tracing::warn!(error = %e, "openai-responses SSE stream error");
+                        vec![Err(StreamError::Upstream(e.to_string()))]
                     }
-                };
+                }
+                Ok(sse_event) => {
+                    let event_type = sse_event.event.as_str();
+                    let data = &sse_event.data;
 
-                parse_event(
-                    event_type,
-                    &parsed,
-                    &mut emitted_response_start,
-                    &mut emitted_message_start,
-                )
+                    if event_type == "response.completed" || event_type == "response.failed" {
+                        state.stream_completed = true;
+                    }
+
+                    let parsed: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return futures::stream::iter(vec![Err(StreamError::Decode(
+                                format!("json parse for {event_type}: {e}"),
+                            ))]);
+                        }
+                    };
+
+                    parse_event(event_type, &parsed, &mut state)
+                }
             }
         };
         futures::stream::iter(events)
     });
 
-    Box::pin(event_stream)
+    // After the upstream ends — clean `response.completed`, abrupt
+    // disconnect, or transport error — `finalize` closes the envelope so
+    // downstream encoders / H7 / streaming usage logger always see
+    // MessageStop + ResponseStop. Idempotent: if `response.completed`
+    // already drove completion, returns nothing.
+    //
+    // Caveat: this parser doesn't track open content blocks (it trusts
+    // upstream `output_index`), so silent-drop mid-block still leaks the
+    // open block. Adding block tracking is F2.1 follow-up; today's
+    // finalize covers the lifecycle-rule-2 (no MessageStop) bug only.
+    let drain = futures::stream::once(async move {
+        let mut state = state.lock().expect("state mutex poisoned");
+        state.finalize().into_iter().map(Ok).collect::<Vec<_>>()
+    })
+    .flat_map(futures::stream::iter);
+
+    Box::pin(event_stream.chain(drain))
+}
+
+#[derive(Default)]
+struct ParserState {
+    emitted_response_start: bool,
+    emitted_message_start: bool,
+    /// Set when a `MessageStop` event has been emitted — either by
+    /// `response.completed` / `response.failed` or by `finalize`.
+    emitted_message_stop: bool,
+    /// Set when a `ResponseStop` event has been emitted. Lets `finalize`
+    /// be idempotent.
+    emitted_response_stop: bool,
+    /// Set once the upstream signals end-of-stream
+    /// (`response.completed` / `response.failed`). Lets the outer
+    /// `flat_map` drop the trailing transport error that some upstreams
+    /// emit when they close the connection right after the final SSE event.
+    stream_completed: bool,
+}
+
+impl ParserState {
+    /// Called once after the upstream stream ends — for any reason,
+    /// including abrupt disconnect without `response.completed`.
+    /// Synthesises missing `MessageStop` / `ResponseStop` so downstream
+    /// encoders always see a closed envelope. Idempotent.
+    fn finalize(&mut self) -> Vec<StreamEvent> {
+        if self.emitted_response_stop {
+            return Vec::new();
+        }
+        let mut evts = Vec::new();
+        if !self.emitted_response_start {
+            // Stream broke before any successful chunk — nothing to close.
+            return evts;
+        }
+        if !self.emitted_message_start {
+            self.emitted_message_start = true;
+            evts.push(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            });
+        }
+        if !self.emitted_message_stop {
+            self.emitted_message_stop = true;
+            evts.push(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            });
+        }
+        self.emitted_response_stop = true;
+        evts.push(StreamEvent::ResponseStop { usage: None });
+        evts
+    }
 }
 
 fn parse_event(
     event_type: &str,
     data: &serde_json::Value,
-    emitted_response_start: &mut bool,
-    emitted_message_start: &mut bool,
+    state: &mut ParserState,
 ) -> Vec<Result<StreamEvent, StreamError>> {
     let mut events = Vec::new();
 
     match event_type {
-        "response.created" | "response.in_progress" if !*emitted_response_start => {
-            *emitted_response_start = true;
+        "response.created" | "response.in_progress" if !state.emitted_response_start => {
+            state.emitted_response_start = true;
             let id = data.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
             let model = data
                 .get("model")
@@ -99,8 +157,8 @@ fn parse_event(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
 
-            if !*emitted_message_start {
-                *emitted_message_start = true;
+            if !state.emitted_message_start {
+                state.emitted_message_start = true;
                 events.push(Ok(StreamEvent::MessageStart {
                     role: MessageRole::Assistant,
                 }));
@@ -206,6 +264,7 @@ fn parse_event(
                 stop_reason,
                 stop_sequence: None,
             }));
+            state.emitted_message_stop = true;
 
             // Extract usage
             let usage = data.get("usage").map(|u| Usage {
@@ -220,6 +279,7 @@ fn parse_event(
                 ..Default::default()
             });
             events.push(Ok(StreamEvent::ResponseStop { usage }));
+            state.emitted_response_stop = true;
         }
 
         "response.failed" => {
@@ -343,5 +403,46 @@ mod tests {
             })
             .collect();
         assert_eq!(args, "{\"city\":\"SF\"}");
+    }
+
+    /// Lifecycle coverage: upstream sends `response.created` and then drops
+    /// the connection silently — no `response.output_item.added`, no
+    /// `response.completed`. finalize must synthesise MessageStart →
+    /// MessageStop → ResponseStop so downstream encoders / H7 hook / usage
+    /// logger see a closed envelope.
+    ///
+    /// Note: this test deliberately avoids opening a content block, since
+    /// the parser doesn't track open blocks today (it trusts upstream
+    /// output_index). Silent-drop mid-block is F2.1 follow-up; here we
+    /// cover the envelope-close path only.
+    #[tokio::test]
+    async fn silent_drop_after_response_created_finalizes_envelope() {
+        const SSE: &str = concat!(
+            "event: response.created\n",
+            "data: {\"id\":\"resp_1\",\"model\":\"gpt-4o\",\"created_at\":1700000000,\"status\":\"in_progress\"}\n\n",
+        );
+        let events = drain(byte_stream(SSE)).await;
+
+        // ResponseStart was emitted by the parser …
+        assert!(
+            matches!(events.first(), Some(StreamEvent::ResponseStart { .. })),
+            "expected ResponseStart, got {:?}",
+            events.first()
+        );
+        // … and finalize synthesised the rest.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageStop { .. })),
+            "expected synthesised MessageStop on silent-drop stream"
+        );
+        assert!(
+            matches!(events.last(), Some(StreamEvent::ResponseStop { .. })),
+            "stream must end with ResponseStop, got {:?}",
+            events.last()
+        );
+
+        // The drain helper already calls assert_canonical_lifecycle(&events),
+        // so reaching this point proves the envelope is well-formed.
     }
 }
