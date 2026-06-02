@@ -130,6 +130,29 @@ pub fn make_oai_compat_target() -> BackendTarget {
     }
 }
 
+/// Build a [`DeepseekProvider`] pointed at the given mockito base URL
+/// with the test API key, no default headers, and a 30s timeout.
+pub fn make_deepseek_provider(base_url: String) -> agent_shim_providers::deepseek::DeepseekProvider {
+    agent_shim_providers::deepseek::DeepseekProvider::new(
+        "deepseek",
+        base_url,
+        "test-key",
+        BTreeMap::new(),
+        30,
+    )
+    .expect("DeepseekProvider::new is infallible for these inputs")
+}
+
+/// Build a [`BackendTarget`] pointing at `deepseek-chat` on the
+/// `deepseek` provider.
+pub fn make_deepseek_target() -> BackendTarget {
+    BackendTarget {
+        provider: "deepseek".to_string(),
+        model: "deepseek-chat".to_string(),
+        policy: Default::default(),
+    }
+}
+
 /// Build a [`CopilotProvider`] pointed at the given mockito base URL.
 ///
 /// Copilot's `complete()` calls the token manager up-front, so tests
