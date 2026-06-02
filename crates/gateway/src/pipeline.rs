@@ -263,6 +263,205 @@ fn handler_error_from_admission(
     }
 }
 
+/// Authenticate the inbound request against the snapshot's `auth.required`
+/// gate. Returns the resolved `AgentIdentity` on success (which may be
+/// `Anonymous` when `auth.enabled = false`), or `HandlerError::Unauthorized`
+/// shaped for the inbound frontend dialect. Pure helper — no `.await`
+/// inside, so the caller's `auth.verify` span guard is safe to span across.
+///
+/// Plan 04 P04 T4 / Plan 03 P03 T3 rationale lives at the call site.
+fn check_auth(
+    snapshot: &crate::state::AppSnapshot,
+    headers: &HeaderMap,
+    spec: &PipelineSpec<'_>,
+) -> Result<AgentIdentity, HandlerError> {
+    if !snapshot.auth_enabled {
+        return Ok(AgentIdentity::Anonymous);
+    }
+    let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
+    if snapshot.auth_required {
+        match &extracted {
+            AgentIdentity::Anonymous => {
+                tracing::warn!(
+                    endpoint = spec.endpoint_label,
+                    "auth.required=true but request had no Authorization or x-api-key header"
+                );
+                return Err(HandlerError::Unauthorized {
+                    kind: spec.frontend.kind(),
+                });
+            }
+            AgentIdentity::KeyHash(h) => {
+                // Non-constant-time compare on already-hashed values is fine:
+                // the hash itself is not a secret, so timing leaks reveal
+                // nothing about the original key bytes.
+                if !snapshot.configured_key_hashes.contains(h) {
+                    // Operator log carries the hash (NEVER plaintext) so a
+                    // misconfigured client can be tracked down without
+                    // leaking the secret.
+                    tracing::warn!(
+                        endpoint = spec.endpoint_label,
+                        presented_hash = %h,
+                        "auth.required=true but presented key not in auth.keys allowlist"
+                    );
+                    return Err(HandlerError::Unauthorized {
+                        kind: spec.frontend.kind(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(extracted)
+}
+
+/// Differentiator for `run_pre_admission_hook` — H2 (`on_decoded_request`,
+/// no target yet) vs H3 (`on_resolved`, carrying the chain head's target).
+enum PreAdmissionHook<'a> {
+    DecodedRequest,
+    Resolved(&'a agent_shim_core::BackendTarget),
+}
+
+/// Run one of the pre-admission plugin hooks (H2 or H3) with the
+/// passthrough-mutation tracking that `dispatch_inner` needs. Returns the
+/// (possibly-mutated) canonical request and `true` if the hook actually
+/// mutated it during a passthrough-eligible request — used to OR into
+/// `passthrough_blocked_by_plugin_mutation`.
+///
+/// Mutation tracking only runs when `try_proxy_raw && has_subscriber(...)`,
+/// the same condition the inline code used. When mutation tracking is
+/// off (canonical-only requests, or no subscribed plugin), the returned
+/// flag is always `false` and we skip the `before` clone entirely —
+/// preserving the zero-overhead fast path.
+async fn run_pre_admission_hook(
+    snapshot: &crate::state::AppSnapshot,
+    spec: &PipelineSpec<'_>,
+    plugin_ctx: &agent_shim_plugins::PluginContext,
+    route: (agent_shim_core::FrontendKind, &str),
+    canonical: agent_shim_core::CanonicalRequest,
+    hook: PreAdmissionHook<'_>,
+) -> Result<(agent_shim_core::CanonicalRequest, bool), HandlerError> {
+    let (kind, _) = route;
+    let has_subscriber = match hook {
+        PreAdmissionHook::DecodedRequest => {
+            snapshot.plugins.has_on_decoded_request_subscriber(route)
+        }
+        PreAdmissionHook::Resolved(_) => snapshot.plugins.has_on_resolved_subscriber(route),
+    };
+    let needs_guard = spec.try_proxy_raw && has_subscriber;
+    let before = needs_guard.then(|| canonical.clone());
+    let after = match hook {
+        PreAdmissionHook::DecodedRequest => {
+            snapshot
+                .plugins
+                .run_on_decoded_request(route, plugin_ctx, canonical)
+                .await
+        }
+        PreAdmissionHook::Resolved(target) => {
+            snapshot
+                .plugins
+                .run_on_resolved(route, plugin_ctx, canonical, target)
+                .await
+        }
+    }
+    .map_err(|e| handler_error_from_plugin_error(e, kind))?;
+    let mutated = before.map(|before| after != before).unwrap_or(false);
+    Ok((after, mutated))
+}
+
+/// Emit the per-request `→ endpoint | model: ... | ...` info log.
+/// Pure formatting — derives inbound/outbound reasoning effort, budget,
+/// beta header, and upstream context-window from the canonical request +
+/// resolved policy + catalog metadata, then issues one `tracing::info!`.
+///
+/// Extracted from `dispatch_inner` because the inline form was a 70-line
+/// block whose only purpose was building arguments for a single log call.
+/// Behaviour is byte-identical; the format string is unchanged so
+/// log-parsing tooling keeps working.
+fn log_request_line(
+    spec: &PipelineSpec<'_>,
+    canonical: &agent_shim_core::CanonicalRequest,
+    first_target: &agent_shim_core::BackendTarget,
+    upstream_model: &str,
+    model_alias: &str,
+    body_bytes: usize,
+    is_stream: bool,
+    model_index: &agent_shim_router::model_index::ModelIndex,
+) {
+    let max_tokens = canonical.generation.max_tokens;
+
+    // Capture the INBOUND reasoning effort before merging with the
+    // resolved policy so the request log can show "what the agent
+    // asked for" alongside "what we forward upstream". `None` means
+    // the inbound request was silent on effort.
+    let inbound_effort: Option<&'static str> = canonical
+        .generation
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort)
+        .map(|e| e.as_str());
+    let outbound_effort: Option<&'static str> = canonical
+        .resolved_policy
+        .reasoning_effort
+        .map(|e| e.as_str());
+
+    // Compress the effort field: identical inbound/outbound prints as
+    // "high"; rewritten prints as "max → xhigh"; route default fills
+    // a silent inbound as "(default) → high"; a route mapping that
+    // explicitly clears the effort prints as "high → (dropped)".
+    let effort_log = format_effort_log(inbound_effort, outbound_effort);
+
+    // Reasoning budget (token-quantified path, used by Gemini and the
+    // legacy Anthropic thinking shape). `resolved_policy` copies the
+    // inbound value as-is in v0.6, so a single field describes both
+    // directions.
+    let reasoning_budget = canonical
+        .resolved_policy
+        .reasoning_budget_tokens
+        .or_else(|| {
+            canonical
+                .generation
+                .reasoning
+                .as_ref()
+                .and_then(|r| r.budget_tokens)
+        });
+
+    let beta_log = canonical
+        .resolved_policy
+        .anthropic_header("anthropic-beta")
+        .map(|s| s.to_string());
+
+    // Upstream context window comes from the discovered model catalog.
+    // `None` for upstreams whose `BackendProvider::list_models` returned
+    // `None`, or for wildcard `upstream_model: "*"` routes whose
+    // resolved id wasn't discovered. Logs as "?" in those cases so the
+    // line stays single-form.
+    let upstream_ctx_log: Option<u32> = model_index
+        .metadata(&first_target.provider, upstream_model)
+        .and_then(|m| m.context_window_tokens);
+
+    tracing::info!(
+        "→ {} | model: {} → {} | bodyBytes: {} | maxTokens: {} | ctxWindow: {} | stream: {} | reasoning: {}{}{}",
+        spec.endpoint_label,
+        model_alias,
+        upstream_model,
+        body_bytes,
+        max_tokens.unwrap_or(0),
+        upstream_ctx_log
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        is_stream,
+        effort_log,
+        reasoning_budget
+            .map(|b| format!(" (budget {} tok)", b))
+            .unwrap_or_default(),
+        beta_log
+            .as_deref()
+            .map(|b| format!(" | beta: {}", b))
+            .unwrap_or_default(),
+    );
+}
+
 /// Body of [`dispatch`], pulled into a separate async fn so the parent can
 /// wrap it with `.instrument(root_span)` rather than holding an `Entered`
 /// guard across `.await` (Plan 03 P03 T3 followup, IMPORTANT-1).
@@ -321,46 +520,7 @@ async fn dispatch_inner(
     // Plan 03 P03 T3: wrap the auth gate in an `auth.verify` child span.
     let identity = {
         let _auth_span = tracing::info_span!("auth.verify").entered();
-        if snapshot.auth_enabled {
-            let authz = headers.get("authorization").and_then(|v| v.to_str().ok());
-            let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-            let extracted = agent_shim_router::extract_identity_from_headers(authz, xkey);
-
-            if snapshot.auth_required {
-                match &extracted {
-                    AgentIdentity::Anonymous => {
-                        tracing::warn!(
-                            endpoint = spec.endpoint_label,
-                            "auth.required=true but request had no Authorization or x-api-key header"
-                        );
-                        return Err(HandlerError::Unauthorized {
-                            kind: spec.frontend.kind(),
-                        });
-                    }
-                    AgentIdentity::KeyHash(h) => {
-                        // Non-constant-time compare on already-hashed values
-                        // is fine: the hash itself is not a secret, so timing
-                        // leaks reveal nothing about the original key bytes.
-                        if !snapshot.configured_key_hashes.contains(h) {
-                            // Operator log carries the hash (NEVER plaintext) so
-                            // a misconfigured client can be tracked down without
-                            // leaking the secret.
-                            tracing::warn!(
-                                endpoint = spec.endpoint_label,
-                                presented_hash = %h,
-                                "auth.required=true but presented key not in auth.keys allowlist"
-                            );
-                            return Err(HandlerError::Unauthorized {
-                                kind: spec.frontend.kind(),
-                            });
-                        }
-                    }
-                }
-            }
-            extracted
-        } else {
-            AgentIdentity::Anonymous
-        }
+        check_auth(&snapshot, &headers, &spec)?
     };
 
     // Plan 03 P03 T3: record identity on the root span. Uses the same
@@ -462,23 +622,17 @@ async fn dispatch_inner(
         frontend_kind_for_hooks,
         route_label.clone(),
     );
-    let needs_h2_guard = spec.try_proxy_raw
-        && snapshot
-            .plugins
-            .has_on_decoded_request_subscriber((frontend_kind_for_hooks, model_alias.as_str()));
-    let before_h2 = needs_h2_guard.then(|| canonical.clone());
-    canonical = snapshot
-        .plugins
-        .run_on_decoded_request(
-            (frontend_kind_for_hooks, model_alias.as_str()),
-            &plugin_ctx,
-            canonical,
-        )
-        .await
-        .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
-    if let Some(before_h2) = before_h2 {
-        passthrough_blocked_by_plugin_mutation |= canonical != before_h2;
-    }
+    let (next_canonical, h2_mutated) = run_pre_admission_hook(
+        &snapshot,
+        &spec,
+        &plugin_ctx,
+        (frontend_kind_for_hooks, model_alias.as_str()),
+        canonical,
+        PreAdmissionHook::DecodedRequest,
+    )
+    .await?;
+    canonical = next_canonical;
+    passthrough_blocked_by_plugin_mutation |= h2_mutated;
 
     // Snapshot the merged route policy onto the canonical request. Providers
     // and logging both read from `resolved_policy` so the merge rule lives in
@@ -493,29 +647,22 @@ async fn dispatch_inner(
     // can adapt to per-upstream context (e.g., target-specific prompt
     // shaping). Failure semantics identical to H2 (PluginFailed → 502;
     // Aborted → 400).
-    let needs_h3_guard = spec.try_proxy_raw
-        && snapshot
-            .plugins
-            .has_on_resolved_subscriber((frontend_kind_for_hooks, model_alias.as_str()));
-    // Note: `before_h3` snapshots the canonical AFTER H2, so this strictly
-    // checks whether H3 itself mutated. Combined with the H2 check above
-    // (which OR-s into the same flag), the cumulative semantic is "any
-    // plugin between decode and admission mutated canonical" -- which is
-    // what passthrough cares about (byte body must match what we'd send).
-    let before_h3 = needs_h3_guard.then(|| canonical.clone());
-    canonical = snapshot
-        .plugins
-        .run_on_resolved(
-            (frontend_kind_for_hooks, model_alias.as_str()),
-            &plugin_ctx,
-            canonical,
-            &first_target,
-        )
-        .await
-        .map_err(|e| handler_error_from_plugin_error(e, frontend_kind_for_hooks))?;
-    if let Some(before_h3) = before_h3 {
-        passthrough_blocked_by_plugin_mutation |= canonical != before_h3;
-    }
+    // `before_h3` semantics: by snapshotting AFTER H2, H3's mutation flag
+    // is independent of H2's. Combined with the H2 OR above, the cumulative
+    // meaning is "any plugin between decode and admission mutated canonical"
+    // — which is what passthrough cares about (byte body must match what
+    // we'd send). See `run_pre_admission_hook` for the per-hook mechanics.
+    let (next_canonical, h3_mutated) = run_pre_admission_hook(
+        &snapshot,
+        &spec,
+        &plugin_ctx,
+        (frontend_kind_for_hooks, model_alias.as_str()),
+        canonical,
+        PreAdmissionHook::Resolved(&first_target),
+    )
+    .await?;
+    canonical = next_canonical;
+    passthrough_blocked_by_plugin_mutation |= h3_mutated;
 
     let frontend_kind = spec.frontend.kind();
     let route_entry =
@@ -641,80 +788,15 @@ async fn dispatch_inner(
     let ticket = unwrap_ticket(ticket);
 
     let is_stream = canonical.stream;
-    let max_tokens = canonical.generation.max_tokens;
-
-    // Capture the INBOUND reasoning effort before merging with the
-    // resolved policy so the request log can show "what the agent
-    // asked for" alongside "what we forward upstream". `None` means
-    // the inbound request was silent on effort.
-    let inbound_effort: Option<&'static str> = canonical
-        .generation
-        .reasoning
-        .as_ref()
-        .and_then(|r| r.effort)
-        .map(|e| e.as_str());
-    let outbound_effort: Option<&'static str> = canonical
-        .resolved_policy
-        .reasoning_effort
-        .map(|e| e.as_str());
-
-    // Compress the effort field: identical inbound/outbound prints as
-    // "high"; rewritten prints as "max → xhigh"; route default fills
-    // a silent inbound as "(default) → high"; a route mapping that
-    // explicitly clears the effort prints as "high → (dropped)".
-    let effort_log = format_effort_log(inbound_effort, outbound_effort);
-
-    // Reasoning budget (token-quantified path, used by Gemini and the
-    // legacy Anthropic thinking shape). `resolved_policy` copies the
-    // inbound value as-is in v0.6, so a single field describes both
-    // directions.
-    let reasoning_budget = canonical
-        .resolved_policy
-        .reasoning_budget_tokens
-        .or_else(|| {
-            canonical
-                .generation
-                .reasoning
-                .as_ref()
-                .and_then(|r| r.budget_tokens)
-        });
-
-    let beta_log = canonical
-        .resolved_policy
-        .anthropic_header("anthropic-beta")
-        .map(|s| s.to_string());
-
-    // Upstream context window comes from the discovered model catalog.
-    // `None` for upstreams whose `BackendProvider::list_models` returned
-    // `None`, or for wildcard `upstream_model: "*"` routes whose
-    // resolved id wasn't discovered. Logs as "?" in those cases so the
-    // line stays single-form.
-    let upstream_ctx_log: Option<u32> = state
-        .core
-        .resolver
-        .model_index()
-        .metadata(&first_target.provider, &upstream_model)
-        .and_then(|m| m.context_window_tokens);
-
-    tracing::info!(
-        "→ {} | model: {} → {} | bodyBytes: {} | maxTokens: {} | ctxWindow: {} | stream: {} | reasoning: {}{}{}",
-        spec.endpoint_label,
-        model_alias,
-        upstream_model,
+    log_request_line(
+        &spec,
+        &canonical,
+        &first_target,
+        &upstream_model,
+        &model_alias,
         body_bytes,
-        max_tokens.unwrap_or(0),
-        upstream_ctx_log
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "?".to_string()),
         is_stream,
-        effort_log,
-        reasoning_budget
-            .map(|b| format!(" (budget {} tok)", b))
-            .unwrap_or_default(),
-        beta_log
-            .as_deref()
-            .map(|b| format!(" | beta: {}", b))
-            .unwrap_or_default(),
+        state.core.resolver.model_index(),
     );
 
     // Walk the admitted chain via `ResilientCaller`: per-element retry,
