@@ -1,6 +1,7 @@
 //! Parse an SSE byte-stream from OpenAI into a CanonicalStream.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -16,340 +17,452 @@ where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 {
     let sse_stream = byte_stream.eventsource();
-
-    let mut emitted_response_start = false;
-    let mut emitted_message_start = false;
-    let mut text_block_open = false;
-    let mut open_tool_blocks: HashSet<u32> = HashSet::new();
-    let mut response_id = String::new();
-    let mut response_model = String::new();
-    // Tracks whether the upstream has signalled end-of-stream (`[DONE]` sentinel
-    // or a `finish_reason`). Many OpenAI-compatible providers (notably GitHub
-    // Copilot via its CloudFlare-fronted endpoint) close the underlying
-    // connection abruptly after `[DONE]`, which surfaces as a benign reqwest
-    // "error decoding response body" on the body stream. Once we've already
-    // emitted a clean termination we drop those transport errors instead of
-    // propagating them as `StreamError::Upstream` and noisy WARN logs.
-    let mut stream_completed = false;
-    // [DEBUG-sse1] context for diagnosing why a transport error survives the
-    // `stream_completed` guard. Tracks how much SSE traffic the parser saw and
-    // what the last meaningful state was when the body stream broke. Kept as
-    // lasting diagnostic — when an upstream regresses, this gives operators
-    // enough context to triage without re-instrumenting.
-    let mut event_count: u64 = 0;
-    let mut total_data_bytes: u64 = 0;
-    let mut last_event_kind: &'static str = "none";
-    let mut last_finish_reason: Option<String> = None;
+    let state = Arc::new(Mutex::new(ParserState::default()));
+    let state_for_items = Arc::clone(&state);
 
     let event_stream = sse_stream.flat_map(move |result| {
-        let events: Vec<Result<StreamEvent, StreamError>> = match result {
-            Err(e) => {
-                if stream_completed {
-                    tracing::debug!(
-                        error = %e,
-                        "ignoring transport error after upstream end-of-stream"
-                    );
-                    Vec::new()
-                } else {
-                    // Walk the error chain so we can tell apart
-                    // (a) our own `read_timeout` tripping vs (b) the upstream
-                    // closing mid-stream (hyper `IncompleteMessage`) vs
-                    // (c) raw IO errors. The top-level Display on the
-                    // `EventStreamError<reqwest::Error>` is just "Transport
-                    // error: error decoding response body" and hides which
-                    // of these actually happened.
-                    //
-                    // Quirks:
-                    //   - `EventStreamError` does NOT implement `source()`
-                    //     (its `Error` impl is the default empty one), so
-                    //     we have to hand-match `Transport(inner)` to reach
-                    //     the wrapped `reqwest::Error`.
-                    //   - `reqwest::Error::is_timeout()` only fires for
-                    //     `Kind::Timeout` (total-request timeout), NOT for
-                    //     `Kind::Body` + `io::Error(TimedOut)` which is how
-                    //     our `read_timeout` actually surfaces. We detect
-                    //     that case by walking the reqwest error's source
-                    //     chain and downcasting to `io::Error`.
-                    let mut error_chain: Vec<String> = Vec::new();
-                    let mut reqwest_flags: Option<(bool, bool, bool, bool, bool)> = None;
-                    if let eventsource_stream::EventStreamError::Transport(ref re) = e {
-                        let mut src: Option<&dyn std::error::Error> = Some(re);
-                        let mut io_timed_out = false;
-                        while let Some(err) = src {
-                            error_chain.push(err.to_string());
-                            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-                                if io_err.kind() == std::io::ErrorKind::TimedOut {
-                                    io_timed_out = true;
-                                }
-                            }
-                            src = err.source();
-                        }
-                        reqwest_flags = Some((
-                            re.is_timeout() || io_timed_out,
-                            re.is_connect(),
-                            re.is_body(),
-                            re.is_decode(),
-                            io_timed_out,
-                        ));
-                    } else {
-                        error_chain.push(e.to_string());
-                    }
-                    let (is_timeout, is_connect, is_body, is_decode, io_timed_out) =
-                        reqwest_flags.unwrap_or((false, false, false, false, false));
-                    tracing::warn!(
-                        error = %e,
-                        error_debug = ?e,
-                        error_chain = ?error_chain,
-                        is_timeout,
-                        is_connect,
-                        is_body,
-                        is_decode,
-                        io_timed_out,
-                        debug_tag = "DEBUG-sse1",
-                        event_count,
-                        total_data_bytes,
-                        last_event_kind,
-                        last_finish_reason = ?last_finish_reason,
-                        emitted_response_start,
-                        emitted_message_start,
-                        text_block_open,
-                        open_tool_blocks = open_tool_blocks.len(),
-                        response_id = %response_id,
-                        response_model = %response_model,
-                        "SSE stream error"
-                    );
-                    vec![Err(StreamError::Upstream(e.to_string()))]
-                }
-            }
-            Ok(event) => {
-                event_count += 1;
-                total_data_bytes += event.data.len() as u64;
-                tracing::debug!(event_type = %event.event, data_len = event.data.len(), "SSE event received");
-                if event.data == "[DONE]" {
-                    last_event_kind = "done";
-                    let mut evts = Vec::new();
-                    // Close any open text block
-                    if text_block_open {
-                        evts.push(Ok(StreamEvent::ContentBlockStop { index: 0 }));
-                        text_block_open = false;
-                    }
-                    // Close any open tool blocks
-                    for idx in open_tool_blocks.drain() {
-                        evts.push(Ok(StreamEvent::ToolCallStop { index: idx }));
-                        evts.push(Ok(StreamEvent::ContentBlockStop { index: idx }));
-                    }
-                    evts.push(Ok(StreamEvent::ResponseStop { usage: None }));
-                    stream_completed = true;
-                    evts
-                } else {
-                    match parse_chunk(
-                        &event.data,
-                        &mut emitted_response_start,
-                        &mut emitted_message_start,
-                        &mut text_block_open,
-                        &mut open_tool_blocks,
-                        &mut response_id,
-                        &mut response_model,
-                        &mut stream_completed,
-                        &mut last_event_kind,
-                        &mut last_finish_reason,
-                    ) {
-                        Ok(evts) => evts.into_iter().map(Ok).collect(),
-                        Err(e) => {
-                            last_event_kind = "decode_error";
-                            vec![Err(StreamError::Decode(e))]
-                        }
-                    }
-                }
+        let events: Vec<Result<StreamEvent, StreamError>> = {
+            let mut s = state_for_items.lock().expect("state mutex poisoned");
+            match result {
+                Err(e) => s.handle_transport_error(e),
+                Ok(event) => s.handle_event(&event),
             }
         };
         futures::stream::iter(events)
     });
 
-    Box::pin(event_stream)
+    // After the upstream ends — for any reason: clean `[DONE]`, abrupt
+    // disconnect, transport error — `finalize` ensures the canonical
+    // lifecycle envelope is closed. If the stream already emitted
+    // `MessageStop` + `ResponseStop` (the `[DONE]` or `finish_reason` path),
+    // `finalize` is a no-op. Otherwise it synthesises whatever events are
+    // missing so downstream encoders, the H7 hook, and the streaming usage
+    // logger always see a well-formed end-of-stream.
+    //
+    // Mirrors the `Arc<Mutex<StreamState>>` + drain-tail pattern used by
+    // `gemini::response::parse_streaming`.
+    let drain = futures::stream::once(async move {
+        let mut s = state.lock().expect("state mutex poisoned");
+        s.finalize().into_iter().map(Ok).collect::<Vec<_>>()
+    })
+    .flat_map(futures::stream::iter);
+
+    Box::pin(event_stream.chain(drain))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn parse_chunk(
-    data: &str,
-    emitted_response_start: &mut bool,
-    emitted_message_start: &mut bool,
-    text_block_open: &mut bool,
-    open_tool_blocks: &mut HashSet<u32>,
-    response_id: &mut String,
-    response_model: &mut String,
-    stream_completed: &mut bool,
-    last_event_kind: &mut &'static str,
-    last_finish_reason: &mut Option<String>,
-) -> Result<Vec<StreamEvent>, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(data).map_err(|e| format!("json parse: {e}"))?;
+#[derive(Default)]
+struct ParserState {
+    emitted_response_start: bool,
+    emitted_message_start: bool,
+    emitted_message_stop: bool,
+    emitted_response_stop: bool,
+    text_block_open: bool,
+    open_tool_blocks: HashSet<u32>,
+    response_id: String,
+    response_model: String,
+    /// Tracks whether the upstream has signalled end-of-stream (`[DONE]`
+    /// sentinel or a `finish_reason`). Many OpenAI-compatible providers
+    /// (notably GitHub Copilot via its CloudFlare-fronted endpoint) close
+    /// the underlying connection abruptly after `[DONE]`, which surfaces as
+    /// a benign reqwest "error decoding response body" on the body stream.
+    /// Once we've already emitted a clean termination we drop those
+    /// transport errors instead of propagating them as
+    /// `StreamError::Upstream` and noisy WARN logs.
+    stream_completed: bool,
+    /// [DEBUG-sse1] context for diagnosing why a transport error survives
+    /// the `stream_completed` guard. Tracks how much SSE traffic the parser
+    /// saw and what the last meaningful state was when the body stream
+    /// broke. Kept as lasting diagnostic — when an upstream regresses, this
+    /// gives operators enough context to triage without re-instrumenting.
+    event_count: u64,
+    total_data_bytes: u64,
+    last_event_kind: &'static str,
+    last_finish_reason: Option<String>,
+}
 
-    if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("upstream error")
-            .to_string();
-        *last_event_kind = "upstream_error";
-        return Ok(vec![StreamEvent::Error { message: msg }]);
-    }
-
-    *last_event_kind = "delta";
-
-    let mut events = Vec::new();
-
-    let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("unknown");
-    let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("unknown");
-    let created = v.get("created").and_then(|x| x.as_u64()).unwrap_or(0);
-
-    if !*emitted_response_start {
-        *emitted_response_start = true;
-        *response_id = id.to_string();
-        *response_model = model.to_string();
-        events.push(StreamEvent::ResponseStart {
-            id: ResponseId(id.to_string()),
-            model: model.to_string(),
-            created_at_unix: created,
-        });
-    }
-
-    let choices = match v.get("choices").and_then(|c| c.as_array()) {
-        Some(c) => c,
-        None => {
-            if let Some(usage) = parse_usage(&v) {
-                events.push(StreamEvent::UsageDelta { usage });
-            }
-            return Ok(events);
+impl ParserState {
+    fn handle_transport_error(
+        &mut self,
+        e: eventsource_stream::EventStreamError<reqwest::Error>,
+    ) -> Vec<Result<StreamEvent, StreamError>> {
+        if self.stream_completed {
+            tracing::debug!(
+                error = %e,
+                "ignoring transport error after upstream end-of-stream"
+            );
+            return Vec::new();
         }
-    };
 
-    for choice in choices {
-        // role → MessageStart (once)
-        if let Some(delta) = choice.get("delta") {
-            if let Some(_role) = delta.get("role").and_then(|r| r.as_str()) {
-                if !*emitted_message_start {
-                    *emitted_message_start = true;
-                    events.push(StreamEvent::MessageStart {
-                        role: MessageRole::Assistant,
-                    });
+        // Walk the error chain so we can tell apart
+        // (a) our own `read_timeout` tripping vs (b) the upstream
+        // closing mid-stream (hyper `IncompleteMessage`) vs
+        // (c) raw IO errors. The top-level Display on the
+        // `EventStreamError<reqwest::Error>` is just "Transport
+        // error: error decoding response body" and hides which
+        // of these actually happened.
+        //
+        // Quirks:
+        //   - `EventStreamError` does NOT implement `source()`
+        //     (its `Error` impl is the default empty one), so
+        //     we have to hand-match `Transport(inner)` to reach
+        //     the wrapped `reqwest::Error`.
+        //   - `reqwest::Error::is_timeout()` only fires for
+        //     `Kind::Timeout` (total-request timeout), NOT for
+        //     `Kind::Body` + `io::Error(TimedOut)` which is how
+        //     our `read_timeout` actually surfaces. We detect
+        //     that case by walking the reqwest error's source
+        //     chain and downcasting to `io::Error`.
+        let mut error_chain: Vec<String> = Vec::new();
+        let mut reqwest_flags: Option<(bool, bool, bool, bool, bool)> = None;
+        if let eventsource_stream::EventStreamError::Transport(ref re) = e {
+            let mut src: Option<&dyn std::error::Error> = Some(re);
+            let mut io_timed_out = false;
+            while let Some(err) = src {
+                error_chain.push(err.to_string());
+                if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                    if io_err.kind() == std::io::ErrorKind::TimedOut {
+                        io_timed_out = true;
+                    }
+                }
+                src = err.source();
+            }
+            reqwest_flags = Some((
+                re.is_timeout() || io_timed_out,
+                re.is_connect(),
+                re.is_body(),
+                re.is_decode(),
+                io_timed_out,
+            ));
+        } else {
+            error_chain.push(e.to_string());
+        }
+        let (is_timeout, is_connect, is_body, is_decode, io_timed_out) =
+            reqwest_flags.unwrap_or((false, false, false, false, false));
+        tracing::warn!(
+            error = %e,
+            error_debug = ?e,
+            error_chain = ?error_chain,
+            is_timeout,
+            is_connect,
+            is_body,
+            is_decode,
+            io_timed_out,
+            debug_tag = "DEBUG-sse1",
+            event_count = self.event_count,
+            total_data_bytes = self.total_data_bytes,
+            last_event_kind = self.last_event_kind,
+            last_finish_reason = ?self.last_finish_reason,
+            emitted_response_start = self.emitted_response_start,
+            emitted_message_start = self.emitted_message_start,
+            text_block_open = self.text_block_open,
+            open_tool_blocks = self.open_tool_blocks.len(),
+            response_id = %self.response_id,
+            response_model = %self.response_model,
+            "SSE stream error"
+        );
+        vec![Err(StreamError::Upstream(e.to_string()))]
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &eventsource_stream::Event,
+    ) -> Vec<Result<StreamEvent, StreamError>> {
+        self.event_count += 1;
+        self.total_data_bytes += event.data.len() as u64;
+        tracing::debug!(
+            event_type = %event.event,
+            data_len = event.data.len(),
+            "SSE event received"
+        );
+        if event.data == "[DONE]" {
+            self.handle_done()
+                .into_iter()
+                .map(Ok)
+                .collect()
+        } else {
+            match self.parse_chunk(&event.data) {
+                Ok(evts) => evts.into_iter().map(Ok).collect(),
+                Err(e) => {
+                    self.last_event_kind = "decode_error";
+                    vec![Err(StreamError::Decode(e))]
                 }
             }
+        }
+    }
 
-            // content text delta
-            if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                if !text.is_empty() {
-                    if !*emitted_message_start {
-                        *emitted_message_start = true;
+    /// Handle the `[DONE]` sentinel. Closes any still-open blocks. Synthesises
+    /// `MessageStart` and `MessageStop` if the upstream never sent them, so the
+    /// canonical lifecycle envelope is always well-formed even when an
+    /// upstream goes straight from "request acknowledged" to `[DONE]` without
+    /// a `finish_reason` chunk (PR-B2: rule 2 violation observed in
+    /// `done_before_any_delta_lifecycle_is_clean`).
+    fn handle_done(&mut self) -> Vec<StreamEvent> {
+        self.last_event_kind = "done";
+        let mut evts = Vec::new();
+        if !self.emitted_response_start {
+            // No upstream chunk to copy id/model from — leave them as the
+            // empty-string sentinels and let downstream encoders surface
+            // them as `unknown`. We still need a ResponseStart to keep the
+            // canonical envelope well-formed.
+            self.emitted_response_start = true;
+            evts.push(StreamEvent::ResponseStart {
+                id: ResponseId(self.response_id.clone()),
+                model: self.response_model.clone(),
+                created_at_unix: 0,
+            });
+        }
+        if !self.emitted_message_start {
+            self.emitted_message_start = true;
+            evts.push(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            });
+        }
+        // Close any open text block
+        if self.text_block_open {
+            evts.push(StreamEvent::ContentBlockStop { index: 0 });
+            self.text_block_open = false;
+        }
+        // Close any open tool blocks (ToolCallStop precedes ContentBlockStop
+        // per canonical lifecycle rule 4).
+        for idx in self.open_tool_blocks.drain() {
+            evts.push(StreamEvent::ToolCallStop { index: idx });
+            evts.push(StreamEvent::ContentBlockStop { index: idx });
+        }
+        if !self.emitted_message_stop {
+            self.emitted_message_stop = true;
+            evts.push(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            });
+        }
+        if !self.emitted_response_stop {
+            self.emitted_response_stop = true;
+            evts.push(StreamEvent::ResponseStop { usage: None });
+        }
+        self.stream_completed = true;
+        evts
+    }
+
+    /// Called once after the upstream stream ends — for any reason, including
+    /// abrupt disconnect without `[DONE]` or `finish_reason`. Synthesises any
+    /// missing lifecycle events so downstream encoders always see a
+    /// well-formed envelope (PR-B2: rule 1d violation observed in
+    /// `content_then_silent_drop_lifecycle_is_clean`). Idempotent — if
+    /// `[DONE]` or `finish_reason` already drove the envelope to completion,
+    /// returns an empty vector.
+    fn finalize(&mut self) -> Vec<StreamEvent> {
+        if self.emitted_response_stop {
+            return Vec::new();
+        }
+
+        let mut evts = Vec::new();
+        if !self.emitted_response_start {
+            // Stream broke before any successful chunk — nothing to close.
+            // Emit nothing; downstream sees just whatever transport error
+            // was already propagated, and the absence of a ResponseStart
+            // tells encoders there is no envelope to finalize.
+            return evts;
+        }
+        if !self.emitted_message_start {
+            self.emitted_message_start = true;
+            evts.push(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            });
+        }
+        if self.text_block_open {
+            self.text_block_open = false;
+            evts.push(StreamEvent::ContentBlockStop { index: 0 });
+        }
+        for idx in self.open_tool_blocks.drain() {
+            evts.push(StreamEvent::ToolCallStop { index: idx });
+            evts.push(StreamEvent::ContentBlockStop { index: idx });
+        }
+        if !self.emitted_message_stop {
+            self.emitted_message_stop = true;
+            evts.push(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            });
+        }
+        self.emitted_response_stop = true;
+        evts.push(StreamEvent::ResponseStop { usage: None });
+        evts
+    }
+
+    fn parse_chunk(&mut self, data: &str) -> Result<Vec<StreamEvent>, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(data).map_err(|e| format!("json parse: {e}"))?;
+
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("upstream error")
+                .to_string();
+            self.last_event_kind = "upstream_error";
+            return Ok(vec![StreamEvent::Error { message: msg }]);
+        }
+
+        self.last_event_kind = "delta";
+
+        let mut events = Vec::new();
+
+        let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("unknown");
+        let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("unknown");
+        let created = v.get("created").and_then(|x| x.as_u64()).unwrap_or(0);
+
+        if !self.emitted_response_start {
+            self.emitted_response_start = true;
+            self.response_id = id.to_string();
+            self.response_model = model.to_string();
+            events.push(StreamEvent::ResponseStart {
+                id: ResponseId(id.to_string()),
+                model: model.to_string(),
+                created_at_unix: created,
+            });
+        }
+
+        let choices = match v.get("choices").and_then(|c| c.as_array()) {
+            Some(c) => c,
+            None => {
+                if let Some(usage) = parse_usage(&v) {
+                    events.push(StreamEvent::UsageDelta { usage });
+                }
+                return Ok(events);
+            }
+        };
+
+        for choice in choices {
+            // role → MessageStart (once)
+            if let Some(delta) = choice.get("delta") {
+                if let Some(_role) = delta.get("role").and_then(|r| r.as_str()) {
+                    if !self.emitted_message_start {
+                        self.emitted_message_start = true;
                         events.push(StreamEvent::MessageStart {
                             role: MessageRole::Assistant,
                         });
                     }
-                    if !*text_block_open {
-                        *text_block_open = true;
-                        events.push(StreamEvent::ContentBlockStart {
-                            index: 0,
-                            kind: ContentBlockKind::Text,
-                        });
-                    }
-                    events.push(StreamEvent::TextDelta {
-                        index: 0,
-                        text: text.to_string(),
-                    });
-                }
-            }
-
-            // tool_calls deltas
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                if !*emitted_message_start {
-                    *emitted_message_start = true;
-                    events.push(StreamEvent::MessageStart {
-                        role: MessageRole::Assistant,
-                    });
-                }
-                // Close text block if open before tool calls start
-                if *text_block_open {
-                    *text_block_open = false;
-                    events.push(StreamEvent::ContentBlockStop { index: 0 });
                 }
 
-                for tc in tool_calls {
-                    let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
-                    // Offset tool indices by 1 since text uses index 0
-                    let block_index = tc_index + 1;
-
-                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                        let name = tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !open_tool_blocks.contains(&block_index) {
-                            open_tool_blocks.insert(block_index);
+                // content text delta
+                if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                    if !text.is_empty() {
+                        if !self.emitted_message_start {
+                            self.emitted_message_start = true;
+                            events.push(StreamEvent::MessageStart {
+                                role: MessageRole::Assistant,
+                            });
+                        }
+                        if !self.text_block_open {
+                            self.text_block_open = true;
                             events.push(StreamEvent::ContentBlockStart {
-                                index: block_index,
-                                kind: ContentBlockKind::ToolCall,
+                                index: 0,
+                                kind: ContentBlockKind::Text,
                             });
                         }
-                        events.push(StreamEvent::ToolCallStart {
-                            index: block_index,
-                            id: ToolCallId::from_provider(id),
-                            name,
+                        events.push(StreamEvent::TextDelta {
+                            index: 0,
+                            text: text.to_string(),
                         });
                     }
+                }
 
-                    if let Some(args) = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(|a| a.as_str())
-                    {
-                        if !args.is_empty() {
-                            events.push(StreamEvent::ToolCallArgumentsDelta {
+                // tool_calls deltas
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    if !self.emitted_message_start {
+                        self.emitted_message_start = true;
+                        events.push(StreamEvent::MessageStart {
+                            role: MessageRole::Assistant,
+                        });
+                    }
+                    // Close text block if open before tool calls start
+                    if self.text_block_open {
+                        self.text_block_open = false;
+                        events.push(StreamEvent::ContentBlockStop { index: 0 });
+                    }
+
+                    for tc in tool_calls {
+                        let tc_index =
+                            tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                        // Offset tool indices by 1 since text uses index 0
+                        let block_index = tc_index + 1;
+
+                        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                            let name = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !self.open_tool_blocks.contains(&block_index) {
+                                self.open_tool_blocks.insert(block_index);
+                                events.push(StreamEvent::ContentBlockStart {
+                                    index: block_index,
+                                    kind: ContentBlockKind::ToolCall,
+                                });
+                            }
+                            events.push(StreamEvent::ToolCallStart {
                                 index: block_index,
-                                json_fragment: args.to_string(),
+                                id: ToolCallId::from_provider(id),
+                                name,
                             });
+                        }
+
+                        if let Some(args) = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                        {
+                            if !args.is_empty() {
+                                events.push(StreamEvent::ToolCallArgumentsDelta {
+                                    index: block_index,
+                                    json_fragment: args.to_string(),
+                                });
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // finish_reason — close blocks and emit MessageStop
-        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-            if !reason.is_empty() {
-                *last_finish_reason = Some(reason.to_string());
-                *last_event_kind = "finish";
-                if *text_block_open {
-                    *text_block_open = false;
-                    events.push(StreamEvent::ContentBlockStop { index: 0 });
+            // finish_reason — close blocks and emit MessageStop
+            if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                if !reason.is_empty() {
+                    self.last_finish_reason = Some(reason.to_string());
+                    self.last_event_kind = "finish";
+                    if self.text_block_open {
+                        self.text_block_open = false;
+                        events.push(StreamEvent::ContentBlockStop { index: 0 });
+                    }
+                    for idx in self.open_tool_blocks.drain() {
+                        events.push(StreamEvent::ToolCallStop { index: idx });
+                        events.push(StreamEvent::ContentBlockStop { index: idx });
+                    }
+                    if !self.emitted_message_stop {
+                        self.emitted_message_stop = true;
+                        events.push(StreamEvent::MessageStop {
+                            stop_reason: StopReason::from_provider_string(reason),
+                            stop_sequence: None,
+                        });
+                    }
+                    // Some providers (e.g. Copilot) close the connection right
+                    // after the final choice without sending an explicit `[DONE]`
+                    // sentinel. Mark the stream complete here so the caller drops
+                    // the trailing transport error instead of WARNing on it.
+                    self.stream_completed = true;
                 }
-                for idx in open_tool_blocks.drain() {
-                    events.push(StreamEvent::ToolCallStop { index: idx });
-                    events.push(StreamEvent::ContentBlockStop { index: idx });
-                }
-                events.push(StreamEvent::MessageStop {
-                    stop_reason: StopReason::from_provider_string(reason),
-                    stop_sequence: None,
-                });
-                // Some providers (e.g. Copilot) close the connection right
-                // after the final choice without sending an explicit `[DONE]`
-                // sentinel. Mark the stream complete here so the caller drops
-                // the trailing transport error instead of WARNing on it.
-                *stream_completed = true;
             }
         }
-    }
 
-    if let Some(usage) = v
-        .get("usage")
-        .filter(|u| !u.is_null())
-        .and_then(|_| parse_usage(&v))
-    {
-        events.push(StreamEvent::UsageDelta { usage });
-    }
+        if let Some(usage) = v
+            .get("usage")
+            .filter(|u| !u.is_null())
+            .and_then(|_| parse_usage(&v))
+        {
+            events.push(StreamEvent::UsageDelta { usage });
+        }
 
-    Ok(events)
+        Ok(events)
+    }
 }
 
 fn parse_usage(v: &serde_json::Value) -> Option<Usage> {

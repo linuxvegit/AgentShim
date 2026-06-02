@@ -39,5 +39,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 
 [dev-dependencies]
+agent-shim-protocol-tests = { path = "../protocol-tests" }
 mockito.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
