@@ -382,12 +382,15 @@ fn log_request_line(
     spec: &PipelineSpec<'_>,
     canonical: &agent_shim_core::CanonicalRequest,
     first_target: &agent_shim_core::BackendTarget,
-    upstream_model: &str,
     model_alias: &str,
     body_bytes: usize,
-    is_stream: bool,
     model_index: &agent_shim_router::model_index::ModelIndex,
 ) {
+    // Derive what we can from the structural inputs instead of plumbing
+    // every primitive through the helper signature: `upstream_model` is
+    // always `first_target.model`; `is_stream` lives on `canonical`.
+    let upstream_model: &str = first_target.model.as_str();
+    let is_stream: bool = canonical.stream;
     let max_tokens = canonical.generation.max_tokens;
 
     // Capture the INBOUND reasoning effort before merging with the
@@ -792,10 +795,8 @@ async fn dispatch_inner(
         &spec,
         &canonical,
         &first_target,
-        &upstream_model,
         &model_alias,
         body_bytes,
-        is_stream,
         state.core.resolver.model_index(),
     );
 

@@ -563,9 +563,8 @@ async fn canonical_path_with_anthropic_frontend_renders_reasoning_then_text() {
 /// the connection without sending `finish_reason` or `[DONE]`. mockito
 /// closes the body cleanly after the partial payload, simulating the
 /// "Copilot via CloudFlare hangs up mid-stream" path.
-const SILENT_DROP_SSE: &str = concat!(
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
-);
+const SILENT_DROP_SSE: &str =
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
 
 /// Lifecycle rule 1d coverage: the parser must close any open content block,
 /// emit MessageStop, and emit ResponseStop even when the upstream cuts off

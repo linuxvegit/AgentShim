@@ -31,9 +31,8 @@ pub const STREAM_DONE_BEFORE_ANY_DELTA: &str = concat!(
 /// parser must emit a clean lifecycle close even without an explicit
 /// terminator, because the H7 plugin hook and the streaming usage logger
 /// both rely on a single `ResponseStop` per stream.
-pub const STREAM_CONTENT_THEN_DROP: &str = concat!(
-    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
-);
+pub const STREAM_CONTENT_THEN_DROP: &str =
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
 
 /// Streaming completion with one tool call followed by `finish_reason=tool_calls`
 /// and `[DONE]`. The tool block must open at canonical index 1 (since text
