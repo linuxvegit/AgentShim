@@ -856,11 +856,10 @@ struct RunContext {
     route_label: String,
 }
 
-// `#[allow(clippy::too_many_arguments)]`: matches the signature of
-// `ResilientCaller::complete` plus the per-frontend pipeline spec and
-// the run-context bundle. Bundling identity/client_ip/frontend_model
-// into a struct would just move the verbosity to the caller.
-#[allow(clippy::too_many_arguments)]
+// run_stream / run_unary used to need #[allow(clippy::too_many_arguments)]
+// before identity / client_ip / frontend_model got bundled into RunContext.
+// They now take 6 args (spec, state, canonical, ticket, snapshot, ctx) —
+// at the default clippy threshold of 7, no allow is required.
 async fn run_stream(
     spec: PipelineSpec<'_>,
     state: &AppState,
@@ -1037,10 +1036,6 @@ async fn run_stream(
     }
 }
 
-// `#[allow(clippy::too_many_arguments)]`: see `run_stream` above —
-// same justification, the parameters describe the full chain-walk
-// context.
-#[allow(clippy::too_many_arguments)]
 async fn run_unary(
     spec: PipelineSpec<'_>,
     state: &AppState,
