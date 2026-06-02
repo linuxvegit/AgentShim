@@ -46,41 +46,38 @@ where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
     let sse_stream = byte_stream.eventsource();
-    let mut state = StreamState::default();
+    let state = std::sync::Arc::new(std::sync::Mutex::new(StreamState::default()));
+    let state_for_items = std::sync::Arc::clone(&state);
 
     let event_stream = sse_stream.flat_map(move |result| {
-        let events: Vec<Result<StreamEvent, StreamError>> = match result {
-            Err(e) => {
-                if state.completed {
-                    tracing::debug!(
-                        error = %e,
-                        "ignoring deepseek transport error after upstream end-of-stream"
-                    );
-                    Vec::new()
-                } else {
-                    tracing::warn!(error = %e, "deepseek SSE stream error");
-                    vec![Err(StreamError::Upstream(e.to_string()))]
+        let events: Vec<Result<StreamEvent, StreamError>> = {
+            let mut state = state_for_items.lock().expect("state mutex poisoned");
+            match result {
+                Err(e) => {
+                    if state.completed {
+                        tracing::debug!(
+                            error = %e,
+                            "ignoring deepseek transport error after upstream end-of-stream"
+                        );
+                        Vec::new()
+                    } else {
+                        tracing::warn!(error = %e, "deepseek SSE stream error");
+                        vec![Err(StreamError::Upstream(e.to_string()))]
+                    }
                 }
-            }
-            Ok(event) => {
-                tracing::debug!(
-                    event_type = %event.event,
-                    data_len = event.data.len(),
-                    "deepseek SSE event received"
-                );
-                if event.data == "[DONE]" {
-                    let mut evts = Vec::new();
-                    // Defensive flush — `finish_reason` should already have
-                    // closed everything, but a broken stream might skip it.
-                    state.interleaver.flush(&mut evts);
-                    drain_open_tool_blocks(&mut state.open_tool_blocks, &mut evts);
-                    evts.push(StreamEvent::ResponseStop { usage: None });
-                    state.completed = true;
-                    evts.into_iter().map(Ok).collect()
-                } else {
-                    match parse_chunk(&event.data, &mut state) {
-                        Ok(evts) => evts.into_iter().map(Ok).collect(),
-                        Err(e) => vec![Err(StreamError::Decode(e))],
+                Ok(event) => {
+                    tracing::debug!(
+                        event_type = %event.event,
+                        data_len = event.data.len(),
+                        "deepseek SSE event received"
+                    );
+                    if event.data == "[DONE]" {
+                        state.handle_done().into_iter().map(Ok).collect()
+                    } else {
+                        match parse_chunk(&event.data, &mut state) {
+                            Ok(evts) => evts.into_iter().map(Ok).collect(),
+                            Err(e) => vec![Err(StreamError::Decode(e))],
+                        }
                     }
                 }
             }
@@ -88,7 +85,18 @@ where
         futures::stream::iter(events)
     });
 
-    Box::pin(event_stream)
+    // After the upstream ends — clean `[DONE]`, abrupt disconnect, or
+    // transport error — `finalize` ensures the canonical lifecycle envelope
+    // is closed. Idempotent: if `[DONE]` / `finish_reason` already drove
+    // completion, returns nothing. Mirrors the chat_sse_parser PR-B2 and
+    // gemini::response::parse_streaming pattern.
+    let drain = futures::stream::once(async move {
+        let mut state = state.lock().expect("state mutex poisoned");
+        state.finalize().into_iter().map(Ok).collect::<Vec<_>>()
+    })
+    .flat_map(futures::stream::iter);
+
+    Box::pin(event_stream.chain(drain))
 }
 
 /// Parse a non-streaming JSON response from DeepSeek into a `CanonicalStream`.
@@ -232,6 +240,14 @@ fn parse_unary_inner(body: &[u8]) -> Result<Vec<StreamEvent>, String> {
 struct StreamState {
     emitted_response_start: bool,
     emitted_message_start: bool,
+    /// Set when a `MessageStop` event has been emitted — either by
+    /// `finish_reason` in a chunk, or synthesised by `handle_done` /
+    /// `finalize` when the upstream closed without sending one.
+    emitted_message_stop: bool,
+    /// Set when a `ResponseStop` event has been emitted. Lets `finalize`
+    /// be idempotent (no-op if `[DONE]` already drove the envelope to
+    /// completion).
+    emitted_response_stop: bool,
     interleaver: ReasoningInterleaver,
     /// Map from upstream `tool_calls[].index` (often 0, 1, 2...) to the
     /// canonical block index allocated for that tool call. The allocator
@@ -246,6 +262,86 @@ struct StreamState {
     /// error that some upstreams emit when they close the connection right
     /// after the final SSE event.
     completed: bool,
+}
+
+impl StreamState {
+    /// Handle the `[DONE]` sentinel. Closes any still-open blocks. Synthesises
+    /// `ResponseStart`/`MessageStart`/`MessageStop` if the upstream never sent
+    /// them, so the canonical lifecycle envelope is always well-formed even
+    /// when an upstream goes straight from acknowledgement to `[DONE]` without
+    /// a `finish_reason` chunk (lifecycle rule 2 — same shape chat_sse_parser
+    /// hit pre-PR-B2).
+    fn handle_done(&mut self) -> Vec<StreamEvent> {
+        let mut evts = Vec::new();
+        if !self.emitted_response_start {
+            self.emitted_response_start = true;
+            evts.push(StreamEvent::ResponseStart {
+                id: ResponseId(self.response_id.clone()),
+                model: self.response_model.clone(),
+                created_at_unix: 0,
+            });
+        }
+        if !self.emitted_message_start {
+            self.emitted_message_start = true;
+            evts.push(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            });
+        }
+        // Defensive flush — `finish_reason` should already have closed
+        // everything, but a broken stream might skip it.
+        self.interleaver.flush(&mut evts);
+        drain_open_tool_blocks(&mut self.open_tool_blocks, &mut evts);
+        if !self.emitted_message_stop {
+            self.emitted_message_stop = true;
+            evts.push(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            });
+        }
+        if !self.emitted_response_stop {
+            self.emitted_response_stop = true;
+            evts.push(StreamEvent::ResponseStop { usage: None });
+        }
+        self.completed = true;
+        evts
+    }
+
+    /// Called once after the upstream stream ends — for any reason, including
+    /// abrupt disconnect without `[DONE]` or `finish_reason`. Synthesises any
+    /// missing lifecycle events so downstream encoders always see a
+    /// well-formed envelope (lifecycle rule 1d — same shape chat_sse_parser
+    /// hit pre-PR-B2). Idempotent — if `[DONE]` or `finish_reason` already
+    /// drove the envelope to completion, returns an empty vector.
+    fn finalize(&mut self) -> Vec<StreamEvent> {
+        if self.emitted_response_stop {
+            return Vec::new();
+        }
+        let mut evts = Vec::new();
+        if !self.emitted_response_start {
+            // Stream broke before any successful chunk — nothing to close.
+            // The absence of a ResponseStart tells encoders there is no
+            // envelope to finalize.
+            return evts;
+        }
+        if !self.emitted_message_start {
+            self.emitted_message_start = true;
+            evts.push(StreamEvent::MessageStart {
+                role: MessageRole::Assistant,
+            });
+        }
+        self.interleaver.flush(&mut evts);
+        drain_open_tool_blocks(&mut self.open_tool_blocks, &mut evts);
+        if !self.emitted_message_stop {
+            self.emitted_message_stop = true;
+            evts.push(StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+                stop_sequence: None,
+            });
+        }
+        self.emitted_response_stop = true;
+        evts.push(StreamEvent::ResponseStop { usage: None });
+        evts
+    }
 }
 
 fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, String> {
@@ -383,6 +479,7 @@ fn parse_chunk(data: &str, state: &mut StreamState) -> Result<Vec<StreamEvent>, 
                     stop_reason: StopReason::from_provider_string(reason),
                     stop_sequence: None,
                 });
+                state.emitted_message_stop = true;
                 // Mark completion so a trailing transport-level error from the
                 // upstream closing the connection is treated as benign.
                 state.completed = true;

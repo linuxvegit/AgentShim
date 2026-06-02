@@ -554,3 +554,70 @@ async fn canonical_path_with_anthropic_frontend_renders_reasoning_then_text() {
 
     mock.assert_async().await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F1 — silent-drop lifecycle coverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// DeepSeek SSE that emits a single text delta and then the upstream drops
+/// the connection without sending `finish_reason` or `[DONE]`. mockito
+/// closes the body cleanly after the partial payload, simulating the
+/// "Copilot via CloudFlare hangs up mid-stream" path.
+const SILENT_DROP_SSE: &str = concat!(
+    "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+);
+
+/// Lifecycle rule 1d coverage: the parser must close any open content block,
+/// emit MessageStop, and emit ResponseStop even when the upstream cuts off
+/// silently — so the gateway's H7 hook and the streaming usage logger see
+/// a complete envelope. Without finalize, the open text block at index 0
+/// would leak and the canonical lifecycle validator would panic.
+#[tokio::test]
+async fn silent_drop_finalize_closes_canonical_envelope() {
+    let mut server = mockito::Server::new_async().await;
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(SILENT_DROP_SSE)
+        .create_async()
+        .await;
+
+    let provider = make_provider(server.url());
+    let stream = provider
+        .complete(
+            make_req(true, FrontendKind::OpenAiChat),
+            make_target("deepseek-chat"),
+        )
+        .await
+        .expect("complete ok");
+
+    let events = drain(stream).await;
+
+    // The single text delta we wrote must be present, proving the parser
+    // didn't bail before producing content.
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "hello");
+
+    // finalize must have synthesised the missing close events.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::MessageStop { .. })),
+        "expected synthesised MessageStop on silent-drop stream"
+    );
+    assert!(
+        matches!(events.last(), Some(StreamEvent::ResponseStop { .. })),
+        "stream must end with ResponseStop, got {:?}",
+        events.last()
+    );
+
+    // The drain helper already calls assert_canonical_lifecycle(&events),
+    // so reaching this point proves the envelope is well-formed.
+}
