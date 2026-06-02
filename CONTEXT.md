@@ -95,6 +95,9 @@ Architectural invariant: same prompt routed through both paths must produce sema
 **Capability gate**
 Pre-network-call check raised as `ProviderError::CapabilityMismatch` when the frontend sent content (e.g. an image) the target provider's `ProviderCapabilities` says it can't handle. Frontend renders a 400 in its dialect. Replaces the alternative of letting upstream return a confusing error.
 
+**Provider capabilities** *(`agent_shim_providers::ProviderCapabilities`)*
+The capability descriptor a `BackendProvider` returns from `capabilities()`. Five fields: `streaming`, `tool_use`, `vision`, `json_mode`, `accepts_xhigh`. The single Interface the **capability gate** consults; there is no second copy. Lives in `agent-shim-providers` (not `agent-shim-core`) because every consumer is a provider crate — the gate, the catalog metadata layer, and admission's per-route capability check all reach for it through the `BackendProvider` trait.
+
 **Extensions namespace**
 `ContentBlock`, `Message`, `CanonicalRequest`, and `CanonicalResponse` carry `extensions: HashMap<String, serde_json::Value>` for protocol-specific data not promoted to canonical fields. v0.2 convention: keys are namespaced by provider — `gemini.safety_ratings`, `anthropic.cache_creation`, `deepseek.<...>`. Documented first-class behaviors live in `docs/providers/<provider>.md`. Promotion to typed canonical fields happens in v0.3 based on cross-provider read patterns, not prediction.
 

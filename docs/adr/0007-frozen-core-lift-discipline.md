@@ -72,6 +72,27 @@ sibling frozen-by-policy crates (`frontends/`, `providers/src/`)
 remain bound by their respective invariants unless their own ADR
 proposes a parallel lift.
 
+### (e) Removing items never used in production is permitted
+
+The discipline (a)–(d) governs *additions* to `core`. Removing a `pub`
+item that has **zero production callers** (verified by workspace-wide
+grep / `cargo public-api diff` showing the removal only affects
+`#[cfg(test)]` blocks) is permitted without invoking the lift
+procedure. Rationale: the invariant exists to keep `core` from
+accreting load-bearing surface area; deleting dead surface area is
+the opposite of accretion and serves the same goal. The removal must
+still be recorded in the release notes for the same paper-trail
+reasons (a)–(d) demand.
+
+v0.9.x worked example: `pub struct ProviderCapabilities` in
+`crates/core/src/capabilities.rs` had nine `supports_*` fields and a
+`supports_model()` helper, but every production reach for "what does
+this provider support" went to the differently-shaped
+`agent_shim_providers::ProviderCapabilities` (five fields, different
+naming). The core type's only callers were its own three unit tests.
+Workspace search confirmed zero non-test imports. The entire module
+plus its `pub use` re-export was removed under this rule.
+
 ## Worked example: v0.6.1's lift of `core`
 
 v0.6.1's diff against `b90b7f3` (the v0.6.0 release point) is:
@@ -134,12 +155,12 @@ declaration enabling above`. Both fit. The v0.7 release notes carry
 the classification table; the v0.7 design spec re-states the new
 post-v0.7 baseline as the diff target for v0.8.
 
-If instead v0.7 wanted to add a `capabilities: Vec<Capability>` field
-to the existing `pub struct ProviderCapabilities`, that would violate
-rule (a) ("no field additions to existing structs") — the change
-would need its own ADR proposing a wider invariant change, OR a
-refactoring approach (e.g. a new struct `ProviderCapabilitiesV2` and
-a deprecation of `ProviderCapabilities` over multiple releases).
+If instead v0.7 wanted to add a `family: ModelFamily` field to the
+existing `pub struct ModelMetadata` (defined in `agent-shim-core::catalog`),
+that would violate rule (a) ("no field additions to existing structs") —
+the change would need its own ADR proposing a wider invariant change,
+OR a refactoring approach (e.g. a new struct `ModelMetadataV2` and a
+deprecation of `ModelMetadata` over multiple releases).
 
 ## Consequences
 
