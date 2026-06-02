@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 /// Parse an SSE stream from the OpenAI Responses API into a CanonicalStream.
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -62,10 +64,10 @@ where
     // MessageStop + ResponseStop. Idempotent: if `response.completed`
     // already drove completion, returns nothing.
     //
-    // Caveat: this parser doesn't track open content blocks (it trusts
-    // upstream `output_index`), so silent-drop mid-block still leaks the
-    // open block. Adding block tracking is F2.1 follow-up; today's
-    // finalize covers the lifecycle-rule-2 (no MessageStop) bug only.
+    // F2.1: ParserState tracks open blocks on `output_item.added`/`.done`,
+    // so finalize also closes any orphaned blocks (tool blocks get
+    // ToolCallStop before ContentBlockStop per lifecycle rule 4) before
+    // emitting MessageStop + ResponseStop.
     let drain = futures::stream::once(async move {
         let mut state = state.lock().expect("state mutex poisoned");
         state.finalize().into_iter().map(Ok).collect::<Vec<_>>()
@@ -90,6 +92,12 @@ struct ParserState {
     /// `flat_map` drop the trailing transport error that some upstreams
     /// emit when they close the connection right after the final SSE event.
     stream_completed: bool,
+    /// Map of `output_index` → `ContentBlockKind` for blocks the upstream
+    /// has opened via `response.output_item.added` but not yet closed via
+    /// `response.output_item.done`. F2.1: used by `finalize` to close
+    /// orphaned blocks on silent-drop mid-block so the canonical lifecycle
+    /// stays well-formed (rule 1d). Inserted on .added, removed on .done.
+    open_blocks: HashMap<u32, ContentBlockKind>,
 }
 
 impl ParserState {
@@ -111,6 +119,20 @@ impl ParserState {
             evts.push(StreamEvent::MessageStart {
                 role: MessageRole::Assistant,
             });
+        }
+        // F2.1: close any blocks the upstream opened but never closed.
+        // Walk indices in sorted order so the synthesised events are
+        // deterministic for snapshot tests and cross-platform repro. Tool
+        // blocks emit ToolCallStop before ContentBlockStop per lifecycle
+        // rule 4; message blocks just emit ContentBlockStop.
+        let mut orphaned: Vec<(u32, ContentBlockKind)> =
+            self.open_blocks.drain().collect();
+        orphaned.sort_unstable_by_key(|(idx, _)| *idx);
+        for (idx, kind) in orphaned {
+            if kind == ContentBlockKind::ToolCall {
+                evts.push(StreamEvent::ToolCallStop { index: idx });
+            }
+            evts.push(StreamEvent::ContentBlockStop { index: idx });
         }
         if !self.emitted_message_stop {
             self.emitted_message_stop = true;
@@ -170,6 +192,9 @@ fn parse_event(
                         index: output_index,
                         kind: ContentBlockKind::Text,
                     }));
+                    state
+                        .open_blocks
+                        .insert(output_index, ContentBlockKind::Text);
                 }
                 "function_call" => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -183,6 +208,9 @@ fn parse_event(
                         id: ToolCallId::from_provider(call_id),
                         name: name.to_string(),
                     }));
+                    state
+                        .open_blocks
+                        .insert(output_index, ContentBlockKind::ToolCall);
                 }
                 _ => {}
             }
@@ -240,11 +268,13 @@ fn parse_event(
                     events.push(Ok(StreamEvent::ContentBlockStop {
                         index: output_index,
                     }));
+                    state.open_blocks.remove(&output_index);
                 }
                 "message" => {
                     events.push(Ok(StreamEvent::ContentBlockStop {
                         index: output_index,
                     }));
+                    state.open_blocks.remove(&output_index);
                 }
                 _ => {}
             }
@@ -411,10 +441,9 @@ mod tests {
     /// MessageStop → ResponseStop so downstream encoders / H7 hook / usage
     /// logger see a closed envelope.
     ///
-    /// Note: this test deliberately avoids opening a content block, since
-    /// the parser doesn't track open blocks today (it trusts upstream
-    /// output_index). Silent-drop mid-block is F2.1 follow-up; here we
-    /// cover the envelope-close path only.
+    /// Counterpart to `silent_drop_mid_block_finalizes_envelope` below,
+    /// which exercises the F2.1 open-block tracking. This test covers the
+    /// no-blocks-opened path; that one covers the orphaned-block path.
     #[tokio::test]
     async fn silent_drop_after_response_created_finalizes_envelope() {
         const SSE: &str = concat!(
@@ -444,5 +473,50 @@ mod tests {
 
         // The drain helper already calls assert_canonical_lifecycle(&events),
         // so reaching this point proves the envelope is well-formed.
+    }
+
+    /// F2.1: upstream sends `response.created` + `response.output_item.added`
+    /// for a message + a `response.output_text.delta` and then drops the
+    /// connection. The text block is open with no `output_item.done`,
+    /// no `response.completed`. finalize must close the open block (rule 1d)
+    /// in addition to synthesising MessageStop + ResponseStop.
+    #[tokio::test]
+    async fn silent_drop_mid_block_finalizes_envelope() {
+        const SSE: &str = concat!(
+            "event: response.created\n",
+            "data: {\"id\":\"resp_1\",\"model\":\"gpt-4o\",\"created_at\":1700000000,\"status\":\"in_progress\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"item_id\":\"msg_0\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n",
+        );
+        let events = drain(byte_stream(SSE)).await;
+
+        // The text delta survives — proves the parser didn't bail early.
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "partial");
+
+        // finalize closed the orphaned block.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })),
+            "expected finalize to emit ContentBlockStop for orphaned block 0"
+        );
+        assert!(
+            matches!(events.last(), Some(StreamEvent::ResponseStop { .. })),
+            "stream must end with ResponseStop, got {:?}",
+            events.last()
+        );
+
+        // The drain helper's assert_canonical_lifecycle would have panicked
+        // on a leaked open block before F2.1; reaching here proves the
+        // envelope is now well-formed.
     }
 }
