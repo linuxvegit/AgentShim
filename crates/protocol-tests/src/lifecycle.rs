@@ -98,7 +98,9 @@ pub fn assert_canonical_lifecycle_strict(events: &[StreamEvent], strict: StrictR
                     panic_at(
                         i,
                         event,
-                        &format!("rule 1a: ContentBlockStart for index {index} which is already open"),
+                        &format!(
+                            "rule 1a: ContentBlockStart for index {index} which is already open"
+                        ),
                     );
                 }
                 if state.closed_indices.contains(index) {
@@ -136,7 +138,14 @@ pub fn assert_canonical_lifecycle_strict(events: &[StreamEvent], strict: StrictR
             StreamEvent::TextDelta { index, .. } => {
                 check_post_message_stop(i, event, &state);
                 check_post_response_stop(i, event, &state, strict);
-                check_delta_kind(i, event, &state, *index, ContentBlockKind::Text, "TextDelta");
+                check_delta_kind(
+                    i,
+                    event,
+                    &state,
+                    *index,
+                    ContentBlockKind::Text,
+                    "TextDelta",
+                );
             }
 
             StreamEvent::ReasoningDelta { index, .. } => {
@@ -497,11 +506,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "rule 1c")]
     fn rule_1c_stop_unopened_block() {
-        let events = vec![
-            response_start(),
-            message_start(),
-            block_stop(0),
-        ];
+        let events = vec![response_start(), message_start(), block_stop(0)];
         assert_canonical_lifecycle(&events);
     }
 
@@ -524,11 +529,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "rule 2: ResponseStop before MessageStop")]
     fn rule_2_response_stop_before_message_stop() {
-        let events = vec![
-            response_start(),
-            message_start(),
-            response_stop(),
-        ];
+        let events = vec![response_start(), message_start(), response_stop()];
         assert_canonical_lifecycle(&events);
     }
 
@@ -594,11 +595,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "rule 5: TextDelta on index 7 which is not open")]
     fn rule_5_text_delta_on_unknown_index() {
-        let events = vec![
-            response_start(),
-            message_start(),
-            text_delta(7, "nowhere"),
-        ];
+        let events = vec![response_start(), message_start(), text_delta(7, "nowhere")];
         assert_canonical_lifecycle(&events);
     }
 
@@ -607,10 +604,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "rule 6: ContentBlockStart before MessageStart")]
     fn rule_6_block_start_before_message_start_strict() {
-        let events = vec![
-            response_start(),
-            block_start(0, ContentBlockKind::Text),
-        ];
+        let events = vec![response_start(), block_start(0, ContentBlockKind::Text)];
         assert_canonical_lifecycle(&events);
     }
 

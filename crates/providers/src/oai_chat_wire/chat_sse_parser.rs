@@ -218,10 +218,7 @@ impl ParserState {
             "SSE event received"
         );
         if event.data == "[DONE]" {
-            self.handle_done()
-                .into_iter()
-                .map(Ok)
-                .collect()
+            self.handle_done().into_iter().map(Ok).collect()
         } else {
             match self.parse_chunk(&event.data) {
                 Ok(evts) => evts.into_iter().map(Ok).collect(),
@@ -425,8 +422,7 @@ impl ParserState {
                     }
 
                     for tc in tool_calls {
-                        let tc_index =
-                            tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                        let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                         // Offset tool indices by 1 since text uses index 0
                         let block_index = tc_index + 1;
 

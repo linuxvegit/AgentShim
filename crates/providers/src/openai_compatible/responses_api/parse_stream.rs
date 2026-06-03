@@ -45,9 +45,9 @@ where
                     let parsed: serde_json::Value = match serde_json::from_str(data) {
                         Ok(v) => v,
                         Err(e) => {
-                            return futures::stream::iter(vec![Err(StreamError::Decode(
-                                format!("json parse for {event_type}: {e}"),
-                            ))]);
+                            return futures::stream::iter(vec![Err(StreamError::Decode(format!(
+                                "json parse for {event_type}: {e}"
+                            )))]);
                         }
                     };
 
@@ -125,8 +125,7 @@ impl ParserState {
         // deterministic for snapshot tests and cross-platform repro. Tool
         // blocks emit ToolCallStop before ContentBlockStop per lifecycle
         // rule 4; message blocks just emit ContentBlockStop.
-        let mut orphaned: Vec<(u32, ContentBlockKind)> =
-            self.open_blocks.drain().collect();
+        let mut orphaned: Vec<(u32, ContentBlockKind)> = self.open_blocks.drain().collect();
         orphaned.sort_unstable_by_key(|(idx, _)| *idx);
         for (idx, kind) in orphaned {
             if kind == ContentBlockKind::ToolCall {

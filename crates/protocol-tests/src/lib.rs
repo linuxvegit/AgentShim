@@ -132,7 +132,9 @@ pub fn make_oai_compat_target() -> BackendTarget {
 
 /// Build a [`DeepseekProvider`] pointed at the given mockito base URL
 /// with the test API key, no default headers, and a 30s timeout.
-pub fn make_deepseek_provider(base_url: String) -> agent_shim_providers::deepseek::DeepseekProvider {
+pub fn make_deepseek_provider(
+    base_url: String,
+) -> agent_shim_providers::deepseek::DeepseekProvider {
     agent_shim_providers::deepseek::DeepseekProvider::new(
         "deepseek",
         base_url,

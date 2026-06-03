@@ -383,26 +383,30 @@ impl PluginRegistry {
             let plugin = entry.plugin.clone();
             let plugin_name = entry.name.clone();
             let outcome = match kind {
-                RequestHookKind::DecodedRequest => crate::invoke::invoke(
-                    crate::invoke::InvokeArgs::from_entry(
-                        entry,
-                        hook,
-                        crate::invoke::SpanMode::PerInvocation,
-                    ),
-                    ctx,
-                    plugin.on_decoded_request(ctx, candidate),
-                )
-                .await,
-                RequestHookKind::Resolved { target } => crate::invoke::invoke(
-                    crate::invoke::InvokeArgs::from_entry(
-                        entry,
-                        hook,
-                        crate::invoke::SpanMode::PerInvocation,
-                    ),
-                    ctx,
-                    plugin.on_resolved(ctx, candidate, target),
-                )
-                .await,
+                RequestHookKind::DecodedRequest => {
+                    crate::invoke::invoke(
+                        crate::invoke::InvokeArgs::from_entry(
+                            entry,
+                            hook,
+                            crate::invoke::SpanMode::PerInvocation,
+                        ),
+                        ctx,
+                        plugin.on_decoded_request(ctx, candidate),
+                    )
+                    .await
+                }
+                RequestHookKind::Resolved { target } => {
+                    crate::invoke::invoke(
+                        crate::invoke::InvokeArgs::from_entry(
+                            entry,
+                            hook,
+                            crate::invoke::SpanMode::PerInvocation,
+                        ),
+                        ctx,
+                        plugin.on_resolved(ctx, candidate, target),
+                    )
+                    .await
+                }
             };
             match outcome {
                 crate::invoke::InvokeOutcome::Success(new_req) => {

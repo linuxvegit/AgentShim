@@ -889,11 +889,8 @@ async fn run_stream(
     //
     // `route_label` is threaded in from `dispatch_inner` instead of
     // re-formatted here — see `RunContext::route_label`.
-    let plugin_ctx_for_run = agent_shim_plugins::PluginContext::new(
-        canonical.id.clone(),
-        frontend_kind,
-        route_label,
-    );
+    let plugin_ctx_for_run =
+        agent_shim_plugins::PluginContext::new(canonical.id.clone(), frontend_kind, route_label);
 
     let upstream_stream_result = state
         .core
@@ -1060,11 +1057,8 @@ async fn run_unary(
     // `route_label` is threaded in from `dispatch_inner` instead of
     // re-formatted here — see `RunContext::route_label`.
     let canonical_id = canonical.id.clone();
-    let plugin_ctx_for_unary = agent_shim_plugins::PluginContext::new(
-        canonical_id.clone(),
-        frontend_kind,
-        route_label,
-    );
+    let plugin_ctx_for_unary =
+        agent_shim_plugins::PluginContext::new(canonical_id.clone(), frontend_kind, route_label);
 
     let stream_result = state
         .core

@@ -69,14 +69,20 @@ pub enum InputMessageContent {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputContentPart {
-    InputText { text: String },
-    InputImage { image_url: String },
+    InputText {
+        text: String,
+    },
+    InputImage {
+        image_url: String,
+    },
     /// Assistant-side text part. OpenAI Responses uses `output_text` for
     /// content emitted by the model; codex 0.5+ feeds prior assistant
     /// messages back into `input` with their original `output_text`
     /// parts intact. Decoded into a canonical text block on the canonical
     /// path; passthrough preserves the original bytes.
-    OutputText { text: String },
+    OutputText {
+        text: String,
+    },
     /// Forward-compatibility catch-all for content part types we don't
     /// enumerate (future OpenAI Responses additions). Without this,
     /// `Items(Vec<InputItem>)` decoding cascades up the untagged
@@ -148,7 +154,9 @@ pub enum InputItem {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningSummaryPart {
-    SummaryText { text: String },
+    SummaryText {
+        text: String,
+    },
     /// Forward-compatibility catch-all (same rationale as `InputItem::Other`).
     /// Reasoning summaries occasionally carry vendor-specific part types
     /// (`encrypted_content`, etc.) that we drop on the canonical path
@@ -161,7 +169,9 @@ pub enum ReasoningSummaryPart {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningContentPart {
-    ReasoningText { text: String },
+    ReasoningText {
+        text: String,
+    },
     /// Forward-compatibility catch-all (same rationale as `InputItem::Other`).
     #[serde(other)]
     Other,

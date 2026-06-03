@@ -145,7 +145,6 @@ fn mock_unary(server: &mut mockito::ServerGuard, model: &str, body: &str) -> moc
         .create()
 }
 
-
 /// Assert the canonical lifecycle contract holds (PR-B3: `CONTEXT.md`
 /// "Canonical lifecycle"). Streaming tests call this on the `Vec<Result>`
 /// they already collected — we unwrap the `Ok` arm into a fresh vector for
@@ -179,7 +178,7 @@ async fn streaming_text_response_yields_canonical_event_sequence() {
         .expect("complete ok");
 
     let events: Vec<_> = stream.collect().await;
-        assert_lifecycle(&events);
+    assert_lifecycle(&events);
 
     // Concatenate every TextDelta — must be exactly "Hello world".
     let combined: String = events
@@ -236,7 +235,7 @@ async fn streaming_reasoning_then_text_then_tool_call_allocates_indices_correctl
         .expect("complete ok");
 
     let events: Vec<_> = stream.collect().await;
-        assert_lifecycle(&events);
+    assert_lifecycle(&events);
 
     // Block index allocation: reasoning=0, text=1, tool_call=2.
     let mut reasoning_index = None;
@@ -326,7 +325,7 @@ async fn unary_inline_image_decodes_base64_into_canonical_image_block() {
     // unit tests inside `gemini::response` (e.g. the
     // `unary_inline_image_decodes_base64_into_canonical_block` test).
     let events: Vec<_> = stream.collect().await;
-        assert_lifecycle(&events);
+    assert_lifecycle(&events);
     let combined: String = events
         .iter()
         .filter_map(|r| match r.as_ref().unwrap() {
@@ -356,7 +355,7 @@ async fn cross_protocol_anthropic_request_routes_through_gemini_unchanged() {
         .expect("complete ok");
 
     let events: Vec<_> = stream.collect().await;
-        assert_lifecycle(&events);
+    assert_lifecycle(&events);
     let combined: String = events
         .iter()
         .filter_map(|r| match r.as_ref().unwrap() {
