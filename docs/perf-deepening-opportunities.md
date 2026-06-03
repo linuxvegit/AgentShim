@@ -151,6 +151,8 @@ Every admit that has cost-filter cap configured walks **every text block in ever
 
 **Confidence** High — `Arc<Mutex>` for a single-owner state machine is a named over-synchronization anti-pattern, and the producer pattern (`flat_map` + later `chain`) gives exclusive access by construction.
 
+**Measured 2026-06-03 (step a — temporary instrumentation, since reverted):** fed the 4-event `STREAM_TWO_TEXT_DELTAS_THEN_DONE` fixture through `parse()`, counted **5 `state.lock()` acquires** (N+1: one per SSE event in `flat_map` + one in the drain tail). The 8 canonical events emitted further multiply downstream encoder work but do **not** add to the parser-side lock count. Extrapolation: a 30-event Copilot Chat response = 31 lock acquires; a 100-event Anthropic-canonical-via-Copilot response = 101. Confirms the structural reasoning; #7 is real and proceeds to rewrite (step b).
+
 #### 8. Anthropic encoder's per-event `Arc::clone(&state)` + lock
 
 **Where**
