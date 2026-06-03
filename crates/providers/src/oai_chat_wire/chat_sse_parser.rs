@@ -1,10 +1,11 @@
 //! Parse an SSE byte-stream from OpenAI into a CanonicalStream.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet, VecDeque};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use eventsource_stream::Eventsource;
-use futures::StreamExt;
+use futures::stream::BoxStream;
 use futures_core::Stream;
 
 use agent_shim_core::{
@@ -16,38 +17,80 @@ pub(crate) fn parse<S>(byte_stream: S) -> agent_shim_core::CanonicalStream
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 {
-    let sse_stream = byte_stream.eventsource();
-    let state = Arc::new(Mutex::new(ParserState::default()));
-    let state_for_items = Arc::clone(&state);
-
-    let event_stream = sse_stream.flat_map(move |result| {
-        let events: Vec<Result<StreamEvent, StreamError>> = {
-            let mut s = state_for_items.lock().expect("state mutex poisoned");
-            match result {
-                Err(e) => s.handle_transport_error(e),
-                Ok(event) => s.handle_event(&event),
-            }
-        };
-        futures::stream::iter(events)
-    });
-
-    // After the upstream ends — for any reason: clean `[DONE]`, abrupt
-    // disconnect, transport error — `finalize` ensures the canonical
-    // lifecycle envelope is closed. If the stream already emitted
-    // `MessageStop` + `ResponseStop` (the `[DONE]` or `finish_reason` path),
-    // `finalize` is a no-op. Otherwise it synthesises whatever events are
-    // missing so downstream encoders, the H7 hook, and the streaming usage
-    // logger always see a well-formed end-of-stream.
-    //
-    // Mirrors the `Arc<Mutex<StreamState>>` + drain-tail pattern used by
-    // `gemini::response::parse_streaming`.
-    let drain = futures::stream::once(async move {
-        let mut s = state.lock().expect("state mutex poisoned");
-        s.finalize().into_iter().map(Ok).collect::<Vec<_>>()
+    let source = byte_stream.eventsource();
+    Box::pin(ChatSseParser {
+        source: Box::pin(source),
+        state: ParserState::default(),
+        pending: VecDeque::new(),
+        finalized: false,
     })
-    .flat_map(futures::stream::iter);
+}
 
-    Box::pin(event_stream.chain(drain))
+/// Hand-rolled `Stream` for the SSE → canonical translation. Owns its
+/// state mutably (no `Arc<Mutex>` synchronisation that the previous
+/// `flat_map` shape required to share state with the drain tail).
+///
+/// All fields are `Unpin`, including the boxed source (`Pin<Box<_>>` is
+/// itself `Unpin`), so the impl can use `self.get_mut()` instead of any
+/// unsafe pin projection.
+struct ChatSseParser {
+    source: BoxStream<
+        'static,
+        Result<eventsource_stream::Event, eventsource_stream::EventStreamError<reqwest::Error>>,
+    >,
+    state: ParserState,
+    pending: VecDeque<Result<StreamEvent, StreamError>>,
+    /// `true` once `state.finalize()` has been called on source EOF, so the
+    /// drain runs exactly once before `Poll::Ready(None)` becomes terminal.
+    finalized: bool,
+}
+
+impl Stream for ChatSseParser {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            // Drain any buffered output first. `parse_chunk` / `handle_done`
+            // can produce 1..N canonical events per SSE input event.
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(ev));
+            }
+
+            // Buffer empty — pull the next SSE event (or drive the drain).
+            match this.source.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(event))) => {
+                    let events = this.state.handle_event(&event);
+                    this.pending.extend(events);
+                    // Loop back to drain `pending`.
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    let events = this.state.handle_transport_error(e);
+                    this.pending.extend(events);
+                }
+                Poll::Ready(None) => {
+                    if !this.finalized {
+                        this.finalized = true;
+                        // `finalize` synthesises any missing lifecycle events
+                        // so downstream encoders always see a well-formed
+                        // envelope. Idempotent — returns Vec::new() when the
+                        // upstream already drove the envelope to completion
+                        // via `[DONE]` or `finish_reason`.
+                        //
+                        // Mirrors the drain-tail pattern used by
+                        // `gemini::response::parse_streaming`.
+                        let drain = this.state.finalize();
+                        this.pending.extend(drain.into_iter().map(Ok));
+                        // Loop back: emit the drain (if any), then on the
+                        // next call the source's None drives a terminal None.
+                    } else {
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 #[derive(Default)]
