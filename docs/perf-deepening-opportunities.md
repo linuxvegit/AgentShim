@@ -197,7 +197,7 @@ The interleaved reasoning state machine (documented in CONTEXT.md as the central
 
 ---
 
-(Top picks land in batch 3.)
+(Cross-stage themes, cross-reference with prior scans, and Top picks live below.)
 
 ---
 
@@ -277,4 +277,50 @@ results of structural progress, not regressions.
 
 ---
 
-(Top picks land in batch 3.)
+## Recommended next steps (Top picks)
+
+Eight `High` confidence candidates surfaced. Per the scan's caps
+(grilling: "5-8 if many strong, only take the strongest 5-8"), this list
+trims to **5** — the per-stage cases that are independently actionable and
+that represent the cross-stage themes through their strongest example.
+
+The ranking criterion is **Value = Confidence × (1 / Effort) × Cost-class
+breadth**, with a soft preference for `S`-effort items so an early measurement
+loop can validate the scan's instincts before committing to the larger
+candidates.
+
+### Order to attempt
+
+| Rank | # | Candidate | Why this rank |
+|---|---|---|---|
+| 1 | **#7** | `chat_sse_parser` Arc<Mutex> on single-owner state | `S` effort, `High` confidence, single-file scope. Tracing-counter proof takes ~1h; if confirmed, removing it is a self-contained patch with no API impact. **Representative for Theme B** — the parallel encoder fix (#8) follows directly. |
+| 2 | **#1** | Anthropic passthrough triple-parse | `S` effort, `High` confidence. ADR-0009 PR3 acknowledged the canonical decode as a trade-off, but the **third** parse in `rewrite_model` (full from_slice → mutate → to_vec for one field swap) was never separately rationalized. Worth measuring before deciding whether it justifies a targeted `jsonptr`-style in-place rewrite. |
+| 3 | **#5** | Admission clones (`chain.clone()`, `route_label.to_string()`, per-skip metric labels) | `M` effort, `High` confidence. Hot on every request that hits admission (all canonical, all passthrough). **Representative for Theme A** — fixing this is the wedge that opens up the broader String-keyed-maps story. |
+| 4 | **#3** | `apply_fuzzy_upgrades` per-element `to_string()` | `M` effort, `High` confidence. Standard `String` → `Cow<'static, str>` or `Arc<str>` refactor; the canonical strings already live in `ModelIndex` forever, so this is "stop allocating what you already own". Affects every request that resolves a route, which is all of them. |
+| 5 | **#9** | SSE event `to_string` → `format!` → `Bytes::from` chain | `M` effort, `High` confidence. Per-event multiplier (100-300 allocs per response on chatty streams) makes the absolute cost reasonable to chase. Standard `BytesMut` rewrite pattern; affects all three encoders. |
+
+### Cut from Top, kept in the candidate list
+
+- **#8** (Anthropic encoder Arc<Mutex>) — same anti-pattern as #7; the fix is template-able. Attempt as a follow-up after #7 lands and prove out the pattern.
+- **#4** (FrontendKind match + `find_route_entry` O(N)) — `S` effort but `Medium` confidence on magnitude; revisit if Top-5 measurements show route resolution is hotter than expected.
+- **#6** (cost_filter tiktoken duplication) — needs deduplication work that touches at least 3 modules (cost_estimate, count_tokens, prompt_compressor); split into its own spec if pursued.
+- **Theme A / Theme B / Theme C** — represented in Top by #5 and #7 respectively; revisit themes as a whole only if the representative fixes do not extrapolate.
+- **#2 / #10** — `Medium`/`Low` confidence; either may rise to High after the Top-5 measurement loop produces baseline numbers.
+
+### Note on the deferred harness spec
+
+The 2026-06-03 baseline-harness design (`docs/superpowers/specs/2026-06-03-perf-baseline-harness-design.md`) was paused so this scan could
+inform what to measure. The Top-5 above shows:
+
+- 4 of 5 picks have `Measurement effort = S or M` and can be validated with
+  in-process micro-bench + tracing counters, **without** needing the full
+  end-to-end harness.
+- None of the picks list `L` effort.
+
+**Recommendation for the harness spec's fate**: do not revive it as-is.
+Convert it to a small "per-pick measurement plan" that names the specific
+counter / micro-bench shape needed for each Top item. The end-to-end harness
+becomes useful only once optimizations land and operators want to claim
+"version A vs version B p99 difference" — a v0.10+ concern. Final disposition
+of the spec file (revert vs. supersede vs. keep-as-future-pointer) is a
+separate one-line decision and not part of this scan.
