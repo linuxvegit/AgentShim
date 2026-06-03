@@ -2,9 +2,34 @@
 
 **Date:** 2026-06-03
 **Baseline commit:** f599854
-**Status:** Approved (brainstorming complete)
+**Status:** **SUPERSEDED** by [`docs/perf-deepening-opportunities.md`](../../perf-deepening-opportunities.md) (2026-06-03).
 **Owner:** agent-shim
-**Next artifact:** implementation plan under `docs/superpowers/plans/`
+**Next artifact:** none — see Superseded note below.
+
+> ## Superseded — read before using this spec
+>
+> Immediately after this spec was approved, a grilling pass concluded that
+> **building an end-to-end harness before identifying hot spots was
+> premature**. A static perf scan was run instead, producing the
+> [Performance Deepening Opportunities](../../perf-deepening-opportunities.md)
+> document on the same date.
+>
+> That scan's Top-5 picks all have `Measurement effort = S or M`,
+> validateable with in-process micro-benches + `tracing` counters. **None**
+> require the full end-to-end harness this spec describes.
+>
+> **When to revive this spec:** v0.10+ work that needs to claim "version A
+> vs version B p99 difference" on a representative end-to-end workload —
+> e.g., after a batch of optimizations from the Top-5 lands and operators
+> want to publish before/after numbers, or when the cost-class question
+> shifts from "what's expensive" to "did our fix actually move the
+> end-to-end p99". At that point, re-validate the §2 architecture choice
+> (still `crates/protocol-tests/benches/`) and the §3-5 fixture inventory
+> against then-current code before implementing.
+>
+> Everything below is preserved verbatim from the approved 2026-06-03 spec.
+
+---
 
 ## 1. Goal
 
