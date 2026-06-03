@@ -197,5 +197,84 @@ The interleaved reasoning state machine (documented in CONTEXT.md as the central
 
 ---
 
-(Cross-stage themes, cross-reference with prior scans, and Top picks will land
-in batches 2 + 3.)
+(Top picks land in batch 3.)
+
+---
+
+## Cross-stage themes
+
+Patterns that don't belong to any one stage because they recur across the
+pipeline. Three themes; each has 2-3 example sites instead of one. Same field
+template as per-stage candidates, but `Where` lists multiple files.
+
+### Theme A — `String`-keyed maps and labels on the per-request hot path
+
+**Where**
+`crates/router/src/rate_limit.rs:151` (`get_or_create` builds `(dim, key.to_string())` composite key per check), `:199, 211, 219, 234` (every `check_pre_chain` / `check_per_upstream` does `cfg.clone()` from a `&BucketConfig`), `:152-159` (every request reads `buckets: RwLock<HashMap>` even when the bucket already exists).
+`crates/router/src/admission.rs:167, 193, 202` (`route_label.to_string()` + per-skip/note `.clone()`).
+`crates/gateway/src/pipeline.rs:622` (`format!("{:?}/{}", frontend_kind_for_hooks, model_alias)` per request — string formatted from a 3-variant enum).
+
+**Suspicion**
+A consistent pattern across rate-limit, admission, and pipeline: data already available as `&'static str` or `Arc<str>` (e.g. enum discriminants, the v0.9 `ResolvedRoute::route_label: Arc<str>`) gets converted to owned `String` for use as a HashMap key or metric label. Each conversion is small (one alloc + copy), but they compound: a typical canonical-path request touches ~15 such conversions between dispatch entry and provider call. Rate-limit's `BucketConfig::clone()` per check (lines 199/211/219/234) is a `Copy`-shaped 8-byte struct cloned through the `Cloned<Option<&BucketConfig>>` adapter — would be a no-op if the field were `Copy`, but the trait isn't derived. The composite-key allocation pattern (`(dim, key.to_string())`) on rate-limit's `get_or_create` is particularly wasteful because the hot path is the cache *hit* and the composite is built only to look up in the map then discarded.
+
+**Cost class** Memory / Throughput
+
+**Measurement effort** M — needs a tracking allocator hooked up to a representative request flow (canonical + passthrough + canonical-with-cost-filter), counting `alloc()` calls per dispatch.
+
+**Confidence** High — every site is visible; the pattern is named (small-string allocation for transient map keys) and there are at least 6 distinct call sites already identified in this scan.
+
+### Theme B — `Arc<Mutex>` / `Arc<AtomicBool>` on single-owner stream state
+
+**Where**
+`crates/providers/src/oai_chat_wire/chat_sse_parser.rs:20-31` (parser state); `crates/frontends/src/anthropic_messages/encode_stream.rs:69-92` (encoder state + `done` flag).
+
+**Suspicion**
+Two distinct stream state machines (one parser-side, one encoder-side) both wrap their state in `Arc<Mutex<...>>` and clone the Arc into `flat_map`'s closure per event. Cross-cutting because the same anti-pattern likely lives in the other two encoders (`openai_chat::encode_stream`, `openai_responses::encode_stream`) and the other native provider parsers (deepseek, gemini, anthropic native) — all of which face the same `flat_map` `'static` constraint. The root cause is structural: `Stream::flat_map` requires the closure to be `Fn`, which forces interior mutability for state updates. `unfold` or a hand-rolled `Stream::poll_next` impl side-steps this with `&mut state` access. Per-request impact = (N events × cost of lock+atomic acquire), times 5+ encoder/parser sites.
+
+**Cost class** CPU / Throughput
+
+**Measurement effort** M — bench any single encoder/parser pair with a 100-event fixture, then sweep the remaining sites to confirm shape.
+
+**Confidence** High — observed on 2 sites by direct read; the pattern is named (over-synchronization for single-owner state). Confirming the other 3 sites is a 30-minute read.
+
+### Theme C — Plugin hook plan cloning when subscribers exist
+
+**Where**
+`crates/plugins/src/registry.rs:530-533` (`wrap_stream` H5 path: `p.clone()` + `plan.on_stream_event.clone()`); analogous sites in `run_on_decoded_request`, `run_on_resolved`, `run_on_response_complete` if they follow the same pattern.
+
+**Suspicion**
+The empty-registry fast path is already zero-overhead and benchmarked by `crates/plugins/benches/empty_registry_overhead.rs`. **But** the non-empty path clones the entire `PluginPlan` and its `on_stream_event: Vec<Arc<PluginEntry>>` per request — each `Arc<PluginEntry>` is bumped twice (once when the `Vec<Arc>` is cloned, once into the per-event invocation). For routes with active plugins (the case `usage_recorder`, `pii_scrubber`, `prompt_compressor` operators actually run), this is a per-request cost that wasn't measured by the existing bench. The bench claim "zero overhead" is only valid for `PluginRegistry::empty()`.
+
+**Cost class** CPU / Memory
+
+**Measurement effort** M — extend `crates/plugins/benches/empty_registry_overhead.rs` to add a `non_empty_registry` group with 1-3 subscribed plugins; the delta over the empty case is the per-request plugin-walker cost.
+
+**Confidence** Medium — the clones are real, but per-request rather than per-event, so absolute cost is small. The interesting question is whether `Arc<PluginPlan>` shared directly via `Arc::clone` (one atomic bump) instead of `plan.clone()` (deep-clones the Vec) would help.
+
+---
+
+## Cross-reference with prior scans
+
+The 2026-05-15 `docs/architecture-deepening-opportunities.md` ran the same
+"deepening opportunities" exercise but limited to Interface/Module boundary
+depth. Three of its five candidates touch perf-adjacent surfaces; this
+section reconciles.
+
+| Prior candidate | Status today | Perf relevance |
+|---|---|---|
+| §1 Resolved Route Module | Landed in v0.9 as `ResolvedRoute` (CONTEXT.md "Admission unification"). Three lookups collapsed into one. | The structural goal is met. The perf gain was never quantified — claim was "one lookup instead of three", but admission still does enough downstream string-key work (this scan #4, #5, Theme A) that the saved lookups are not visibly the bottleneck. Independently scanned this round under stage 2 / 3. |
+| §2 Canonical Stream Lifecycle | Concentrated in `crates/protocol-tests/src/lifecycle.rs` as a test-only validator. Producer parsers and consumer encoders still each maintain their own state machines per ADR-0007 frozen-core discipline. | Perf interest is the **other** half — every parser/encoder pair runs its own state machine and (per this scan, Theme B) over-synchronizes it. Independently scanned this round under #7, #8, Theme B. |
+| §4 Plugin Hook Runner | The internal seam was partially extracted (per `git log` `consolidate H2/H3 hook walker`). The empty-registry fast path is benched. | Non-empty hot path is unmeasured. Scanned this round under Theme C. |
+| §3 Raw Passthrough Admission | Landed in v0.9 as ADR-0009 + AdmissionTicket; the "passthrough bypasses gates" gap is closed. | Perf side-effect: passthrough now also decodes the body for admission's canonical view (ADR-0009 PR3 decision). Scanned this round under #1 — the cost is acknowledged trade-off, not a new finding. |
+| §5 Capability Language Cleanup | Still has the two `ProviderCapabilities` modules (one in `core`, one in `providers`). CONTEXT.md ("Provider capabilities") names the live one as `agent-shim-providers`. | Pure structural concern, no perf impact. Out of scope here. |
+
+**Net read:** the architecture scan moved structural mass that this scan now
+sees the leftover perf overhead from. Specifically, the v0.9 admission
+unification collapsed lookups but introduced the per-request canonical decode
+on the passthrough path (this scan #1) and concentrated per-request small
+allocations into one well-named module (this scan #5, Theme A) — both visible
+results of structural progress, not regressions.
+
+---
+
+(Top picks land in batch 3.)
