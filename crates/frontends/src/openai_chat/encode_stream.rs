@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_shim_core::stream::StreamEvent;
+use agent_shim_core::stream::{CanonicalStream, StreamEvent};
 use bytes::Bytes;
-use futures_util::{stream::BoxStream, StreamExt};
-use parking_lot::Mutex;
+use futures_util::{stream::BoxStream, Stream, StreamExt};
 
 use super::mapping::finish_reason_from_canonical;
 use super::wire::{
@@ -68,36 +69,50 @@ fn make_usage_chunk(state: &EncoderState, usage: &agent_shim_core::usage::Usage)
     sse::data_only(&json)
 }
 
-pub fn encode(
-    canonical: agent_shim_core::stream::CanonicalStream,
-    keepalive: Option<Duration>,
+/// Hand-rolled `Stream` for the canonical -> OpenAI Chat SSE translation.
+///
+/// Replaces the prior `flat_map` + `Arc<Mutex<EncoderState>>` +
+/// `Arc<AtomicBool> done` + `Bytes::new()` sentinel + outer `scan()`
+/// terminator shape with a single owning struct (same template as
+/// `chat_sse_parser::ChatSseParser` and
+/// `anthropic_messages::encode_stream::AnthropicEncoderStream`).
+struct OaiChatEncoderStream {
+    source: CanonicalStream,
+    state: EncoderState,
     clock_override: Option<u64>,
-) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    pending: VecDeque<Result<Bytes, crate::FrontendError>>,
+    /// `true` once `[DONE]` has been emitted; the next poll returns
+    /// `Poll::Ready(None)`.
+    done: bool,
+}
 
-    let state = Arc::new(Mutex::new(EncoderState::new(clock_override)));
-    let done = Arc::new(AtomicBool::new(false));
-    let done_for_flat_map = Arc::clone(&done);
+impl OaiChatEncoderStream {
+    fn new(source: CanonicalStream, clock_override: Option<u64>) -> Self {
+        Self {
+            source,
+            state: EncoderState::new(clock_override),
+            clock_override,
+            pending: VecDeque::new(),
+            done: false,
+        }
+    }
 
-    let event_stream = canonical.flat_map(move |item| {
-        let state = Arc::clone(&state);
-        let done = Arc::clone(&done_for_flat_map);
-        let mut chunks: Vec<Result<Bytes, crate::FrontendError>> = Vec::new();
+    fn push_bytes(&mut self, b: Bytes) {
+        self.pending.push_back(Ok(b));
+    }
 
+    /// Process one canonical event into 0..N outbound chunks. Returns `true`
+    /// once `[DONE]` has been emitted and the stream should terminate.
+    fn handle(&mut self, item: Result<StreamEvent, agent_shim_core::StreamError>) -> bool {
         let stream_event = match item {
             Ok(e) => e,
             Err(e) => {
-                // Emit a data chunk with error info then [DONE]
+                // Emit a data chunk with error info then [DONE], then terminate.
                 let err_json = serde_json::json!({ "error": { "message": e.to_string() } });
                 let s = serde_json::to_string(&err_json).unwrap_or_default();
-                chunks.push(Ok(sse::data_only(&s)));
-                chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
-                // Signal termination: stop keepalive pings and trip the
-                // terminate_on_sentinel scan downstream so the HTTP body
-                // closes (otherwise clients hang waiting for EOF).
-                done.store(true, Ordering::SeqCst);
-                chunks.push(Ok(Bytes::new()));
-                return futures_util::stream::iter(chunks);
+                self.push_bytes(sse::data_only(&s));
+                self.push_bytes(Bytes::from("data: [DONE]\n\n"));
+                return true;
             }
         };
 
@@ -107,19 +122,19 @@ pub fn encode(
                 model,
                 created_at_unix,
             } => {
-                let mut s = state.lock();
-                s.response_id = id.0;
-                s.model = model;
+                self.state.response_id = id.0;
+                self.state.model = model;
                 // If no clock_override was set, use the event's timestamp for consistency
-                if clock_override.is_none() {
-                    s.created = created_at_unix;
+                if self.clock_override.is_none() {
+                    self.state.created = created_at_unix;
                 }
                 // Emit role chunk
                 let delta = DeltaOut {
                     role: Some("assistant"),
                     ..Default::default()
                 };
-                chunks.push(Ok(make_chunk(&s, delta, None)));
+                let b = make_chunk(&self.state, delta, None);
+                self.push_bytes(b);
             }
 
             StreamEvent::MessageStart { .. } => {
@@ -131,7 +146,6 @@ pub fn encode(
             }
 
             StreamEvent::ToolCallStart { index, id, name } => {
-                let s = state.lock();
                 let delta = DeltaOut {
                     tool_calls: vec![ToolCallDeltaOut {
                         index,
@@ -144,16 +158,17 @@ pub fn encode(
                     }],
                     ..Default::default()
                 };
-                chunks.push(Ok(make_chunk(&s, delta, None)));
+                let b = make_chunk(&self.state, delta, None);
+                self.push_bytes(b);
             }
 
             StreamEvent::TextDelta { text, .. } => {
-                let s = state.lock();
                 let delta = DeltaOut {
                     content: Some(text),
                     ..Default::default()
                 };
-                chunks.push(Ok(make_chunk(&s, delta, None)));
+                let b = make_chunk(&self.state, delta, None);
+                self.push_bytes(b);
             }
 
             StreamEvent::ReasoningDelta { .. } => {
@@ -164,7 +179,6 @@ pub fn encode(
                 index,
                 json_fragment,
             } => {
-                let s = state.lock();
                 let delta = DeltaOut {
                     tool_calls: vec![ToolCallDeltaOut {
                         index,
@@ -177,7 +191,8 @@ pub fn encode(
                     }],
                     ..Default::default()
                 };
-                chunks.push(Ok(make_chunk(&s, delta, None)));
+                let b = make_chunk(&self.state, delta, None);
+                self.push_bytes(b);
             }
 
             StreamEvent::ToolCallStop { .. } | StreamEvent::ContentBlockStop { .. } => {
@@ -189,77 +204,68 @@ pub fn encode(
             }
 
             StreamEvent::MessageStop { stop_reason, .. } => {
-                let s = state.lock();
                 let finish = finish_reason_from_canonical(&stop_reason).to_owned();
                 let delta = DeltaOut::default();
-                chunks.push(Ok(make_chunk(&s, delta, Some(finish))));
+                let b = make_chunk(&self.state, delta, Some(finish));
+                self.push_bytes(b);
             }
 
             StreamEvent::ResponseStop { usage } => {
                 if let Some(u) = usage {
-                    let s = state.lock();
-                    chunks.push(Ok(make_usage_chunk(&s, &u)));
+                    let b = make_usage_chunk(&self.state, &u);
+                    self.push_bytes(b);
                 }
-                chunks.push(Ok(Bytes::from("data: [DONE]\n\n")));
-                // Signal termination: stop keepalive pings and trip the
-                // terminate_on_sentinel scan downstream. Without this the
-                // ping stream is infinite and the HTTP body never closes,
-                // so clients (e.g. Codex/Cursor) hang on "waiting for
-                // reply" even after [DONE] is sent.
-                done.store(true, Ordering::SeqCst);
-                chunks.push(Ok(Bytes::new()));
+                self.push_bytes(Bytes::from("data: [DONE]\n\n"));
+                return true;
             }
 
             StreamEvent::Error { message } => {
                 let err_json = serde_json::json!({ "error": { "message": message } });
                 let s = serde_json::to_string(&err_json).unwrap_or_default();
-                chunks.push(Ok(sse::data_only(&s)));
+                self.push_bytes(sse::data_only(&s));
             }
 
             StreamEvent::RawProviderEvent(_) => {}
         }
 
-        futures_util::stream::iter(chunks)
-    });
+        false
+    }
+}
 
-    // Terminate the output stream after `data: [DONE]\n\n`. The flat_map
-    // emits an empty `Bytes` sentinel after [DONE]; `scan` yields all items
-    // up to (but not including) the sentinel, then returns None to end.
-    //
-    // Without this, the keepalive ping stream is infinite and `select` only
-    // ends when *both* sides end, so the HTTP body never closes — clients
-    // (Codex, Cursor, etc.) sit on "waiting for reply" forever after the
-    // model has actually finished.
-    let terminate_on_sentinel = |stream: BoxStream<
-        'static,
-        Result<Bytes, crate::FrontendError>,
-    >|
-     -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-        stream
-            .scan((), |(), item| {
-                let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
-                if is_sentinel {
-                    futures::future::ready(None)
-                } else {
-                    futures::future::ready(Some(item))
+impl Stream for OaiChatEncoderStream {
+    type Item = Result<Bytes, crate::FrontendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(ev));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            match this.source.as_mut().poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    if this.handle(item) {
+                        this.done = true;
+                    }
                 }
-            })
-            .boxed()
-    };
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
-    if let Some(interval) = keepalive {
-        use tokio_stream::wrappers::IntervalStream;
-        let done2 = Arc::clone(&done);
-        let ping_stream = IntervalStream::new(tokio::time::interval(interval))
-            .take_while(move |_| {
-                let is_done = done2.load(std::sync::atomic::Ordering::SeqCst);
-                futures::future::ready(!is_done)
-            })
-            .map(|_| Ok::<Bytes, crate::FrontendError>(sse::comment("ping")));
-        let merged = futures_util::stream::select(event_stream.boxed(), ping_stream.boxed());
-        terminate_on_sentinel(merged.boxed())
-    } else {
-        terminate_on_sentinel(event_stream.boxed())
+pub fn encode(
+    canonical: CanonicalStream,
+    keepalive: Option<Duration>,
+    clock_override: Option<u64>,
+) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+    let encoder = OaiChatEncoderStream::new(canonical, clock_override);
+    match keepalive {
+        Some(period) => sse::KeepaliveStream::new(encoder, period).boxed(),
+        None => encoder.boxed(),
     }
 }
 
@@ -301,18 +307,16 @@ mod tests {
         // that feeds an illegal fixture would be testing a scenario the
         // encoder is allowed to handle however it wants; this anchors all
         // encoder behaviour against well-formed input.
-        let owned: Vec<StreamEvent> = events
-            .iter()
-            .map(|r| r.as_ref().unwrap().clone())
-            .collect();
+        let owned: Vec<StreamEvent> = events.iter().map(|r| r.as_ref().unwrap().clone()).collect();
         agent_shim_protocol_tests::lifecycle::assert_canonical_lifecycle(&owned);
         events
     }
 
     /// Regression: with keepalive enabled, the encoded SSE stream MUST end
-    /// after `data: [DONE]\n\n`. Before the terminate_on_sentinel fix the
-    /// ping stream was infinite and `select` never closed the body, so
-    /// clients hung on "waiting for reply" after the model finished.
+    /// after `data: [DONE]\n\n`. Before the self-terminating encoder + new
+    /// KeepaliveStream landed, the ping stream was infinite and `select`
+    /// never closed the body, so clients hung on "waiting for reply" after
+    /// the model finished.
     #[tokio::test]
     async fn stream_terminates_after_done_with_keepalive() {
         let canonical: CanonicalStream = Box::pin(stream::iter(fake_events()));

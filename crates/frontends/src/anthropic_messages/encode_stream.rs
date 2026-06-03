@@ -336,59 +336,13 @@ impl Stream for AnthropicEncoderStream {
 /// pinging. Side benefit: when the canonical stream terminates early (e.g.
 /// upstream cancel before `ResponseStop`), the keepalive task now stops
 /// promptly instead of waiting for the next interval tick.
-struct KeepaliveStream<S> {
-    inner: S,
-    interval: tokio::time::Interval,
-    inner_done: bool,
-}
-
-impl<S> KeepaliveStream<S> {
-    fn new(inner: S, period: Duration) -> Self {
-        Self {
-            inner,
-            interval: tokio::time::interval(period),
-            inner_done: false,
-        }
-    }
-}
-
-impl<S> Stream for KeepaliveStream<S>
-where
-    S: Stream<Item = Result<Bytes, crate::FrontendError>> + Unpin,
-{
-    type Item = Result<Bytes, crate::FrontendError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        // Always prefer real bytes over pings.
-        if !this.inner_done {
-            match Pin::new(&mut this.inner).poll_next(cx) {
-                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
-                Poll::Ready(None) => {
-                    this.inner_done = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => {}
-            }
-        } else {
-            return Poll::Ready(None);
-        }
-
-        // Inner pending — emit a keepalive ping if the interval has fired.
-        match this.interval.poll_tick(cx) {
-            Poll::Ready(_) => Poll::Ready(Some(Ok(sse::comment("ping")))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 pub fn encode(
     canonical: CanonicalStream,
     keepalive: Option<Duration>,
 ) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
     let encoder = AnthropicEncoderStream::new(canonical);
     match keepalive {
-        Some(period) => KeepaliveStream::new(encoder, period).boxed(),
+        Some(period) => sse::KeepaliveStream::new(encoder, period).boxed(),
         None => encoder.boxed(),
     }
 }

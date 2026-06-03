@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use agent_shim_core::stream::{ContentBlockKind, StreamEvent};
+use agent_shim_core::stream::{CanonicalStream, ContentBlockKind, StreamEvent};
 use bytes::Bytes;
-use futures_util::{stream::BoxStream, StreamExt};
-use parking_lot::Mutex;
+use futures_util::{stream::BoxStream, Stream, StreamExt};
 
 use super::mapping::status_from_stop_reason;
 use super::wire::{
@@ -67,25 +68,53 @@ fn emit(event_name: &str, data: &impl serde::Serialize) -> Option<Bytes> {
     Some(sse::event(event_name, &json))
 }
 
-pub fn encode(
-    canonical: agent_shim_core::stream::CanonicalStream,
-    keepalive: Option<Duration>,
+/// Hand-rolled `Stream` for the canonical -> OpenAI Responses SSE
+/// translation.
+///
+/// Replaces the prior `flat_map` + `Arc<Mutex<EncoderState>>` +
+/// `Arc<AtomicBool> done` + `Bytes::new()` sentinel + outer `scan()`
+/// terminator shape with a single owning struct (same template as the
+/// `openai_chat` and `anthropic_messages` encoders).
+///
+/// The state is heavier than the other two encoders (six HashMaps for
+/// per-output_index accumulators) but the *coordination* shape is
+/// identical, and the rewrite eliminates the lock cost on every text
+/// delta — for a long response that was the single hottest lock site.
+struct OaiResponsesEncoderStream {
+    source: CanonicalStream,
+    state: EncoderState,
     clock_override: Option<u64>,
-) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    pending: VecDeque<Result<Bytes, crate::FrontendError>>,
+    /// `true` once `response.completed` has been emitted; the next poll
+    /// returns `Poll::Ready(None)`.
+    done: bool,
+}
 
-    let state = Arc::new(Mutex::new(EncoderState::new()));
-    if let Some(ts) = clock_override {
-        state.lock().created_at = ts;
+impl OaiResponsesEncoderStream {
+    fn new(source: CanonicalStream, clock_override: Option<u64>) -> Self {
+        let mut state = EncoderState::new();
+        if let Some(ts) = clock_override {
+            state.created_at = ts;
+        }
+        Self {
+            source,
+            state,
+            clock_override,
+            pending: VecDeque::new(),
+            done: false,
+        }
     }
-    let done = Arc::new(AtomicBool::new(false));
-    let done_for_flat_map = Arc::clone(&done);
 
-    let event_stream = canonical.flat_map(move |item| {
-        let state = Arc::clone(&state);
-        let done = Arc::clone(&done_for_flat_map);
-        let mut chunks: Vec<Result<Bytes, crate::FrontendError>> = Vec::new();
+    fn push_event(&mut self, event_name: &str, data: &impl serde::Serialize) {
+        if let Some(b) = emit(event_name, data) {
+            self.pending.push_back(Ok(b));
+        }
+    }
 
+    /// Process one canonical event into 0..N outbound chunks. Returns
+    /// `true` once `response.completed` has been emitted and the stream
+    /// should terminate.
+    fn handle(&mut self, item: Result<StreamEvent, agent_shim_core::StreamError>) -> bool {
         let stream_event = match item {
             Ok(e) => e,
             Err(e) => {
@@ -94,10 +123,8 @@ pub fn encode(
                     "code": "server_error",
                     "message": e.to_string()
                 });
-                if let Some(b) = emit("error", &err) {
-                    chunks.push(Ok(b));
-                }
-                return futures_util::stream::iter(chunks);
+                self.push_event("error", &err);
+                return false;
             }
         };
 
@@ -107,34 +134,30 @@ pub fn encode(
                 model,
                 created_at_unix,
             } => {
-                let mut s = state.lock();
-                s.response_id = format!("resp_{}", id.0);
-                s.model = model.clone();
-                if clock_override.is_none() {
-                    s.created_at = created_at_unix;
+                self.state.response_id = format!("resp_{}", id.0);
+                self.state.model = model.clone();
+                if self.clock_override.is_none() {
+                    self.state.created_at = created_at_unix;
                 }
                 let resp = ResponseObject {
-                    id: s.response_id.clone(),
+                    id: self.state.response_id.clone(),
                     object: "response",
                     status: "in_progress",
                     model,
-                    created_at: s.created_at,
+                    created_at: self.state.created_at,
                     output: vec![],
                     usage: None,
                 };
-                if let Some(b) = emit("response.created", &resp) {
-                    chunks.push(Ok(b));
-                }
+                self.push_event("response.created", &resp);
             }
 
             StreamEvent::ContentBlockStart { index, kind } => {
                 if kind == ContentBlockKind::Text {
-                    let mut s = state.lock();
-                    let oi = s.next_output_index();
+                    let oi = self.state.next_output_index();
                     let item_id = format!("msg_{oi}");
-                    s.canonical_to_output.insert(index, oi);
-                    s.item_ids.insert(oi, item_id.clone());
-                    s.text_buf.insert(oi, String::new());
+                    self.state.canonical_to_output.insert(index, oi);
+                    self.state.item_ids.insert(oi, item_id.clone());
+                    self.state.text_buf.insert(oi, String::new());
 
                     let item = OutputItem::Message {
                         id: item_id.clone(),
@@ -142,16 +165,14 @@ pub fn encode(
                         status: "in_progress",
                         content: vec![],
                     };
-                    if let Some(b) = emit(
+                    self.push_event(
                         "response.output_item.added",
                         &OutputItemAdded {
                             output_index: oi,
                             item,
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
-                    if let Some(b) = emit(
+                    );
+                    self.push_event(
                         "response.content_part.added",
                         &ContentPartAdded {
                             item_id,
@@ -162,48 +183,40 @@ pub fn encode(
                                 annotations: vec![],
                             },
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
+                    );
                 } else if kind == ContentBlockKind::Reasoning {
-                    let mut s = state.lock();
-                    let oi = s.next_output_index();
+                    let oi = self.state.next_output_index();
                     let item_id = format!("rs_{oi}");
-                    s.canonical_to_output.insert(index, oi);
-                    s.item_ids.insert(oi, item_id.clone());
-                    s.reasoning_buf.insert(oi, String::new());
+                    self.state.canonical_to_output.insert(index, oi);
+                    self.state.item_ids.insert(oi, item_id.clone());
+                    self.state.reasoning_buf.insert(oi, String::new());
 
                     let item = OutputItem::Reasoning {
                         id: item_id,
                         status: "in_progress",
                         content: vec![],
                     };
-                    if let Some(b) = emit(
+                    self.push_event(
                         "response.output_item.added",
                         &OutputItemAdded {
                             output_index: oi,
                             item,
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
+                    );
                 }
             }
 
             StreamEvent::TextDelta { index, text } => {
-                let (oi, item_id) = {
-                    let s = state.lock();
-                    let Some(oi) = s.canonical_to_output.get(&index).copied() else {
-                        chunks.push(Err(crate::FrontendError::Encode(format!(
+                let Some(oi) = self.state.canonical_to_output.get(&index).copied() else {
+                    self.pending
+                        .push_back(Err(crate::FrontendError::Encode(format!(
                             "text delta for unknown content block index: {index}"
                         ))));
-                        return futures_util::stream::iter(chunks);
-                    };
-                    let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
-                    (oi, item_id)
+                    return false;
                 };
+                let item_id = self.state.item_ids.get(&oi).cloned().unwrap_or_default();
 
-                if let Some(b) = emit(
+                self.push_event(
                     "response.output_text.delta",
                     &TextDeltaPayload {
                         item_id,
@@ -211,37 +224,29 @@ pub fn encode(
                         content_index: 0,
                         delta: text.clone(),
                     },
-                ) {
-                    chunks.push(Ok(b));
-                }
-                state.lock().text_buf.entry(oi).or_default().push_str(&text);
+                );
+                self.state.text_buf.entry(oi).or_default().push_str(&text);
             }
 
             StreamEvent::ReasoningDelta { index, text } => {
-                let (oi, item_id) = {
-                    let s = state.lock();
-                    let Some(oi) = s.canonical_to_output.get(&index).copied() else {
-                        chunks.push(Err(crate::FrontendError::Encode(format!(
+                let Some(oi) = self.state.canonical_to_output.get(&index).copied() else {
+                    self.pending
+                        .push_back(Err(crate::FrontendError::Encode(format!(
                             "reasoning delta for unknown content block index: {index}"
                         ))));
-                        return futures_util::stream::iter(chunks);
-                    };
-                    let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
-                    (oi, item_id)
+                    return false;
                 };
+                let item_id = self.state.item_ids.get(&oi).cloned().unwrap_or_default();
 
-                if let Some(b) = emit(
+                self.push_event(
                     "response.reasoning.delta",
                     &ReasoningDeltaPayload {
                         item_id,
                         output_index: oi,
                         delta: text.clone(),
                     },
-                ) {
-                    chunks.push(Ok(b));
-                }
-                state
-                    .lock()
+                );
+                self.state
                     .reasoning_buf
                     .entry(oi)
                     .or_default()
@@ -249,13 +254,14 @@ pub fn encode(
             }
 
             StreamEvent::ToolCallStart { index, id, name } => {
-                let mut s = state.lock();
-                let oi = s.next_output_index();
+                let oi = self.state.next_output_index();
                 let item_id = format!("fc_{oi}");
-                s.canonical_to_output.insert(index, oi);
-                s.item_ids.insert(oi, item_id.clone());
-                s.tool_args_buf.insert(oi, String::new());
-                s.tool_meta.insert(oi, (id.0.clone(), name.clone()));
+                self.state.canonical_to_output.insert(index, oi);
+                self.state.item_ids.insert(oi, item_id.clone());
+                self.state.tool_args_buf.insert(oi, String::new());
+                self.state
+                    .tool_meta
+                    .insert(oi, (id.0.clone(), name.clone()));
 
                 let item = OutputItem::FunctionCall {
                     id: item_id,
@@ -264,45 +270,37 @@ pub fn encode(
                     arguments: String::new(),
                     status: "in_progress",
                 };
-                if let Some(b) = emit(
+                self.push_event(
                     "response.output_item.added",
                     &OutputItemAdded {
                         output_index: oi,
                         item,
                     },
-                ) {
-                    chunks.push(Ok(b));
-                }
+                );
             }
 
             StreamEvent::ToolCallArgumentsDelta {
                 index,
                 json_fragment,
             } => {
-                let (oi, item_id) = {
-                    let s = state.lock();
-                    let Some(oi) = s.canonical_to_output.get(&index).copied() else {
-                        chunks.push(Err(crate::FrontendError::Encode(format!(
+                let Some(oi) = self.state.canonical_to_output.get(&index).copied() else {
+                    self.pending
+                        .push_back(Err(crate::FrontendError::Encode(format!(
                             "tool call argument delta for unknown content block index: {index}"
                         ))));
-                        return futures_util::stream::iter(chunks);
-                    };
-                    let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
-                    (oi, item_id)
+                    return false;
                 };
+                let item_id = self.state.item_ids.get(&oi).cloned().unwrap_or_default();
 
-                if let Some(b) = emit(
+                self.push_event(
                     "response.function_call_arguments.delta",
                     &FunctionCallArgsDelta {
                         item_id,
                         output_index: oi,
                         delta: json_fragment.clone(),
                     },
-                ) {
-                    chunks.push(Ok(b));
-                }
-                state
-                    .lock()
+                );
+                self.state
                     .tool_args_buf
                     .entry(oi)
                     .or_default()
@@ -310,14 +308,13 @@ pub fn encode(
             }
 
             StreamEvent::ContentBlockStop { index } => {
-                let mut s = state.lock();
-                let Some(oi) = s.canonical_to_output.remove(&index) else {
-                    return futures_util::stream::iter(chunks);
+                let Some(oi) = self.state.canonical_to_output.remove(&index) else {
+                    return false;
                 };
-                let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
+                let item_id = self.state.item_ids.get(&oi).cloned().unwrap_or_default();
 
-                if let Some(text) = s.text_buf.remove(&oi) {
-                    if let Some(b) = emit(
+                if let Some(text) = self.state.text_buf.remove(&oi) {
+                    self.push_event(
                         "response.output_text.done",
                         &TextDonePayload {
                             item_id: item_id.clone(),
@@ -325,10 +322,8 @@ pub fn encode(
                             content_index: 0,
                             text: text.clone(),
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
-                    if let Some(b) = emit(
+                    );
+                    self.push_event(
                         "response.content_part.done",
                         &ContentPartDone {
                             item_id: item_id.clone(),
@@ -339,9 +334,7 @@ pub fn encode(
                                 annotations: vec![],
                             },
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
+                    );
                     let done_item = OutputItem::Message {
                         id: item_id,
                         role: "assistant",
@@ -351,26 +344,22 @@ pub fn encode(
                             annotations: vec![],
                         }],
                     };
-                    if let Some(b) = emit(
+                    self.push_event(
                         "response.output_item.done",
                         &OutputItemDone {
                             output_index: oi,
                             item: done_item,
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
-                } else if let Some(reasoning_text) = s.reasoning_buf.remove(&oi) {
-                    if let Some(b) = emit(
+                    );
+                } else if let Some(reasoning_text) = self.state.reasoning_buf.remove(&oi) {
+                    self.push_event(
                         "response.reasoning.done",
                         &ReasoningDonePayload {
                             item_id: item_id.clone(),
                             output_index: oi,
                             text: reasoning_text.clone(),
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
+                    );
                     let done_item = OutputItem::Reasoning {
                         id: item_id,
                         status: "completed",
@@ -379,40 +368,36 @@ pub fn encode(
                             summary: None,
                         }],
                     };
-                    if let Some(b) = emit(
+                    self.push_event(
                         "response.output_item.done",
                         &OutputItemDone {
                             output_index: oi,
                             item: done_item,
                         },
-                    ) {
-                        chunks.push(Ok(b));
-                    }
+                    );
                 }
             }
 
             StreamEvent::ToolCallStop { index } => {
-                let mut s = state.lock();
-                let Some(oi) = s.canonical_to_output.get(&index).copied() else {
-                    chunks.push(Err(crate::FrontendError::Encode(format!(
-                        "tool call stop for unknown content block index: {index}"
-                    ))));
-                    return futures_util::stream::iter(chunks);
+                let Some(oi) = self.state.canonical_to_output.get(&index).copied() else {
+                    self.pending
+                        .push_back(Err(crate::FrontendError::Encode(format!(
+                            "tool call stop for unknown content block index: {index}"
+                        ))));
+                    return false;
                 };
-                let item_id = s.item_ids.get(&oi).cloned().unwrap_or_default();
-                let args = s.tool_args_buf.remove(&oi).unwrap_or_default();
-                let (call_id, name) = s.tool_meta.remove(&oi).unwrap_or_default();
+                let item_id = self.state.item_ids.get(&oi).cloned().unwrap_or_default();
+                let args = self.state.tool_args_buf.remove(&oi).unwrap_or_default();
+                let (call_id, name) = self.state.tool_meta.remove(&oi).unwrap_or_default();
 
-                if let Some(b) = emit(
+                self.push_event(
                     "response.function_call_arguments.done",
                     &FunctionCallArgsDone {
                         item_id: item_id.clone(),
                         output_index: oi,
                         arguments: args.clone(),
                     },
-                ) {
-                    chunks.push(Ok(b));
-                }
+                );
                 let done_item = OutputItem::FunctionCall {
                     id: item_id,
                     call_id,
@@ -420,61 +405,50 @@ pub fn encode(
                     arguments: args,
                     status: "completed",
                 };
-                if let Some(b) = emit(
+                self.push_event(
                     "response.output_item.done",
                     &OutputItemDone {
                         output_index: oi,
                         item: done_item,
                     },
-                ) {
-                    chunks.push(Ok(b));
-                }
+                );
             }
 
             StreamEvent::UsageDelta { usage } => {
-                let mut s = state.lock();
-                s.input_tokens += usage.input_tokens.unwrap_or(0);
-                s.output_tokens += usage.output_tokens.unwrap_or(0);
+                self.state.input_tokens += usage.input_tokens.unwrap_or(0);
+                self.state.output_tokens += usage.output_tokens.unwrap_or(0);
             }
 
             StreamEvent::MessageStop { stop_reason, .. } => {
                 let status = status_from_stop_reason(&stop_reason);
-                state.lock().final_status = Some(status);
+                self.state.final_status = Some(status);
             }
 
             StreamEvent::ResponseStop { usage } => {
                 if let Some(u) = usage {
-                    let mut s = state.lock();
                     if let Some(it) = u.input_tokens {
-                        s.input_tokens = it;
+                        self.state.input_tokens = it;
                     }
                     if let Some(ot) = u.output_tokens {
-                        s.output_tokens = ot;
+                        self.state.output_tokens = ot;
                     }
                 }
-                if !done.load(Ordering::SeqCst) {
-                    let s = state.lock();
-                    let status = s.final_status.unwrap_or("completed");
-                    let resp = ResponseObject {
-                        id: s.response_id.clone(),
-                        object: "response",
-                        status,
-                        model: s.model.clone(),
-                        created_at: s.created_at,
-                        output: vec![],
-                        usage: Some(UsageOut {
-                            input_tokens: s.input_tokens,
-                            output_tokens: s.output_tokens,
-                            total_tokens: s.input_tokens + s.output_tokens,
-                        }),
-                    };
-                    drop(s);
-                    if let Some(b) = emit("response.completed", &resp) {
-                        chunks.push(Ok(b));
-                    }
-                    done.store(true, Ordering::SeqCst);
-                    chunks.push(Ok(Bytes::new()));
-                }
+                let status = self.state.final_status.unwrap_or("completed");
+                let resp = ResponseObject {
+                    id: self.state.response_id.clone(),
+                    object: "response",
+                    status,
+                    model: self.state.model.clone(),
+                    created_at: self.state.created_at,
+                    output: vec![],
+                    usage: Some(UsageOut {
+                        input_tokens: self.state.input_tokens,
+                        output_tokens: self.state.output_tokens,
+                        total_tokens: self.state.input_tokens + self.state.output_tokens,
+                    }),
+                };
+                self.push_event("response.completed", &resp);
+                return true;
             }
 
             StreamEvent::Error { message } => {
@@ -483,50 +457,50 @@ pub fn encode(
                     "code": "server_error",
                     "message": message
                 });
-                if let Some(b) = emit("error", &err) {
-                    chunks.push(Ok(b));
-                }
+                self.push_event("error", &err);
             }
 
             StreamEvent::MessageStart { .. } | StreamEvent::RawProviderEvent(_) => {}
         }
 
-        futures_util::stream::iter(chunks)
-    });
+        false
+    }
+}
 
-    // Terminate the stream after response.completed. The flat_map emits an
-    // empty Bytes sentinel; scan() yields all items up to the sentinel, then
-    // returns None to end.
-    let terminate_on_sentinel = |stream: BoxStream<
-        'static,
-        Result<Bytes, crate::FrontendError>,
-    >|
-     -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-        stream
-            .scan((), |(), item| {
-                let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
-                if is_sentinel {
-                    futures::future::ready(None)
-                } else {
-                    futures::future::ready(Some(item))
+impl Stream for OaiResponsesEncoderStream {
+    type Item = Result<Bytes, crate::FrontendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(ev));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            match this.source.as_mut().poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    if this.handle(item) {
+                        this.done = true;
+                    }
                 }
-            })
-            .boxed()
-    };
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
-    if let Some(interval) = keepalive {
-        use tokio_stream::wrappers::IntervalStream;
-        let done2 = Arc::clone(&done);
-        let ping_stream = IntervalStream::new(tokio::time::interval(interval))
-            .take_while(move |_| {
-                let is_done = done2.load(std::sync::atomic::Ordering::SeqCst);
-                futures::future::ready(!is_done)
-            })
-            .map(|_| Ok::<Bytes, crate::FrontendError>(sse::comment("ping")));
-        let merged = futures_util::stream::select(event_stream.boxed(), ping_stream.boxed());
-        terminate_on_sentinel(merged.boxed())
-    } else {
-        terminate_on_sentinel(event_stream.boxed())
+pub fn encode(
+    canonical: CanonicalStream,
+    keepalive: Option<Duration>,
+    clock_override: Option<u64>,
+) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+    let encoder = OaiResponsesEncoderStream::new(canonical, clock_override);
+    match keepalive {
+        Some(period) => sse::KeepaliveStream::new(encoder, period).boxed(),
+        None => encoder.boxed(),
     }
 }
 
