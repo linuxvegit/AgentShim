@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use agent_shim_core::{
     ids::ResponseId,
-    stream::{ContentBlockKind, StreamEvent},
+    stream::{CanonicalStream, ContentBlockKind, StreamEvent},
 };
 use bytes::Bytes;
-use futures_util::{stream::BoxStream, StreamExt};
-use parking_lot::Mutex;
+use futures_util::{stream::BoxStream, Stream, StreamExt};
 
 use super::wire::{
     ContentBlockDelta, ContentBlockStartPayload, MessageDeltaPayload, MessageStartPayload,
@@ -15,7 +16,9 @@ use super::wire::{
 };
 use crate::sse;
 
-/// Mutable state threaded through SSE encoding.
+/// Mutable state owned by the encoder stream. No `Arc<Mutex<_>>` — the
+/// hand-rolled `AnthropicEncoderStream` owns this directly, so every
+/// `&mut self` borrow proves there is no concurrent access.
 struct EncoderState {
     response_id: String,
     model: String,
@@ -60,44 +63,69 @@ fn serialize_event(ev: &OutboundEvent) -> Option<Bytes> {
     Some(sse::event(name, &data))
 }
 
-pub fn encode(
-    canonical: agent_shim_core::stream::CanonicalStream,
-    keepalive: Option<Duration>,
-) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+/// Hand-rolled `Stream` that turns a `CanonicalStream` into Anthropic
+/// Messages SSE bytes.
+///
+/// Replaces the prior `flat_map` + `Arc<Mutex<state>>` + `Arc<AtomicBool>
+/// done` + `Bytes::new()` sentinel + outer `scan()` terminator shape with a
+/// single owning struct that:
+///
+/// - holds `EncoderState` by value (zero synchronisation),
+/// - drains buffered output before pulling the source again,
+/// - terminates itself the moment `MessageStop` is emitted (no
+///   downstream `scan` needed; the wrapper handles `done` directly).
+///
+/// All fields are `Unpin` (`Pin<Box<_>>` is itself `Unpin`,
+/// `EncoderState`/`VecDeque`/`bool` are `Unpin`), so `self.get_mut()` is
+/// safe without pin projection.
+struct AnthropicEncoderStream {
+    source: CanonicalStream,
+    state: EncoderState,
+    pending: VecDeque<Result<Bytes, crate::FrontendError>>,
+    /// `true` once `MessageStop` has been emitted; on the next poll the
+    /// stream returns `Poll::Ready(None)` to terminate cleanly.
+    done: bool,
+}
 
-    let state = Arc::new(Mutex::new(EncoderState::new()));
-    let done = Arc::new(AtomicBool::new(false));
-    let done_for_flat_map = Arc::clone(&done);
+impl AnthropicEncoderStream {
+    fn new(source: CanonicalStream) -> Self {
+        Self {
+            source,
+            state: EncoderState::new(),
+            pending: VecDeque::new(),
+            done: false,
+        }
+    }
 
-    let event_stream = canonical.flat_map(move |item| {
-        let state = Arc::clone(&state);
-        let done = Arc::clone(&done_for_flat_map);
-        let mut chunks: Vec<Result<Bytes, crate::FrontendError>> = Vec::new();
+    fn push(&mut self, ev: &OutboundEvent) {
+        if let Some(b) = serialize_event(ev) {
+            self.pending.push_back(Ok(b));
+        }
+    }
 
+    /// Translate one canonical event into 0..N outbound SSE events,
+    /// buffering them in `self.pending`. Returns `true` once the encoder
+    /// has emitted `message_stop` and the stream should terminate.
+    fn handle(&mut self, item: Result<StreamEvent, agent_shim_core::StreamError>) -> bool {
         let stream_event = match item {
             Ok(e) => e,
             Err(e) => {
-                let ev = OutboundEvent::Error {
+                self.push(&OutboundEvent::Error {
                     error: super::wire::ErrorPayload {
                         ty: "api_error".into(),
                         message: e.to_string(),
                     },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
-                return futures_util::stream::iter(chunks);
+                });
+                return false;
             }
         };
 
         match stream_event {
             StreamEvent::ResponseStart { id, model, .. } => {
-                let mut s = state.lock();
-                s.response_id = id.0.clone();
-                s.model = model.clone();
+                self.state.response_id = id.0.clone();
+                self.state.model = model.clone();
                 // Emit message_start with empty usage (updated later)
-                let ev = OutboundEvent::MessageStart {
+                self.push(&OutboundEvent::MessageStart {
                     message: MessageStartPayload {
                         id: id.0,
                         ty: "message",
@@ -105,23 +133,19 @@ pub fn encode(
                         model,
                         usage: OutboundUsage::default(),
                     },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                });
                 // Emit a ping to signal start
-                if let Some(b) = serialize_event(&OutboundEvent::Ping) {
-                    chunks.push(Ok(b));
-                }
+                self.push(&OutboundEvent::Ping);
             }
 
             StreamEvent::ContentBlockStart { index, kind } => {
-                let mut s = state.lock();
                 let idx = index as usize;
-                if idx >= s.block_kinds.len() {
-                    s.block_kinds.resize(idx + 1, ContentBlockKind::Text);
+                if idx >= self.state.block_kinds.len() {
+                    self.state
+                        .block_kinds
+                        .resize(idx + 1, ContentBlockKind::Text);
                 }
-                s.block_kinds[idx] = kind;
+                self.state.block_kinds[idx] = kind;
 
                 if kind != ContentBlockKind::ToolCall {
                     let payload = match kind {
@@ -140,63 +164,48 @@ pub fn encode(
                             text: String::new(),
                         },
                     };
-                    let ev = OutboundEvent::ContentBlockStart {
+                    self.push(&OutboundEvent::ContentBlockStart {
                         index,
                         content_block: payload,
-                    };
-                    if let Some(b) = serialize_event(&ev) {
-                        chunks.push(Ok(b));
-                    }
+                    });
                 }
             }
 
             StreamEvent::ToolCallStart { index, id, name } => {
-                let ev = OutboundEvent::ContentBlockStart {
+                self.push(&OutboundEvent::ContentBlockStart {
                     index,
                     content_block: ContentBlockStartPayload::ToolUse {
                         id: id.0,
                         name,
                         input: String::new(),
                     },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                });
             }
 
             StreamEvent::TextDelta { index, text } => {
-                let ev = OutboundEvent::ContentBlockDelta {
+                self.push(&OutboundEvent::ContentBlockDelta {
                     index,
                     delta: ContentBlockDelta::TextDelta { text },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                });
             }
 
             StreamEvent::ReasoningDelta { index, text } => {
-                let ev = OutboundEvent::ContentBlockDelta {
+                self.push(&OutboundEvent::ContentBlockDelta {
                     index,
                     delta: ContentBlockDelta::ThinkingDelta { thinking: text },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                });
             }
 
             StreamEvent::ToolCallArgumentsDelta {
                 index,
                 json_fragment,
             } => {
-                let ev = OutboundEvent::ContentBlockDelta {
+                self.push(&OutboundEvent::ContentBlockDelta {
                     index,
                     delta: ContentBlockDelta::InputJsonDelta {
                         partial_json: json_fragment,
                     },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                });
             }
 
             StreamEvent::ToolCallStop { .. } => {
@@ -204,21 +213,17 @@ pub fn encode(
             }
 
             StreamEvent::ContentBlockStop { index } => {
-                let ev = OutboundEvent::ContentBlockStop { index };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                self.push(&OutboundEvent::ContentBlockStop { index });
             }
 
             StreamEvent::UsageDelta { usage } => {
-                let mut s = state.lock();
-                s.input_tokens += usage.input_tokens.unwrap_or(0);
-                s.output_tokens += usage.output_tokens.unwrap_or(0);
+                self.state.input_tokens += usage.input_tokens.unwrap_or(0);
+                self.state.output_tokens += usage.output_tokens.unwrap_or(0);
                 if let Some(v) = usage.cache_creation_input_tokens {
-                    *s.cache_creation_input_tokens.get_or_insert(0) += v;
+                    *self.state.cache_creation_input_tokens.get_or_insert(0) += v;
                 }
                 if let Some(v) = usage.cache_read_input_tokens {
-                    *s.cache_read_input_tokens.get_or_insert(0) += v;
+                    *self.state.cache_read_input_tokens.get_or_insert(0) += v;
                 }
             }
 
@@ -228,64 +233,52 @@ pub fn encode(
             } => {
                 // Defer emission to ResponseStop so that any trailing UsageDelta
                 // events (common with OpenAI-compatible backends) are captured.
-                let mut s = state.lock();
-                s.pending_stop = Some((stop_reason, stop_sequence));
+                self.state.pending_stop = Some((stop_reason, stop_sequence));
             }
 
             StreamEvent::ResponseStop { usage } => {
                 use super::mapping::stop_reason_to_anthropic;
-                let mut s = state.lock();
                 // Apply any final usage override from the provider.
                 if let Some(u) = usage {
                     if let Some(it) = u.input_tokens {
-                        s.input_tokens = it;
+                        self.state.input_tokens = it;
                     }
                     if let Some(ot) = u.output_tokens {
-                        s.output_tokens = ot;
+                        self.state.output_tokens = ot;
                     }
                     if let Some(v) = u.cache_creation_input_tokens {
-                        s.cache_creation_input_tokens = Some(v);
+                        self.state.cache_creation_input_tokens = Some(v);
                     }
                     if let Some(v) = u.cache_read_input_tokens {
-                        s.cache_read_input_tokens = Some(v);
+                        self.state.cache_read_input_tokens = Some(v);
                     }
                 }
                 // Now emit the deferred message_delta + message_stop.
-                if let Some((stop_reason, stop_sequence)) = s.pending_stop.take() {
-                    let ev = OutboundEvent::MessageDelta {
+                if let Some((stop_reason, stop_sequence)) = self.state.pending_stop.take() {
+                    self.push(&OutboundEvent::MessageDelta {
                         delta: MessageDeltaPayload {
                             stop_reason: stop_reason_to_anthropic(&stop_reason).to_owned(),
                             stop_sequence,
                         },
                         usage: OutboundUsage {
-                            input_tokens: s.input_tokens,
-                            output_tokens: s.output_tokens,
-                            cache_creation_input_tokens: s.cache_creation_input_tokens,
-                            cache_read_input_tokens: s.cache_read_input_tokens,
+                            input_tokens: self.state.input_tokens,
+                            output_tokens: self.state.output_tokens,
+                            cache_creation_input_tokens: self.state.cache_creation_input_tokens,
+                            cache_read_input_tokens: self.state.cache_read_input_tokens,
                         },
-                    };
-                    drop(s);
-                    if let Some(b) = serialize_event(&ev) {
-                        chunks.push(Ok(b));
-                    }
-                    if let Some(b) = serialize_event(&OutboundEvent::MessageStop) {
-                        chunks.push(Ok(b));
-                    }
-                    done.store(true, Ordering::SeqCst);
-                    chunks.push(Ok(Bytes::new()));
+                    });
+                    self.push(&OutboundEvent::MessageStop);
+                    return true;
                 }
             }
 
             StreamEvent::Error { message } => {
-                let ev = OutboundEvent::Error {
+                self.push(&OutboundEvent::Error {
                     error: super::wire::ErrorPayload {
                         ty: "api_error".into(),
                         message,
                     },
-                };
-                if let Some(b) = serialize_event(&ev) {
-                    chunks.push(Ok(b));
-                }
+                });
             }
 
             StreamEvent::MessageStart { .. } | StreamEvent::RawProviderEvent(_) => {
@@ -293,44 +286,110 @@ pub fn encode(
             }
         }
 
-        futures_util::stream::iter(chunks)
-    });
+        false
+    }
+}
 
-    // Terminate the output stream after message_stop. The flat_map emits an
-    // empty Bytes sentinel after the message_stop SSE event. scan() yields all
-    // items up to (but not including) the sentinel, then returns None to end.
-    let terminate_on_sentinel = |stream: BoxStream<
-        'static,
-        Result<Bytes, crate::FrontendError>,
-    >|
-     -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
-        stream
-            .scan((), |(), item| {
-                let is_sentinel = matches!(&item, Ok(b) if b.is_empty());
-                if is_sentinel {
-                    futures::future::ready(None)
-                } else {
-                    futures::future::ready(Some(item))
+impl Stream for AnthropicEncoderStream {
+    type Item = Result<Bytes, crate::FrontendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            // Drain any buffered output first. `handle` can produce 0..N
+            // SSE events per canonical input event.
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(ev));
+            }
+
+            // No buffered output. If we already emitted message_stop on a
+            // prior poll, this is the terminal call.
+            if this.done {
+                return Poll::Ready(None);
+            }
+
+            // Pull the next canonical event (or terminate on source EOF).
+            match this.source.as_mut().poll_next(cx) {
+                Poll::Ready(Some(item)) => {
+                    if this.handle(item) {
+                        this.done = true;
+                    }
+                    // Loop back to drain `pending`.
                 }
-            })
-            .boxed()
-    };
+                Poll::Ready(None) => {
+                    // Source ended without ResponseStop. Treat as terminal —
+                    // the upstream lifecycle validator is responsible for
+                    // flagging malformed canonical streams; this encoder
+                    // surfaces whatever bytes it already emitted.
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
-    // Optionally interleave keepalive pings
-    if let Some(interval) = keepalive {
-        use tokio_stream::wrappers::IntervalStream;
-        let done2 = Arc::clone(&done);
-        let ping_stream = IntervalStream::new(tokio::time::interval(interval))
-            .take_while(move |_| {
-                let is_done = done2.load(std::sync::atomic::Ordering::SeqCst);
-                futures::future::ready(!is_done)
-            })
-            .map(|_| Ok::<Bytes, crate::FrontendError>(sse::comment("ping")));
+/// Wraps an inner SSE byte stream with periodic keepalive comments.
+///
+/// Replaces the prior `Arc<AtomicBool> done` flag + `select` pattern with a
+/// stream that observes the inner stream's own `Poll::Ready(None)` to stop
+/// pinging. Side benefit: when the canonical stream terminates early (e.g.
+/// upstream cancel before `ResponseStop`), the keepalive task now stops
+/// promptly instead of waiting for the next interval tick.
+struct KeepaliveStream<S> {
+    inner: S,
+    interval: tokio::time::Interval,
+    inner_done: bool,
+}
 
-        let merged = futures_util::stream::select(event_stream.boxed(), ping_stream.boxed());
-        terminate_on_sentinel(merged.boxed())
-    } else {
-        terminate_on_sentinel(event_stream.boxed())
+impl<S> KeepaliveStream<S> {
+    fn new(inner: S, period: Duration) -> Self {
+        Self {
+            inner,
+            interval: tokio::time::interval(period),
+            inner_done: false,
+        }
+    }
+}
+
+impl<S> Stream for KeepaliveStream<S>
+where
+    S: Stream<Item = Result<Bytes, crate::FrontendError>> + Unpin,
+{
+    type Item = Result<Bytes, crate::FrontendError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // Always prefer real bytes over pings.
+        if !this.inner_done {
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(item)) => return Poll::Ready(Some(item)),
+                Poll::Ready(None) => {
+                    this.inner_done = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {}
+            }
+        } else {
+            return Poll::Ready(None);
+        }
+
+        // Inner pending — emit a keepalive ping if the interval has fired.
+        match this.interval.poll_tick(cx) {
+            Poll::Ready(_) => Poll::Ready(Some(Ok(sse::comment("ping")))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub fn encode(
+    canonical: CanonicalStream,
+    keepalive: Option<Duration>,
+) -> BoxStream<'static, Result<Bytes, crate::FrontendError>> {
+    let encoder = AnthropicEncoderStream::new(canonical);
+    match keepalive {
+        Some(period) => KeepaliveStream::new(encoder, period).boxed(),
+        None => encoder.boxed(),
     }
 }
 
