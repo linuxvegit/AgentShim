@@ -548,6 +548,29 @@ pub fn validate_routes(cfg: &GatewayConfig) -> Result<(), String> {
                 ));
             }
         }
+
+        // Rule 8 (2026-06-04): `model` may contain `*` only as the sole
+        // character (the full catch-all) or as a single trailing character
+        // (a prefix pattern like `claude-*`). Anything else is malformed.
+        //
+        // Predicate: model is valid iff at least one of
+        //   (a) model == "*"
+        //   (b) model has no '*' at all
+        //   (c) model has exactly one '*', it's the final character, and the
+        //       prefix (everything before it) is non-empty.
+        if route.model != "*" {
+            let star_count = route.model.matches('*').count();
+            let star_at_end = route.model.ends_with('*');
+            let prefix_non_empty = route.model.len() > 1;
+            let valid_no_star = star_count == 0;
+            let valid_prefix = star_count == 1 && star_at_end && prefix_non_empty;
+            if !valid_no_star && !valid_prefix {
+                return Err(format!(
+                    "route[{i}] '{}/{}': '*' is only allowed at the end of the model pattern (e.g. \"claude-*\") or as the sole character (\"*\")",
+                    route.frontend, route.model
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1684,6 +1707,207 @@ mod tests {
         );
         let err = validate_routes(&cfg).unwrap_err();
         assert!(err.contains("multiplier"));
+    }
+
+    // ── Plan: route prefix wildcard `model` validation ──────────────────────
+
+    #[test]
+    fn validate_routes_accepts_prefix_pattern() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "*",
+        ));
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "glm*",
+            "copilot",
+            "*",
+        ));
+        validate_routes(&cfg).expect("prefix patterns should pass");
+    }
+
+    #[test]
+    fn validate_routes_rejects_star_in_middle() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*-thinking",
+            "copilot",
+            "*",
+        ));
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(
+            err.contains("'*' is only allowed at the end"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_routes_rejects_star_at_start() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "*claude",
+            "copilot",
+            "*",
+        ));
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("'*' is only allowed at the end"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_routes_rejects_star_in_two_positions() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "*claude*",
+            "copilot",
+            "*",
+        ));
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("'*' is only allowed at the end"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_routes_rejects_double_star_suffix() {
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-**",
+            "copilot",
+            "*",
+        ));
+        let err = validate_routes(&cfg).unwrap_err();
+        assert!(err.contains("'*' is only allowed at the end"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_routes_accepts_exact_and_full_wildcard_regression() {
+        // Pins that today's two existing model-field shapes still validate after
+        // the new rule. Defensive against an accidental over-tightening of the
+        // predicate during refactors.
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-sonnet-4-5",
+            "copilot",
+            "claude-sonnet-4-5",
+        ));
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "*",
+            "copilot",
+            "*",
+        ));
+        validate_routes(&cfg).expect("exact + catch-all should pass");
+    }
+
+    #[test]
+    fn validate_routes_allows_overlapping_prefixes() {
+        // Documented in the spec: overlap is a feature; the router disambiguates
+        // by longest-prefix-wins. Validation must NOT reject.
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "*",
+        ));
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-3-*",
+            "copilot",
+            "*",
+        ));
+        validate_routes(&cfg).expect("overlapping prefixes should pass");
+    }
+
+    #[test]
+    fn validate_routes_allows_duplicate_prefix_silent_override() {
+        // Documented in the spec: identical (frontend, model) entries silently
+        // overwrite (last wins) — mirrors today's behavior for duplicate exact
+        // routes. Validation does NOT enforce uniqueness here.
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "*",
+        ));
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "claude-3-5-sonnet-20241022",
+        ));
+        validate_routes(&cfg).expect("duplicate prefix should pass at config level");
     }
 
     // ── Plan 04 P04 T3: rate_limit + auth validation ────────────────────────
