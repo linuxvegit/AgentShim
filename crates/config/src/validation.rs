@@ -2817,6 +2817,62 @@ routes:
     }
 
     #[test]
+    fn validate_with_index_checks_literal_upstream_model_under_prefix_route() {
+        // Per spec §5: validate_with_index reads only `upstream_model`, never
+        // `model`. So a prefix route with a literal upstream_model that mistypes
+        // the discovered catalog still fails at startup.
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.validation.strict_upstream_models = true;
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "claude-typo-not-in-catalog",
+        ));
+        let discovered = vec![(
+            "copilot".to_string(),
+            vec!["claude-sonnet-4-5".to_string()],
+        )];
+        let err = validate_with_index(&cfg, &discovered).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ValidationError::UnknownUpstreamModel { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_with_index_skips_wildcard_upstream_model_under_prefix_route() {
+        // Per spec §5: upstream_model == "*" is the pass-through marker; the
+        // checker skips it regardless of the model-field shape.
+        let mut cfg = mk_cfg_with_routes(vec![]);
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            crate::schema::UpstreamConfig::GithubCopilot(crate::schema::GithubCopilotUpstream {
+                tier: crate::schema::Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        cfg.validation.strict_upstream_models = true;
+        cfg.routes.push(crate::schema::RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "*",
+        ));
+        let discovered = vec![("copilot".to_string(), vec![])]; // empty catalog
+        validate_with_index(&cfg, &discovered).expect("pass-through should skip the check");
+    }
+
+    #[test]
     fn validate_with_index_walks_each_chain_element() {
         // Build a multi-upstream route by hand — the YAML form for
         // `upstreams: [...]` is a different parse path; for tests we
