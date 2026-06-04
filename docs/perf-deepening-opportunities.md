@@ -313,7 +313,7 @@ candidates.
 | #1 | **Done** | `053c139` — `rewrite_model` fast-path scanner skips the full JSON round-trip; per-request alloc drops from ~80 KB to ~30 KB on typical Anthropic-passthrough requests. |
 | #5 | **Done** | `bb0d968` — 4 of 6 admission clones eliminated on the happy path (`route_label`, `chain`, `identity`, `open_breakers`); remaining 2 (`BackendTarget::clone` × N survivors, per-skip metric labels) documented as structurally required. |
 | #3 | **Deferred** (2026-06-04) | Local site already optimal given current types. Requires `BackendTarget::model: String → Arc<str>` system change (27 files, 64 construction sites) for ~150 ns / ~90 bytes per request — 1-3 orders of magnitude below other Top picks' wins. Documented inline at the candidate above. Revisit triggers: (i) another use case justifies `BackendTarget` interning, or (ii) a criterion bench shows route resolution is hotter than predicted. |
-| #9 | Not yet attempted | Next pick (M effort, High confidence; per-event multiplier on chatty streams). |
+| #9 | **Done** (2026-06-04) | New `sse::event_serialized` / `sse::data_only_serialized` helpers use a `BytesMutWriter` (`io::Write` over `&mut BytesMut`) so `serde_json::to_writer` lands JSON directly in the SSE frame buffer -- one alloc per event instead of two (String + BytesMut). 6 call sites across the 3 encoders converted; byte-identity preserved (tested). |
 
 ### Cut from Top, kept in the candidate list
 
