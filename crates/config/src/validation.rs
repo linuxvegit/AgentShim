@@ -1230,99 +1230,6 @@ mod tests {
     }
 
     #[test]
-    fn glm_upstream_validation_passes() {
-        let mut cfg = minimal_config();
-        cfg.upstreams.insert(
-            "glm".to_string(),
-            UpstreamConfig::Glm(GlmUpstream {
-                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
-                api_key: Secret::new("zhipu-test"),
-                default_headers: BTreeMap::new(),
-                request_timeout_secs: 30,
-                tier: Tier::Standard,
-                cost: None,
-                p95_latency_budget_ms: None,
-            }),
-        );
-        assert!(validate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn glm_validation_rejects_empty_api_key() {
-        let mut cfg = minimal_config();
-        cfg.upstreams.insert(
-            "glm".to_string(),
-            UpstreamConfig::Glm(GlmUpstream {
-                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
-                api_key: Secret::new(""),
-                default_headers: BTreeMap::new(),
-                request_timeout_secs: 30,
-                tier: Tier::Standard,
-                cost: None,
-                p95_latency_budget_ms: None,
-            }),
-        );
-        match validate(&cfg) {
-            Err(ValidationError::InvalidUpstream(name, msg)) => {
-                assert_eq!(name, "glm");
-                assert!(msg.contains("api_key"), "expected api_key error, got: {msg}");
-            }
-            other => panic!("expected InvalidUpstream, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn glm_validation_rejects_bad_base_url() {
-        let mut cfg = minimal_config();
-        cfg.upstreams.insert(
-            "glm".to_string(),
-            UpstreamConfig::Glm(GlmUpstream {
-                base_url: "ftp://open.bigmodel.cn".to_string(),
-                api_key: Secret::new("zhipu-test"),
-                default_headers: BTreeMap::new(),
-                request_timeout_secs: 30,
-                tier: Tier::Standard,
-                cost: None,
-                p95_latency_budget_ms: None,
-            }),
-        );
-        match validate(&cfg) {
-            Err(ValidationError::InvalidUpstream(name, msg)) => {
-                assert_eq!(name, "glm");
-                assert!(msg.contains("base_url"), "expected base_url error, got: {msg}");
-            }
-            other => panic!("expected InvalidUpstream, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn glm_validation_rejects_zero_timeout() {
-        let mut cfg = minimal_config();
-        cfg.upstreams.insert(
-            "glm".to_string(),
-            UpstreamConfig::Glm(GlmUpstream {
-                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
-                api_key: Secret::new("zhipu-test"),
-                default_headers: BTreeMap::new(),
-                request_timeout_secs: 0,
-                tier: Tier::Standard,
-                cost: None,
-                p95_latency_budget_ms: None,
-            }),
-        );
-        match validate(&cfg) {
-            Err(ValidationError::InvalidUpstream(name, msg)) => {
-                assert_eq!(name, "glm");
-                assert!(
-                    msg.contains("request_timeout_secs"),
-                    "expected request_timeout_secs error, got: {msg}"
-                );
-            }
-            other => panic!("expected InvalidUpstream, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn gemini_upstream_validation_passes() {
         let mut cfg = minimal_config();
         cfg.upstreams.insert(
@@ -1412,6 +1319,105 @@ mod tests {
         match validate(&cfg) {
             Err(ValidationError::InvalidUpstream(name, msg)) => {
                 assert_eq!(name, "gemini");
+                assert!(
+                    msg.contains("request_timeout_secs"),
+                    "expected request_timeout_secs error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glm_upstream_validation_passes() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "glm".to_string(),
+            UpstreamConfig::Glm(GlmUpstream {
+                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+                api_key: Secret::new("zhipu-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn glm_validation_rejects_empty_api_key() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "glm".to_string(),
+            UpstreamConfig::Glm(GlmUpstream {
+                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+                api_key: Secret::new(""),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "glm");
+                assert!(
+                    msg.contains("api_key"),
+                    "expected api_key error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glm_validation_rejects_bad_base_url() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "glm".to_string(),
+            UpstreamConfig::Glm(GlmUpstream {
+                base_url: "ftp://open.bigmodel.cn".to_string(),
+                api_key: Secret::new("zhipu-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 30,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "glm");
+                assert!(
+                    msg.contains("base_url"),
+                    "expected base_url error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn glm_validation_rejects_zero_timeout() {
+        let mut cfg = minimal_config();
+        cfg.upstreams.insert(
+            "glm".to_string(),
+            UpstreamConfig::Glm(GlmUpstream {
+                base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+                api_key: Secret::new("zhipu-test"),
+                default_headers: BTreeMap::new(),
+                request_timeout_secs: 0,
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        match validate(&cfg) {
+            Err(ValidationError::InvalidUpstream(name, msg)) => {
+                assert_eq!(name, "glm");
                 assert!(
                     msg.contains("request_timeout_secs"),
                     "expected request_timeout_secs error, got: {msg}"
