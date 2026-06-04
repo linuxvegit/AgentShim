@@ -522,4 +522,47 @@ mod tests {
             .expect("big variant present");
         assert!(big.long_context_variant.is_none());
     }
+
+    #[test]
+    fn prefix_route_then_fuzzy_upgrades_per_chain_element() {
+        // Prefix route with upstream_model passthrough: inbound model is
+        // rewritten into chain[0].model in StaticRouter, then ModelResolver
+        // upgrades it to the discovered canonical form in apply_fuzzy_upgrades.
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let resolver = resolver_with(cfg, "copilot", &["claude-sonnet-4-5-20250514"]);
+        let chain = resolver
+            .resolve(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        // Pass-through gave "claude-sonnet-4-5"; fuzzy upgrade promoted to
+        // the discovered canonical "claude-sonnet-4-5-20250514".
+        assert_eq!(chain[0].model, "claude-sonnet-4-5-20250514");
+    }
+
+    #[test]
+    fn list_catalog_excludes_prefix_routes() {
+        // A config with one prefix route and one exact route should yield a
+        // catalog that contains ONLY the exact route's record. The prefix
+        // route is structurally absent because StaticRouter::list_routes
+        // iterates exact_entries.keys(); prefix routes live in self.prefixes.
+        let mut cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-sonnet-4-5",
+            "copilot",
+            "claude-sonnet-4-5",
+        );
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "*",
+        ));
+        let resolver = resolver_with(cfg, "copilot", &["claude-sonnet-4-5"]);
+        let catalog = resolver.list_catalog();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "claude-sonnet-4-5");
+        // And the prefix-pattern id must NOT appear.
+        assert!(catalog.iter().all(|r| r.id != "claude-*"));
+    }
 }
