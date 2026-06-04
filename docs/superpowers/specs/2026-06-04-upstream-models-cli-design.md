@@ -136,44 +136,36 @@ The six existing unit tests in `copilot_models.rs`
 
 ## 6. Provider work — fill in `list_models()`
 
-Four providers currently use the default trait impl that returns
-`Ok(None)`. We add real implementations so the new CLI works for every
-upstream type without case-by-case errors.
+Two providers currently use the default trait impl that returns
+`Ok(None)`: `anthropic` and `gemini`. (Verified: `glm`, `deepseek`,
+`openai_compatible`, and `github_copilot` already have working
+`list_models()` implementations — the Copilot config path already
+reuses `CopilotTokenManager` + `models::list_models` per the existing
+device-flow code, so `agent-shim models <copilot-upstream-name>`
+already works today.) We add real implementations to anthropic and
+gemini so the new CLI works for every upstream type without case-by-case
+errors.
 
-All four follow the same pattern that GLM and DeepSeek already use:
-`GET {base_url}/<models-path>`, deserialise the response, extract IDs
-into a `BTreeMap<String, ModelMetadata::default()>`, return `Ok(None)`
-on any non-2xx so the CLI surfaces a clean "does not support discovery"
-message rather than leaking a raw HTTP error.
+Both follow the same pattern that GLM, DeepSeek, and openai_compatible
+already use: `GET {base_url}/<models-path>`, deserialise the response,
+extract IDs into a `BTreeMap<String, ModelMetadata::default()>`, return
+`Ok(None)` on any non-2xx so the CLI surfaces a clean "does not support
+discovery" message rather than leaking a raw HTTP error.
 
 | Provider             | Path                              | Auth                          | Response shape         |
 |----------------------|-----------------------------------|-------------------------------|------------------------|
 | `anthropic`          | `GET {base_url}/v1/models`        | `x-api-key: {api_key}` + `anthropic-version` header | `{ data: [{ id, ... }] }` |
-| `gemini`             | `GET {base_url}/v1beta/models?key={api_key}` | query string | `{ models: [{ name: "models/gemini-…", ... }] }` — strip `models/` prefix |
-| `openai_compatible`  | `GET {base_url}/models`           | `Authorization: Bearer {api_key}` | `{ data: [{ id, ... }] }` |
-| `github_copilot` (cfg path) | reuses `github_copilot::models::list_models()` | reuses the existing device-flow credential via `CopilotTokenManager` (the cfg has no api_key — Copilot upstreams authenticate from the on-disk credential, same as today) | full capability map (Copilot already returns rich metadata) |
+| `gemini`             | `GET {base_url}/v1beta/models?key={api_key}` | query string via `AiStudioAuth::apply` | `{ models: [{ name: "models/gemini-…", ... }] }` — strip `models/` prefix |
 
-The Copilot config-path implementation reuses
-`CopilotTokenManager::get()` to obtain a fresh token, then calls
-`github_copilot::models::list_models(&http, &token)` — the same
-function the device-flow `copilot models` command uses today. The cfg
-side does not introduce a second auth mechanism; the credential still
-lives on disk and `agent-shim copilot login` is still how it gets
-written. The new code path is purely a `BackendProvider` adapter that
-gives `agent-shim models <copilot-upstream-name>` something to call.
-
-The Copilot path keeps the rich `ModelMetadata` (family, context
-window, reasoning effort values, thinking budget) because that's what
-`models::parse_models_response` already returns. The other three
-providers populate only `id` for now; richer metadata extraction is
-intentionally deferred (`ModelMetadata::default()` is a valid
-renderable shape — the `format_*` helpers already render `"—"` / `"?"`
-for absent fields).
+Both new implementations populate only `id` for now; richer metadata
+extraction is intentionally deferred (`ModelMetadata::default()` is a
+valid renderable shape — the `format_*` helpers already render `"—"` /
+`"?"` for absent fields).
 
 Each new `list_models()` ships with mockito coverage:
 - 200 success → returns the expected map
 - 404 → returns `Ok(None)`
-- 401 / 5xx → returns `Ok(None)` (consistent with GLM/DeepSeek precedent)
+- 401 → returns `Ok(None)` (consistent with GLM/DeepSeek precedent)
 
 ## 7. Wiring
 
@@ -218,12 +210,13 @@ upstream key.
 
 ## 9. Test plan
 
-- `render_models.rs` — the six migrated unit tests, plus one new test
+- `render_models.rs` — the seven migrated unit tests, plus one new test
   that renders a generic (non-Copilot) header line and asserts the
   table body row matches the existing Copilot output.
-- `anthropic::list_models` / `gemini::list_models` /
-  `openai_compatible::list_models` / `github_copilot::list_models`
-  (cfg path) — mockito success / 404 / 401 cases per provider.
+- `anthropic::list_models` / `gemini::list_models` — mockito
+  success / 404 / 401 cases per provider (the existing
+  openai_compatible / glm / deepseek / github_copilot tests already
+  cover the others).
 - CLI integration test (`assert_cmd` + mockito server in a
   `tokio::spawn`):
   - `agent-shim models nonexistent` → exit 1, error contains
