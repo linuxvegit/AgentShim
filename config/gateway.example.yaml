@@ -67,6 +67,25 @@ upstreams:
   #   # base_url: https://generativelanguage.googleapis.com/v1beta
   #   # request_timeout_secs: 30
   #   # default_headers: {}
+  # Zhipu GLM (open.bigmodel.cn). OpenAI-Chat compatible with two quirks
+  # handled by the gateway: `reasoning_effort` -> `thinking:{type:...}`,
+  # SSE `reasoning_content` deltas surface as canonical Reasoning blocks.
+  glm:
+    type: glm
+    api_key: "zhipu-your-glm-api-key-here"
+    tier: standard
+    # Optional overrides (defaults shown):
+    # base_url: https://open.bigmodel.cn/api/paas/v4
+    # request_timeout_secs: 30
+    # default_headers: {}
+  # Alternative: Z.AI exposes GLM through an Anthropic-Messages compatible
+  # endpoint. No new upstream type needed — point the existing `anthropic`
+  # provider at the Z.AI base URL.
+  # zai:
+  #   type: anthropic
+  #   base_url: https://api.z.ai/api/anthropic
+  #   api_key: "your-zai-api-key-here"
+  #   tier: standard
 routes:
   - frontend: openai_chat
     model: deepseek-chat
@@ -151,3 +170,12 @@ routes:
   #   upstream: gemini
   #   upstream_model: gemini-2.5-flash-thinking
   #   reasoning_effort: medium
+
+  # GLM via OpenAI Chat frontend. The `glm` provider injects
+  # `thinking:{type:enabled}` based on the canonical reasoning_effort
+  # (Minimal -> disabled, all other levels -> enabled) and strips the
+  # OpenAI-style `reasoning_effort` field that Zhipu would reject.
+  - frontend: openai_chat
+    model: glm-5.1
+    upstream: glm
+    upstream_model: glm-5.1
