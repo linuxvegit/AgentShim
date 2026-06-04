@@ -20,6 +20,7 @@ pub fn upstream_tier(u: &UpstreamConfig) -> Tier {
         UpstreamConfig::Anthropic(c) => c.tier,
         UpstreamConfig::Deepseek(c) => c.tier,
         UpstreamConfig::Gemini(c) => c.tier,
+        UpstreamConfig::Glm(c) => c.tier,
     }
 }
 
@@ -33,6 +34,7 @@ pub fn upstream_cost(u: &UpstreamConfig) -> Option<&UpstreamCost> {
         UpstreamConfig::Anthropic(c) => c.cost.as_ref(),
         UpstreamConfig::Deepseek(c) => c.cost.as_ref(),
         UpstreamConfig::Gemini(c) => c.cost.as_ref(),
+        UpstreamConfig::Glm(c) => c.cost.as_ref(),
     }
 }
 
@@ -45,5 +47,6 @@ pub fn upstream_latency_budget(u: &UpstreamConfig) -> Option<u64> {
         UpstreamConfig::Anthropic(c) => c.p95_latency_budget_ms,
         UpstreamConfig::Deepseek(c) => c.p95_latency_budget_ms,
         UpstreamConfig::Gemini(c) => c.p95_latency_budget_ms,
+        UpstreamConfig::Glm(c) => c.p95_latency_budget_ms,
     }
 }
