@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::{collections::HashMap, sync::Arc};
 
 use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
@@ -182,11 +183,11 @@ impl StaticRouter {
         }
 
         // Sort each frontend's prefix bucket by literal-prefix length
-        // descending. Rust's sort is stable, so when two distinct prefixes
-        // happen to be the same length the YAML appearance order is
-        // preserved (first-in-YAML wins).
+        // descending. `sort_by_key` is stable (MUST stay stable — tie-break
+        // preserves YAML appearance order when two distinct prefixes have
+        // the same length; do NOT switch to `sort_unstable_by_key`).
         for routes in prefixes.values_mut() {
-            routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+            routes.sort_by_key(|r| Reverse(r.prefix.len()));
         }
 
         Self {
