@@ -64,6 +64,10 @@
 //!   `MessageStop`, then `ResponseStop` carrying any usage metadata that
 //!   accompanied the final chunk.
 
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use agent_shim_core::{
     content::{ImageBlock, ReasoningBlock, TextBlock},
     BinarySource, CanonicalResponse, CanonicalStream, ContentBlock, ContentBlockKind, ExtensionMap,
@@ -71,7 +75,7 @@ use agent_shim_core::{
     StreamEvent, ToolCallArguments, ToolCallBlock, ToolCallId, Usage,
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::Stream;
 
 use super::stream::ResponseStream;
 use super::wire::{Candidate, FunctionCall, GenerateContentResponse, Part, UsageMetadata};
@@ -151,33 +155,62 @@ pub(crate) fn parse_unary(
 /// `model` is captured at call time and embedded in the `ResponseStart`
 /// event so downstream encoders can echo it back to the agent.
 pub(crate) fn parse_streaming(stream: ResponseStream, model: String) -> CanonicalStream {
-    // Same `Arc<Mutex<...>>` pattern as the byte-level Scanner: the state
-    // is mutated by per-item processing AND by the post-EOF drain step.
-    // Mutex is uncontended (the chain composes serially).
-    let state = std::sync::Arc::new(std::sync::Mutex::new(StreamState::new(model)));
-    let state_for_items = std::sync::Arc::clone(&state);
-    let event_stream = stream.flat_map(move |item| {
-        let events = {
-            let mut s = state_for_items.lock().expect("state mutex poisoned");
-            match item {
-                Ok(resp) => s.handle(resp),
-                Err(e) => vec![Err(e)],
-            }
-        };
-        futures::stream::iter(events)
-    });
-
-    // After the upstream ends, drain any open block / unsent ResponseStop
-    // so encoders see a well-formed close. Streams that never emitted a
-    // ResponseStart (e.g. immediate upstream error) skip the drain — there's
-    // nothing to close.
-    let drain = futures::stream::once(async move {
-        let mut s = state.lock().expect("state mutex poisoned");
-        s.finalize()
+    Box::pin(GeminiStreamParser {
+        source: stream,
+        state: StreamState::new(model),
+        pending: VecDeque::new(),
+        finalized: false,
     })
-    .flat_map(futures::stream::iter);
+}
 
-    Box::pin(event_stream.chain(drain))
+/// Hand-rolled `Stream` for the Gemini -> canonical translation.
+///
+/// Replaces the prior `Arc<Mutex<StreamState>>` + `flat_map` +
+/// `chain(once(drain))` shape with a single owning struct (same template
+/// as `oai_chat_wire::chat_sse_parser::ChatSseParser` and
+/// `deepseek::response::DeepSeekStreamParser`).
+struct GeminiStreamParser {
+    source: ResponseStream,
+    state: StreamState,
+    pending: VecDeque<Result<StreamEvent, StreamError>>,
+    /// `true` once `state.finalize()` has been called on source EOF, so the
+    /// drain runs exactly once before `Poll::Ready(None)` becomes terminal.
+    finalized: bool,
+}
+
+impl Stream for GeminiStreamParser {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(ev));
+            }
+            match this.source.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(resp))) => {
+                    this.pending.extend(this.state.handle(resp));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.pending.push_back(Err(e));
+                }
+                Poll::Ready(None) => {
+                    if !this.finalized {
+                        this.finalized = true;
+                        // After the upstream ends, drain any open block /
+                        // unsent ResponseStop so encoders see a well-formed
+                        // close. Streams that never emitted a ResponseStart
+                        // (e.g. immediate upstream error) skip the drain --
+                        // there's nothing to close.
+                        this.pending.extend(this.state.finalize());
+                    } else {
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 /// Per-stream state: tracks open blocks and bookkeeping needed to emit
@@ -698,6 +731,7 @@ mod tests {
         Content, FileData, FunctionCall, GenerateContentResponse, InlineData, Part, SafetyRating,
         UsageMetadata,
     };
+    use futures::StreamExt;
     use serde_json::json;
 
     fn part_text(text: &str) -> Part {

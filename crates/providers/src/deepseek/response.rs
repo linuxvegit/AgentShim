@@ -25,12 +25,14 @@
 //! `oai_chat_wire::chat_unary_parser::parse` that swaps in [`map_usage`] for
 //! the final `ResponseStop` event's usage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use eventsource_stream::Eventsource;
 use futures::stream;
-use futures::StreamExt;
+use futures::stream::BoxStream;
 use futures_core::Stream;
 
 use agent_shim_core::{
@@ -45,58 +47,90 @@ pub(crate) fn parse_stream<S>(byte_stream: S) -> CanonicalStream
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
-    let sse_stream = byte_stream.eventsource();
-    let state = std::sync::Arc::new(std::sync::Mutex::new(StreamState::default()));
-    let state_for_items = std::sync::Arc::clone(&state);
+    let sse = byte_stream.eventsource();
+    Box::pin(DeepSeekStreamParser {
+        source: Box::pin(sse),
+        state: StreamState::default(),
+        pending: VecDeque::new(),
+        finalized: false,
+    })
+}
 
-    let event_stream = sse_stream.flat_map(move |result| {
-        let events: Vec<Result<StreamEvent, StreamError>> = {
-            let mut state = state_for_items.lock().expect("state mutex poisoned");
-            match result {
-                Err(e) => {
-                    if state.completed {
-                        tracing::debug!(
-                            error = %e,
-                            "ignoring deepseek transport error after upstream end-of-stream"
-                        );
-                        Vec::new()
-                    } else {
-                        tracing::warn!(error = %e, "deepseek SSE stream error");
-                        vec![Err(StreamError::Upstream(e.to_string()))]
-                    }
-                }
-                Ok(event) => {
+/// Hand-rolled `Stream` for the DeepSeek SSE -> canonical translation.
+/// Owns its `StreamState` by value, replacing the prior
+/// `Arc<Mutex<StreamState>>` + `flat_map` + `chain(once(drain))` shape.
+///
+/// Same template as `oai_chat_wire::chat_sse_parser::ChatSseParser`.
+struct DeepSeekStreamParser {
+    source: BoxStream<
+        'static,
+        Result<eventsource_stream::Event, eventsource_stream::EventStreamError<reqwest::Error>>,
+    >,
+    state: StreamState,
+    pending: VecDeque<Result<StreamEvent, StreamError>>,
+    /// `true` once `state.finalize()` has been called on source EOF, so the
+    /// drain runs exactly once before `Poll::Ready(None)` becomes terminal.
+    finalized: bool,
+}
+
+impl Stream for DeepSeekStreamParser {
+    type Item = Result<StreamEvent, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.pending.pop_front() {
+                return Poll::Ready(Some(ev));
+            }
+            match this.source.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(event))) => {
                     tracing::debug!(
                         event_type = %event.event,
                         data_len = event.data.len(),
                         "deepseek SSE event received"
                     );
                     if event.data == "[DONE]" {
-                        state.handle_done().into_iter().map(Ok).collect()
+                        this.pending
+                            .extend(this.state.handle_done().into_iter().map(Ok));
                     } else {
-                        match parse_chunk(&event.data, &mut state) {
-                            Ok(evts) => evts.into_iter().map(Ok).collect(),
-                            Err(e) => vec![Err(StreamError::Decode(e))],
+                        match parse_chunk(&event.data, &mut this.state) {
+                            Ok(evts) => this.pending.extend(evts.into_iter().map(Ok)),
+                            Err(e) => this.pending.push_back(Err(StreamError::Decode(e))),
                         }
                     }
                 }
+                Poll::Ready(Some(Err(e))) => {
+                    if this.state.completed {
+                        tracing::debug!(
+                            error = %e,
+                            "ignoring deepseek transport error after upstream end-of-stream"
+                        );
+                        // No output -- loop back to poll source again (likely EOF next).
+                    } else {
+                        tracing::warn!(error = %e, "deepseek SSE stream error");
+                        this.pending
+                            .push_back(Err(StreamError::Upstream(e.to_string())));
+                    }
+                }
+                Poll::Ready(None) => {
+                    if !this.finalized {
+                        this.finalized = true;
+                        // After the upstream ends -- clean `[DONE]`, abrupt
+                        // disconnect, or transport error -- `finalize`
+                        // ensures the canonical lifecycle envelope is
+                        // closed. Idempotent: returns Vec::new() if
+                        // `[DONE]` / `finish_reason` already drove
+                        // completion.
+                        this.pending
+                            .extend(this.state.finalize().into_iter().map(Ok));
+                    } else {
+                        return Poll::Ready(None);
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
             }
-        };
-        futures::stream::iter(events)
-    });
-
-    // After the upstream ends — clean `[DONE]`, abrupt disconnect, or
-    // transport error — `finalize` ensures the canonical lifecycle envelope
-    // is closed. Idempotent: if `[DONE]` / `finish_reason` already drove
-    // completion, returns nothing. Mirrors the chat_sse_parser PR-B2 and
-    // gemini::response::parse_streaming pattern.
-    let drain = futures::stream::once(async move {
-        let mut state = state.lock().expect("state mutex poisoned");
-        state.finalize().into_iter().map(Ok).collect::<Vec<_>>()
-    })
-    .flat_map(futures::stream::iter);
-
-    Box::pin(event_stream.chain(drain))
+        }
+    }
 }
 
 /// Parse a non-streaming JSON response from DeepSeek into a `CanonicalStream`.
