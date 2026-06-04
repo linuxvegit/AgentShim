@@ -333,6 +333,7 @@ pub enum UpstreamConfig {
     Anthropic(AnthropicUpstream),
     Deepseek(DeepseekUpstream),
     Gemini(GeminiUpstream),
+    Glm(GlmUpstream),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +457,26 @@ pub struct GeminiUpstream {
     pub p95_latency_budget_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmUpstream {
+    #[serde(default = "default_glm_base_url")]
+    pub base_url: String,
+    pub api_key: Secret,
+    #[serde(default)]
+    pub default_headers: BTreeMap<String, String>,
+    #[serde(default = "default_timeout")]
+    pub request_timeout_secs: u64,
+    /// Tier label. Plan 06 P03 — required.
+    pub tier: Tier,
+    /// Per-token cost in USD. Plan 06 P03 — optional.
+    #[serde(default)]
+    pub cost: Option<UpstreamCost>,
+    /// p95 latency budget in milliseconds. Plan 06 P03 — optional.
+    #[serde(default)]
+    pub p95_latency_budget_ms: Option<u64>,
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -474,6 +495,10 @@ fn default_deepseek_base_url() -> String {
 
 fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com/v1beta".to_string()
+}
+
+fn default_glm_base_url() -> String {
+    "https://open.bigmodel.cn/api/paas/v4".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -908,6 +933,51 @@ default_headers:
     #[test]
     fn deepseek_upstream_unknown_field_rejected() {
         let yaml = "type: deepseek\napi_key: sk-deepseek-test\ntier: standard\nbogus: 1\n";
+        let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
+    }
+
+    #[test]
+    fn glm_upstream_yaml_round_trip_with_defaults() {
+        // Minimal GLM upstream config; only api_key required.
+        let yaml = "type: glm\napi_key: zhipu-test\ntier: standard\n";
+        let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
+        let UpstreamConfig::Glm(g) = cfg else {
+            panic!("expected Glm variant");
+        };
+        assert_eq!(g.api_key.expose(), "zhipu-test");
+        assert_eq!(g.base_url, "https://open.bigmodel.cn/api/paas/v4");
+        assert_eq!(g.request_timeout_secs, 30);
+        assert!(g.default_headers.is_empty());
+    }
+
+    #[test]
+    fn glm_upstream_yaml_with_overrides() {
+        let yaml = "
+type: glm
+api_key: zhipu-test
+base_url: https://custom.glm.example.com/v1
+request_timeout_secs: 60
+tier: standard
+default_headers:
+  x-custom: value
+";
+        let cfg: UpstreamConfig = serde_yaml::from_str(yaml).unwrap();
+        let UpstreamConfig::Glm(g) = cfg else {
+            panic!("expected Glm variant");
+        };
+        assert_eq!(g.api_key.expose(), "zhipu-test");
+        assert_eq!(g.base_url, "https://custom.glm.example.com/v1");
+        assert_eq!(g.request_timeout_secs, 60);
+        assert_eq!(
+            g.default_headers.get("x-custom"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[test]
+    fn glm_upstream_unknown_field_rejected() {
+        let yaml = "type: glm\napi_key: zhipu-test\ntier: standard\nbogus: 1\n";
         let result: Result<UpstreamConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "deny_unknown_fields should reject 'bogus'");
     }
