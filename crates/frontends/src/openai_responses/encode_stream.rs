@@ -64,8 +64,10 @@ impl EncoderState {
 }
 
 fn emit(event_name: &str, data: &impl serde::Serialize) -> Option<Bytes> {
-    let json = serde_json::to_string(data).ok()?;
-    Some(sse::event(event_name, &json))
+    // Single-allocation path: serialise directly into the SSE frame buffer.
+    // Replaces `serde_json::to_string(data)` + `sse::event(event_name, &json)`
+    // which allocated twice per event.
+    sse::event_serialized(event_name, data)
 }
 
 /// Hand-rolled `Stream` for the canonical -> OpenAI Responses SSE

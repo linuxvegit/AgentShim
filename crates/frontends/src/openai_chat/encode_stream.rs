@@ -48,8 +48,9 @@ fn make_chunk(state: &EncoderState, delta: DeltaOut, finish_reason: Option<Strin
         }],
         usage: None,
     };
-    let json = serde_json::to_string(&chunk).unwrap_or_default();
-    sse::data_only(&json)
+    // Single-allocation path: serialise directly into the SSE frame buffer.
+    // Replaces `serde_json::to_string(&chunk)` + `sse::data_only(&json)`.
+    sse::data_only_serialized(&chunk)
 }
 
 fn make_usage_chunk(state: &EncoderState, usage: &agent_shim_core::usage::Usage) -> Bytes {
@@ -65,8 +66,7 @@ fn make_usage_chunk(state: &EncoderState, usage: &agent_shim_core::usage::Usage)
             total_tokens: usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0),
         }),
     };
-    let json = serde_json::to_string(&chunk).unwrap_or_default();
-    sse::data_only(&json)
+    sse::data_only_serialized(&chunk)
 }
 
 /// Hand-rolled `Stream` for the canonical -> OpenAI Chat SSE translation.
@@ -109,8 +109,7 @@ impl OaiChatEncoderStream {
             Err(e) => {
                 // Emit a data chunk with error info then [DONE], then terminate.
                 let err_json = serde_json::json!({ "error": { "message": e.to_string() } });
-                let s = serde_json::to_string(&err_json).unwrap_or_default();
-                self.push_bytes(sse::data_only(&s));
+                self.push_bytes(sse::data_only_serialized(&err_json));
                 self.push_bytes(Bytes::from("data: [DONE]\n\n"));
                 return true;
             }
@@ -221,8 +220,7 @@ impl OaiChatEncoderStream {
 
             StreamEvent::Error { message } => {
                 let err_json = serde_json::json!({ "error": { "message": message } });
-                let s = serde_json::to_string(&err_json).unwrap_or_default();
-                self.push_bytes(sse::data_only(&s));
+                self.push_bytes(sse::data_only_serialized(&err_json));
             }
 
             StreamEvent::RawProviderEvent(_) => {}

@@ -59,8 +59,10 @@ fn serialize_event(ev: &OutboundEvent) -> Option<Bytes> {
         OutboundEvent::Ping => "ping",
         OutboundEvent::Error { .. } => "error",
     };
-    let data = serde_json::to_string(ev).ok()?;
-    Some(sse::event(name, &data))
+    // Single-allocation path: serialise directly into the SSE frame buffer.
+    // Replaces `serde_json::to_string(ev)` + `sse::event(name, &json)` which
+    // allocated twice per event.
+    sse::event_serialized(name, ev)
 }
 
 /// Hand-rolled `Stream` that turns a `CanonicalStream` into Anthropic
