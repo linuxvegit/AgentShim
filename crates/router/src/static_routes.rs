@@ -26,27 +26,52 @@ struct WildcardTarget {
 
 /// A static router built from `GatewayConfig.routes`.
 pub struct StaticRouter {
-    /// Route table keyed by `(frontend, model)`. Each entry holds the FULL
-    /// fallback chain — singular config produces a 1-element vec, array-form
-    /// config produces N elements in configured order. `Router::resolve`
-    /// returns `Vec<BackendTarget>` so `ResilientCaller` (Plan 02 T4) can
-    /// walk the chain head-to-tail.
-    routes: HashMap<RouteKey, Vec<BackendTarget>>,
+    /// Exact route table keyed by `(frontend, model)`. O(1) lookup; the hot
+    /// path for well-tuned configs. Each entry holds the full fallback chain
+    /// (`Vec<BackendTarget>` len 1 for singular config, len N for array).
+    exact: HashMap<RouteKey, Vec<BackendTarget>>,
+    /// Source `RouteEntry` for each exact route so resolution can recover
+    /// per-route resilience policy (retry, breaker).
+    exact_entries: HashMap<RouteKey, RouteEntry>,
+
+    /// Prefix-wildcard route table, partitioned by frontend. Each per-frontend
+    /// `Vec<PrefixRoute>` is sorted at startup by `prefix.len()` descending,
+    /// so a linear scan's first hit IS the longest prefix match. Real-world
+    /// per-frontend prefix counts are < 10; the linear scan is effectively
+    /// O(1) at production scale.
+    prefixes: HashMap<FrontendKind, Vec<PrefixRoute>>,
+
+    /// Catch-all wildcard (`model: "*"`), at most one per frontend.
     wildcards: HashMap<FrontendKind, WildcardTarget>,
-    /// Source `RouteEntry` indexed by `(frontend, model)` so route resolution
-    /// can recover the startup-frozen per-route resilience policy (`retry`,
-    /// `breaker`) alongside the fallback chain.
-    route_entries: HashMap<RouteKey, RouteEntry>,
-    /// Wildcard variant of `route_entries`. Keyed by frontend only because
-    /// wildcards match any model for a frontend.
+    /// `RouteEntry` source for wildcard routes, mirroring `exact_entries`.
     wildcard_entries: HashMap<FrontendKind, RouteEntry>,
+}
+
+/// A prefix-wildcard route (`model: "claude-*"`). Stored separately from both
+/// exact and full-wildcard routes so:
+///   - `list_routes()` ignores them structurally (catalog excludes prefix).
+///   - The hot exact-lookup path is not touched.
+///   - Longest-prefix-wins is a simple sorted-Vec scan.
+struct PrefixRoute {
+    /// `model` field with the trailing `*` stripped. Non-empty by validation.
+    prefix: String,
+    /// Same `Vec<BackendTarget>` shape exact routes produce.
+    chain: Vec<BackendTarget>,
+    /// True when the source `upstream_model` was `"*"` (singular form only);
+    /// at lookup time the router overwrites `chain[0].model` with the
+    /// inbound model string.
+    upstream_model_passthrough: bool,
+    /// Source `RouteEntry` so per-route retry/breaker propagate the same way
+    /// they do for exact routes.
+    entry: RouteEntry,
 }
 
 impl StaticRouter {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
-        let mut routes = HashMap::new();
+        let mut exact = HashMap::new();
+        let mut exact_entries = HashMap::new();
+        let mut prefixes: HashMap<FrontendKind, Vec<PrefixRoute>> = HashMap::new();
         let mut wildcards = HashMap::new();
-        let mut route_entries = HashMap::new();
         let mut wildcard_entries = HashMap::new();
         for entry in &cfg.routes {
             let frontend = match entry.frontend.as_str() {
@@ -68,12 +93,6 @@ impl StaticRouter {
                     "ignoring unknown reasoning_effort in route config (expected minimal/low/medium/high/xhigh)"
                 );
             }
-            // Translate config-shape `MappingRuleConfig { match: String, set: String }`
-            // into core-shape `MappingRule { match: ReasoningEffort, set: ReasoningEffort }`.
-            // Unknown effort strings are silently dropped here as a belt-and-braces
-            // — `validate_routes` rejects them at config-load (Task 14), so any
-            // bad row reaching this point came from a hand-built `GatewayConfig`
-            // fixture that bypassed validation.
             let reasoning_mapping: Vec<MappingRule> = entry
                 .reasoning_mapping
                 .iter()
@@ -89,11 +108,6 @@ impl StaticRouter {
                 reasoning_mapping,
             };
 
-            // Build the full fallback chain from either the singular (v0.3)
-            // or array (v0.4) form. `validate_routes` enforces exactly one
-            // shape per route, so an empty `upstreams` vec is the unambiguous
-            // marker for the singular shape. Plan 02 T1: singular produces a
-            // 1-element chain; array produces N elements in configured order.
             let targets: Vec<BackendTarget> = if !entry.upstreams.is_empty() {
                 entry
                     .upstreams
@@ -105,12 +119,6 @@ impl StaticRouter {
                     })
                     .collect()
             } else {
-                // Singular form: `validate_routes` enforces these are
-                // populated when `upstreams` is empty. `.expect()` (not
-                // `unwrap_or_default()`) so a config that bypassed
-                // validation panics with a pointer to the invariant
-                // instead of silently routing to `provider = ""` and
-                // failing later with a confusing `UnknownProvider("")`.
                 let provider = entry
                     .upstream
                     .clone()
@@ -126,10 +134,11 @@ impl StaticRouter {
                 }]
             };
 
+            // Partition by `model` field shape into exactly one of three
+            // buckets. `validate_routes` rule 8 guarantees `*` is either
+            // absent, the sole character, or the final character; this
+            // matches that grammar.
             if entry.model == "*" {
-                // Wildcards stay single-target — exactly one wildcard per
-                // frontend, and chain walking under wildcards isn't part of
-                // Plan 02. Pick the chain head as the wildcard primary.
                 let head = &targets[0];
                 wildcards.insert(
                     frontend,
@@ -140,19 +149,51 @@ impl StaticRouter {
                     },
                 );
                 wildcard_entries.insert(frontend, entry.clone());
-                continue;
+            } else if let Some(prefix) = entry.model.strip_suffix('*') {
+                // Prefix wildcard. validate_routes ensures `prefix` is
+                // non-empty and contains no other `*`.
+                //
+                // Pass-through is only meaningful in the singular form; the
+                // array form specifies per-element model strings explicitly.
+                let upstream_model_passthrough = entry.upstreams.is_empty()
+                    && entry.upstream_model.as_deref() == Some("*");
+                let route = PrefixRoute {
+                    prefix: prefix.to_string(),
+                    chain: targets,
+                    upstream_model_passthrough,
+                    entry: entry.clone(),
+                };
+                let bucket = prefixes.entry(frontend).or_default();
+                // Spec §2.4: identical (frontend, model) entries silently
+                // overwrite — later wins, mirroring HashMap-replacement
+                // semantics for exact routes. For the Vec-based prefix
+                // bucket, achieve this by removing any earlier entry with
+                // the same literal prefix before pushing.
+                bucket.retain(|existing| existing.prefix != route.prefix);
+                bucket.push(route);
+            } else {
+                let key = RouteKey {
+                    frontend,
+                    model: entry.model.clone(),
+                };
+                exact.insert(key.clone(), targets);
+                exact_entries.insert(key, entry.clone());
             }
-            let key = RouteKey {
-                frontend,
-                model: entry.model.clone(),
-            };
-            routes.insert(key.clone(), targets);
-            route_entries.insert(key, entry.clone());
         }
+
+        // Sort each frontend's prefix bucket by literal-prefix length
+        // descending. Rust's sort is stable, so when two distinct prefixes
+        // happen to be the same length the YAML appearance order is
+        // preserved (first-in-YAML wins).
+        for routes in prefixes.values_mut() {
+            routes.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        }
+
         Self {
-            routes,
+            exact,
+            exact_entries,
+            prefixes,
             wildcards,
-            route_entries,
             wildcard_entries,
         }
     }
@@ -166,14 +207,49 @@ impl StaticRouter {
             frontend,
             model: model.to_string(),
         };
-        if let Some(targets) = self.routes.get(&key) {
+
+        // Tier 1: exact lookup. O(1) hot path; unchanged from pre-prefix.
+        if let Some(targets) = self.exact.get(&key) {
             return Ok(ResolvedRoute {
                 chain: targets.clone(),
-                retry: self.retry_config_for(frontend, &key, model),
-                breaker: self.breaker_config_for(frontend, &key, model),
+                retry: self.retry_config_for_exact(&key, model),
+                breaker: self.breaker_config_for_exact(&key, model),
                 route_label: route_label(frontend, model),
             });
         }
+
+        // Tier 2: prefix lookup. Sorted longest-first at startup, so the
+        // first `starts_with` hit IS the longest-prefix match. Linear scan
+        // over a per-frontend bucket (real-world size < 10).
+        if let Some(bucket) = self.prefixes.get(&frontend) {
+            for pr in bucket {
+                if model.starts_with(&pr.prefix) {
+                    tracing::debug!(
+                        frontend = ?frontend,
+                        inbound_model = %model,
+                        matched_prefix = %pr.prefix,
+                        provider = %pr.chain[0].provider,
+                        "prefix route hit"
+                    );
+                    let mut chain = pr.chain.clone();
+                    if pr.upstream_model_passthrough {
+                        // Singular-form pass-through: rewrite chain head to
+                        // the inbound model. Fuzzy upgrade (in ModelResolver)
+                        // canonicalizes this against the upstream's
+                        // discovered catalog.
+                        chain[0].model = model.to_string();
+                    }
+                    return Ok(ResolvedRoute {
+                        chain,
+                        retry: pr.entry.retry.clone(),
+                        breaker: pr.entry.breaker.clone(),
+                        route_label: route_label(frontend, model),
+                    });
+                }
+            }
+        }
+
+        // Tier 3: catch-all wildcard. Unchanged from pre-prefix.
         if let Some(wc) = self.wildcards.get(&frontend) {
             let upstream_model = if wc.upstream_model == "*" {
                 model.to_string()
@@ -186,50 +262,64 @@ impl StaticRouter {
                     model: upstream_model,
                     policy: wc.policy.clone(),
                 }],
-                retry: self.retry_config_for(frontend, &key, model),
-                breaker: self.breaker_config_for(frontend, &key, model),
+                retry: self.retry_config_for_wildcard(frontend, model),
+                breaker: self.breaker_config_for_wildcard(frontend, model),
                 route_label: route_label(frontend, model),
             });
         }
+
         Err(RouteError::NoRoute {
             frontend,
             model: model.to_string(),
         })
     }
 
-    fn retry_config_for(&self, frontend: FrontendKind, key: &RouteKey, model: &str) -> RetryConfig {
-        match self
-            .route_entries
-            .get(key)
-            .or_else(|| self.wildcard_entries.get(&frontend))
-        {
+    fn retry_config_for_exact(&self, key: &RouteKey, model: &str) -> RetryConfig {
+        match self.exact_entries.get(key) {
             Some(entry) => entry.retry.clone(),
             None => {
                 tracing::debug!(
                     model = %model,
-                    "no route-specific retry policy; using RetryConfig defaults"
+                    "no exact-route retry policy; using RetryConfig defaults"
                 );
                 RetryConfig::default()
             }
         }
     }
 
-    fn breaker_config_for(
-        &self,
-        frontend: FrontendKind,
-        key: &RouteKey,
-        model: &str,
-    ) -> BreakerConfig {
-        match self
-            .route_entries
-            .get(key)
-            .or_else(|| self.wildcard_entries.get(&frontend))
-        {
+    fn breaker_config_for_exact(&self, key: &RouteKey, model: &str) -> BreakerConfig {
+        match self.exact_entries.get(key) {
             Some(entry) => entry.breaker.clone(),
             None => {
                 tracing::debug!(
                     model = %model,
-                    "no route-specific breaker policy; using BreakerConfig defaults"
+                    "no exact-route breaker policy; using BreakerConfig defaults"
+                );
+                BreakerConfig::default()
+            }
+        }
+    }
+
+    fn retry_config_for_wildcard(&self, frontend: FrontendKind, model: &str) -> RetryConfig {
+        match self.wildcard_entries.get(&frontend) {
+            Some(entry) => entry.retry.clone(),
+            None => {
+                tracing::debug!(
+                    model = %model,
+                    "no wildcard-route retry policy; using RetryConfig defaults"
+                );
+                RetryConfig::default()
+            }
+        }
+    }
+
+    fn breaker_config_for_wildcard(&self, frontend: FrontendKind, model: &str) -> BreakerConfig {
+        match self.wildcard_entries.get(&frontend) {
+            Some(entry) => entry.breaker.clone(),
+            None => {
+                tracing::debug!(
+                    model = %model,
+                    "no wildcard-route breaker policy; using BreakerConfig defaults"
                 );
                 BreakerConfig::default()
             }
@@ -259,9 +349,12 @@ impl Router for StaticRouter {
     }
 
     fn list_routes(&self) -> Vec<(FrontendKind, String)> {
-        // Wildcards are intentionally excluded: catalog surfaces enumerate
-        // concrete aliases, not "any model goes" entries.
-        self.route_entries
+        // Both wildcards (`*`) and prefix wildcards (`claude-*`) are
+        // intentionally excluded: catalog surfaces enumerate concrete
+        // aliases only. Prefix routes live in `self.prefixes` and not in
+        // `self.exact_entries`, so this iteration excludes them
+        // structurally — no `if pattern { skip }` needed.
+        self.exact_entries
             .keys()
             .map(|k| (k.frontend, k.model.clone()))
             .collect()
