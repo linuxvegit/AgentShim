@@ -652,4 +652,240 @@ mod tests {
         assert_eq!(policy.reasoning_mapping.len(), 1);
         assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max,);
     }
+
+    #[test]
+    fn prefix_route_passes_inbound_model_through_when_upstream_model_is_star() {
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn prefix_route_overrides_model_when_upstream_model_is_literal() {
+        let cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "claude-3-5-sonnet-20241022",
+        );
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-anything-at-all")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "claude-3-5-sonnet-20241022");
+    }
+
+    #[test]
+    fn exact_route_beats_prefix_route() {
+        let mut cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-sonnet-4-5",
+            "copilot",
+            "claude-sonnet-4-5",
+        );
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "claude-3-5-sonnet-20241022",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        // Exact wins: upstream_model is the literal "claude-sonnet-4-5",
+        // NOT the prefix route's "claude-3-5-sonnet-20241022".
+        assert_eq!(chain[0].model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "short");
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-3-*",
+            "copilot",
+            "mid",
+        ));
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-3-5-*",
+            "copilot",
+            "long",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+
+        let hit_long = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-3-5-sonnet")
+            .unwrap();
+        assert_eq!(hit_long[0].model, "long");
+
+        let hit_mid = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-3-haiku")
+            .unwrap();
+        assert_eq!(hit_mid[0].model, "mid");
+
+        let hit_short = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
+        assert_eq!(hit_short[0].model, "short");
+    }
+
+    #[test]
+    fn prefix_falls_back_to_full_wildcard_on_miss() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "claude-target");
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "*",
+            "copilot",
+            "*",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "gpt-4o")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "gpt-4o"); // wildcard pass-through
+    }
+
+    #[test]
+    fn prefix_route_returns_no_route_on_complete_miss() {
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let router = StaticRouter::from_config(&cfg);
+        let err = router
+            .resolve(FrontendKind::AnthropicMessages, "gpt-4o")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RouteError::NoRoute {
+                frontend: FrontendKind::AnthropicMessages,
+                model,
+            } if model == "gpt-4o"
+        ));
+    }
+
+    #[test]
+    fn prefix_route_carries_route_label_with_inbound_model() {
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let router = StaticRouter::from_config(&cfg);
+        let resolved = router
+            .resolve_route(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
+        // route_label uses the INBOUND model name (not the prefix pattern),
+        // matching wildcard behavior so per-route metrics slice by real model
+        // identity.
+        assert_eq!(
+            resolved.route_label.as_ref(),
+            "anthropic_messages/claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn prefix_route_uses_route_specific_retry_and_breaker() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        cfg.routes[0].retry.max_attempts = 7;
+        cfg.routes[0].breaker.failure_threshold_pct = 99;
+        let router = StaticRouter::from_config(&cfg);
+        let resolved = router
+            .resolve_route(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(resolved.retry.max_attempts, 7);
+        assert_eq!(resolved.breaker.failure_threshold_pct, 99);
+    }
+
+    #[test]
+    fn prefix_route_carries_reasoning_mapping_to_policy() {
+        use agent_shim_config::MappingRuleConfig;
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        cfg.routes[0].reasoning_mapping = vec![MappingRuleConfig {
+            r#match: "max".into(),
+            set: "xhigh".into(),
+        }];
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
+        let policy = &chain[0].policy;
+        assert_eq!(policy.reasoning_mapping.len(), 1);
+        assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max);
+        assert_eq!(policy.reasoning_mapping[0].set, ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn duplicate_prefix_uses_last_definition() {
+        // Spec §2.4: identical (frontend, model) entries silently overwrite.
+        // Task 4 Step 2's from_config implements this for the prefix tier
+        // via a `bucket.retain(|e| e.prefix != route.prefix)` call before
+        // pushing — so the SECOND push wins, matching exact/wildcard
+        // HashMap-replacement behavior.
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "first", "first-model");
+        // Add a second upstream so the second route's `upstream: "second"`
+        // passes validation; cfg_with_route only registered "first".
+        cfg.upstreams.insert(
+            "second".to_string(),
+            agent_shim_config::UpstreamConfig::GithubCopilot(
+                agent_shim_config::GithubCopilotUpstream {
+                    tier: agent_shim_config::Tier::Standard,
+                    cost: None,
+                    p95_latency_budget_ms: None,
+                },
+            ),
+        );
+        cfg.upstreams.insert(
+            "first".to_string(),
+            agent_shim_config::UpstreamConfig::GithubCopilot(
+                agent_shim_config::GithubCopilotUpstream {
+                    tier: agent_shim_config::Tier::Standard,
+                    cost: None,
+                    p95_latency_budget_ms: None,
+                },
+            ),
+        );
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "second",
+            "second-model",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-anything")
+            .unwrap();
+        // Last-wins: the second push overwrites the first.
+        assert_eq!(chain[0].provider, "second");
+        assert_eq!(chain[0].model, "second-model");
+    }
+
+    #[test]
+    fn cross_frontend_prefix_isolation() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        cfg.routes.push(RouteEntry::singular(
+            "openai_chat",
+            "gpt-*",
+            "copilot",
+            "*",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+
+        // anthropic_messages prefix should NOT capture openai_chat traffic.
+        let err = router
+            .resolve(FrontendKind::OpenAiChat, "claude-foo")
+            .unwrap_err();
+        assert!(matches!(err, RouteError::NoRoute { .. }));
+
+        // And vice-versa.
+        let err = router
+            .resolve(FrontendKind::AnthropicMessages, "gpt-foo")
+            .unwrap_err();
+        assert!(matches!(err, RouteError::NoRoute { .. }));
+    }
 }
