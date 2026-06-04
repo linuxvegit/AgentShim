@@ -113,9 +113,7 @@ async fn glm_request_carries_thinking_and_no_reasoning_effort_and_streams_reason
         .mock("POST", "/chat/completions")
         .match_body(mockito::Matcher::AllOf(vec![
             // Positive: thinking type must be enabled (effort = High, not Minimal).
-            mockito::Matcher::PartialJsonString(
-                r#"{"thinking":{"type":"enabled"}}"#.to_string(),
-            ),
+            mockito::Matcher::PartialJsonString(r#"{"thinking":{"type":"enabled"}}"#.to_string()),
             // Positive: model name forwarded correctly to upstream.
             mockito::Matcher::PartialJsonString(r#"{"model":"glm-5.1"}"#.to_string()),
         ]))

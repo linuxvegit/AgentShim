@@ -24,10 +24,7 @@ mod tests {
         fn _assert_unary(_f: fn(&[u8]) -> CanonicalStream) {}
         _assert_unary(parse_unary);
         let _stream_fn: fn(
-            futures::stream::BoxStream<
-                'static,
-                Result<bytes::Bytes, reqwest::Error>,
-            >,
+            futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
         ) -> CanonicalStream = parse_stream;
     }
 }

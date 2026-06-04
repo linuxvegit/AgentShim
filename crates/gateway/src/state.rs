@@ -11,8 +11,9 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_providers::{
-    anthropic, deepseek, gemini, glm,
+    anthropic, deepseek, gemini,
     github_copilot::{self, credential_store},
+    glm,
     openai_compatible::{self},
     BackendProvider, ProviderRegistry,
 };

@@ -180,7 +180,9 @@ mod tests {
         let stripped = strip_cache_control(&mut body);
         assert_eq!(stripped, 2);
         assert!(body["messages"][0].get("cache_control").is_none());
-        assert!(body["messages"][0]["content"][0].get("cache_control").is_none());
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
