@@ -868,12 +868,8 @@ mod tests {
     #[test]
     fn cross_frontend_prefix_isolation() {
         let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
-        cfg.routes.push(RouteEntry::singular(
-            "openai_chat",
-            "gpt-*",
-            "copilot",
-            "*",
-        ));
+        cfg.routes
+            .push(RouteEntry::singular("openai_chat", "gpt-*", "copilot", "*"));
         let router = StaticRouter::from_config(&cfg);
 
         // anthropic_messages prefix should NOT capture openai_chat traffic.
@@ -887,5 +883,90 @@ mod tests {
             .resolve(FrontendKind::AnthropicMessages, "gpt-foo")
             .unwrap_err();
         assert!(matches!(err, RouteError::NoRoute { .. }));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use agent_shim_config::{
+        GatewayConfig, GithubCopilotUpstream, RouteEntry, Tier, UpstreamConfig,
+    };
+    use proptest::prelude::*;
+
+    fn cfg_with_prefixes(prefixes: &[&str]) -> GatewayConfig {
+        let mut cfg = GatewayConfig {
+            server: Default::default(),
+            logging: Default::default(),
+            upstreams: Default::default(),
+            routes: vec![],
+            plugins: ::std::collections::BTreeMap::new(),
+            auth: Default::default(),
+            rate_limit: Default::default(),
+            copilot: None,
+            admin: None,
+            metrics: Default::default(),
+            otel: None,
+            shutdown: Default::default(),
+            validation: Default::default(),
+        };
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            UpstreamConfig::GithubCopilot(GithubCopilotUpstream {
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        for (i, p) in prefixes.iter().enumerate() {
+            cfg.routes.push(RouteEntry::singular(
+                "anthropic_messages",
+                format!("{p}*"),
+                "copilot",
+                format!("mark-{i}"),
+            ));
+        }
+        cfg
+    }
+
+    proptest! {
+        /// For any set of distinct prefixes registered on one frontend, the
+        /// router's choice for a given inbound model is the *longest* prefix
+        /// among those that `starts_with` succeed against the inbound model.
+        /// This guards against an accidental switch to BTreeMap iteration
+        /// order or to unsorted bucket scans.
+        #[test]
+        fn longest_prefix_is_deterministic(
+            prefixes in proptest::collection::btree_set("[a-z]{1,8}", 1..8usize),
+            suffix in "[a-z]{0,8}",
+        ) {
+            let prefixes_vec: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+            let cfg = cfg_with_prefixes(&prefixes_vec);
+            let router = StaticRouter::from_config(&cfg);
+
+            // Build inbound by concatenating the LONGEST prefix with the
+            // random suffix, so at least one prefix is guaranteed to match.
+            let longest = prefixes_vec.iter().max_by_key(|p| p.len()).copied().unwrap();
+            let inbound = format!("{longest}{suffix}");
+
+            let resolved = router
+                .resolve(FrontendKind::AnthropicMessages, &inbound)
+                .expect("at least the longest prefix matches");
+
+            // Compute the expected winner: longest prefix among matchers.
+            // BTreeSet iteration is alphabetic; we sort by length descending,
+            // and break ties by picking the lexicographically earliest (which
+            // matches BTreeSet's natural order for same-length elements).
+            let mut matchers: Vec<&&str> = prefixes_vec
+                .iter()
+                .filter(|p| inbound.starts_with(*p))
+                .collect();
+            matchers.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+            let expected_prefix = *matchers[0];
+            let expected_idx = prefixes_vec.iter().position(|p| *p == expected_prefix).unwrap();
+            let expected_mark = format!("mark-{expected_idx}");
+
+            prop_assert_eq!(&resolved[0].model, &expected_mark);
+        }
     }
 }
