@@ -9,6 +9,9 @@
 //!
 //! Manual invocation:
 //!   cargo nextest run -p agent-shim --features live glm_live
+//!
+//! Runs nightly from `.github/workflows/nightly-live.yaml` once the
+//! `GLM_API_KEY` secret is wired up.
 
 #![cfg(feature = "live")]
 

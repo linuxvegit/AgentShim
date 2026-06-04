@@ -60,6 +60,8 @@ pub(crate) fn build(
 /// objects and from message-content array blocks. Returns the total count.
 /// Mirrors the deepseek defense-in-depth pass.
 fn strip_cache_control(body: &mut serde_json::Value) -> usize {
+    // TODO: extract to oai_chat_wire when a third "OAI + cache_control strip" consumer arrives.
+    // Currently duplicated with crates/providers/src/deepseek/request.rs::strip_cache_control.
     let mut count = 0;
     let Some(obj) = body.as_object_mut() else {
         return count;

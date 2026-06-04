@@ -59,6 +59,8 @@ pub(crate) fn build(
 ///
 /// Both are stripped here. Other top-level fields are left untouched.
 fn strip_cache_control(body: &mut serde_json::Value) -> usize {
+    // TODO: extract to oai_chat_wire when a third "OAI + cache_control strip" consumer arrives.
+    // Currently duplicated with crates/providers/src/glm/request.rs::strip_cache_control.
     let mut count = 0;
     let Some(obj) = body.as_object_mut() else {
         return count;
