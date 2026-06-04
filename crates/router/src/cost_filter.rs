@@ -91,7 +91,7 @@ pub struct FilterOutcome {
 /// concrete impl from the inbound `FrontendKind`; `Admission::admit`
 /// threads it here.
 pub fn filter_chain(
-    chain: Vec<BackendTarget>,
+    chain: &[BackendTarget],
     route: &RouteEntry,
     request: &CanonicalRequest,
     config: &GatewayConfig,
@@ -107,12 +107,12 @@ pub fn filter_chain(
         // — the same key used in `GatewayConfig.upstreams`. No
         // `upstream_name()` accessor exists on `BackendTarget`; we
         // read the field directly.
-        let upstream_name = target.provider.clone();
-        let Some(upstream_cfg) = config.upstreams.get(&upstream_name) else {
+        let upstream_name = target.provider.as_str();
+        let Some(upstream_cfg) = config.upstreams.get(upstream_name) else {
             // Upstream config missing — earlier validation should have
             // caught this. Keep as a survivor; `ResilientCaller` will
             // surface the error consistently with v0.4 semantics.
-            survivors.push(target);
+            survivors.push(target.clone());
             continue;
         };
 
@@ -121,7 +121,7 @@ pub fn filter_chain(
             let upstream_tier = upstream_tier(upstream_cfg);
             if upstream_tier < min_tier {
                 skipped.push(Skip {
-                    upstream: upstream_name,
+                    upstream: upstream_name.to_owned(),
                     reason: FilterReason::Tier,
                 });
                 continue;
@@ -131,10 +131,10 @@ pub fn filter_chain(
         // Axis 2: latency
         let p95_budget = upstream_latency_budget(upstream_cfg);
         if let Some(budget) = p95_budget {
-            match probe.recent_p95_ms(&upstream_name) {
+            match probe.recent_p95_ms(upstream_name) {
                 Some(measured) if measured > budget => {
                     skipped.push(Skip {
-                        upstream: upstream_name,
+                        upstream: upstream_name.to_owned(),
                         reason: FilterReason::Latency,
                     });
                     continue;
@@ -142,7 +142,7 @@ pub fn filter_chain(
                 None => {
                     // Probe has no data — let through, but note it.
                     notes.push(Note {
-                        upstream: upstream_name.clone(),
+                        upstream: upstream_name.to_owned(),
                         reason: FilterReason::LatencyUnknown,
                     });
                 }
@@ -156,7 +156,7 @@ pub fn filter_chain(
             if let Some(est) = estimate_request_cost(request, upstream_cost, image_estimator) {
                 if est.cost_usd > cap {
                     skipped.push(Skip {
-                        upstream: upstream_name,
+                        upstream: upstream_name.to_owned(),
                         reason: FilterReason::Cap,
                     });
                     continue;
@@ -167,7 +167,7 @@ pub fn filter_chain(
             // "Copilot has no per-token cost" case).
         }
 
-        survivors.push(target);
+        survivors.push(target.clone());
     }
 
     FilterOutcome {
@@ -318,7 +318,7 @@ mod tests {
         let req = request_with_text("hi", None);
 
         let outcome = filter_chain(
-            vec![target("economy"), target("premium")],
+            &[target("economy"), target("premium")],
             &route,
             &req,
             &cfg,
@@ -349,7 +349,7 @@ mod tests {
         let probe = MockLatencyProbe::with([("slow", 500u64)]);
 
         let outcome = filter_chain(
-            vec![target("slow"), target("unknown")],
+            &[target("slow"), target("unknown")],
             &route,
             &req,
             &cfg,
@@ -390,7 +390,7 @@ mod tests {
         let req = request_with_text("hello world this is a non-trivial request", Some(100));
 
         let outcome = filter_chain(
-            vec![target("expensive")],
+            &[target("expensive")],
             &route,
             &req,
             &cfg,
@@ -415,7 +415,7 @@ mod tests {
         let req = request_with_text("hi", None);
 
         let outcome = filter_chain(
-            vec![target("a"), target("b")],
+            &[target("a"), target("b")],
             &route,
             &req,
             &cfg,
@@ -451,7 +451,7 @@ mod tests {
         let req = request_with_text("hi", None);
 
         let outcome = filter_chain(
-            vec![target("a"), target("b"), target("c"), target("d")],
+            &[target("a"), target("b"), target("c"), target("d")],
             &route,
             &req,
             &cfg,

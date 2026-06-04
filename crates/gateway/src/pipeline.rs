@@ -689,7 +689,7 @@ async fn dispatch_inner(
             route_entry,
             &snapshot.config,
             &canonical,
-            &identity,
+            identity,
             &client_ip,
             image_estimator,
         )

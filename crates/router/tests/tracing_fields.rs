@@ -225,7 +225,7 @@ fn admitted_ticket(
             route,
             &config,
             &dummy_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &AnthropicImageEstimator,
         )
@@ -418,7 +418,7 @@ async fn rate_limit_rejected_event_has_standard_fields() {
         route,
         &config,
         &dummy_request(),
-        &AgentIdentity::Anonymous,
+        AgentIdentity::Anonymous,
         "127.0.0.1",
         &AnthropicImageEstimator,
     );

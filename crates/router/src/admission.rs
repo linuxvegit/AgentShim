@@ -159,15 +159,21 @@ impl Admission {
         route_entry: &RouteEntry,
         config: &GatewayConfig,
         request: &CanonicalRequest,
-        identity: &AgentIdentity,
+        identity: AgentIdentity,
         client_ip: &str,
         image_estimator: &dyn ImageTokenEstimator,
     ) -> Result<AdmissionTicket, AdmissionError> {
         let limiter = self.limiter.load_full();
-        let route_label = resolved.route_label.to_string();
+        // Keep `route_label` as the shared `Arc<str>` it came in as. Only
+        // materialise an owned `String` inside the metric-emission loops
+        // below -- those run 0 times in the steady-state pass-through case
+        // (no skips, no notes), so the per-request alloc cost is amortised
+        // against the actual metric-label requirement. Earlier code paid
+        // `to_string()` upfront on every admit.
+        let route_label = Arc::clone(&resolved.route_label);
 
         limiter
-            .check_pre_chain(identity, &route_label, client_ip)
+            .check_pre_chain(&identity, &route_label, client_ip)
             .map_err(|(dimension, retry_after_secs)| {
                 emit_rate_limit_rejected(dimension, retry_after_secs, identity.log_id());
                 AdmissionError::RateLimited {
@@ -177,8 +183,12 @@ impl Admission {
             })?;
         let mut rate_limit_reservations = vec![RateLimitReservation {}];
 
+        // Borrow `resolved.chain` for filtering; the helper clones only
+        // targets that survive (skipped ones are dropped). Earlier code
+        // did `resolved.chain.clone()` here which allocated the Vec
+        // header + every BackendTarget regardless of survival.
         let filter_outcome = cost_filter::filter_chain(
-            resolved.chain.clone(),
+            &resolved.chain,
             route_entry,
             request,
             config,
@@ -190,7 +200,7 @@ impl Admission {
                 crate::metric_names::COST_FILTERED_TOTAL,
                 "reason" => skip.reason.as_str(),
                 "upstream" => skip.upstream.clone(),
-                "route" => route_label.clone(),
+                "route" => route_label.as_ref().to_owned(),
             )
             .increment(1);
         }
@@ -199,7 +209,7 @@ impl Admission {
                 crate::metric_names::COST_FILTERED_TOTAL,
                 "reason" => note.reason.as_str(),
                 "upstream" => note.upstream.clone(),
-                "route" => route_label.clone(),
+                "route" => route_label.as_ref().to_owned(),
             )
             .increment(1);
         }
@@ -229,30 +239,33 @@ impl Admission {
 
         let breaker_policy = BreakerPolicy::from(&resolved.breaker);
         let mut breaker_holds = Vec::with_capacity(filtered_chain.len());
-        let mut open_breakers = Vec::new();
+        let mut any_allowed = false;
         for target in &filtered_chain {
             match self
                 .breaker
                 .try_hold(&target.provider, &target.model, &breaker_policy)
             {
-                Some(hold) => breaker_holds.push(Some(hold)),
-                None => {
-                    open_breakers.push(target.provider.clone());
-                    breaker_holds.push(None);
+                Some(hold) => {
+                    any_allowed = true;
+                    breaker_holds.push(Some(hold));
                 }
+                None => breaker_holds.push(None),
             }
         }
 
-        if breaker_holds.iter().all(Option::is_none) {
-            return Err(AdmissionError::AllBreakersOpen {
-                tried: open_breakers,
-            });
+        if !any_allowed {
+            // Materialise the upstream names only now -- the common case
+            // (at least one breaker closed) skips this allocation entirely.
+            // Earlier code did `open_breakers.push(target.provider.clone())`
+            // inside the loop above and discarded the vec on the happy path.
+            let tried: Vec<String> = filtered_chain.iter().map(|t| t.provider.clone()).collect();
+            return Err(AdmissionError::AllBreakersOpen { tried });
         }
 
         Ok(AdmissionTicket {
             filtered_chain,
             resolved: Arc::new(resolved),
-            identity: identity.clone(),
+            identity,
             breaker_holds,
             rate_limit_reservations,
             consumed: AtomicBool::new(false),
@@ -543,7 +556,7 @@ mod tests {
                 &config.routes[0],
                 &config,
                 &text_request(),
-                &AgentIdentity::Anonymous,
+                AgentIdentity::Anonymous,
                 "127.0.0.1",
                 &crate::image_estimators::AnthropicImageEstimator,
             )
@@ -574,7 +587,7 @@ mod tests {
             &config.routes[0],
             &config,
             &text_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
@@ -604,7 +617,7 @@ mod tests {
             &config.routes[0],
             &config,
             &text_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
@@ -629,7 +642,7 @@ mod tests {
             &config.routes[0],
             &config,
             &image_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
@@ -663,7 +676,7 @@ mod tests {
             &config.routes[0],
             &config,
             &text_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
@@ -690,7 +703,7 @@ mod tests {
             &config.routes[0],
             &config,
             &text_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
@@ -727,7 +740,7 @@ mod tests {
             &config.routes[0],
             &config,
             &text_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
@@ -773,7 +786,7 @@ mod tests {
             &config.routes[0],
             &config,
             &text_request(),
-            &AgentIdentity::Anonymous,
+            AgentIdentity::Anonymous,
             "127.0.0.1",
             &crate::image_estimators::AnthropicImageEstimator,
         )
