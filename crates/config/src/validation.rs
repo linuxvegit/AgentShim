@@ -2837,10 +2837,7 @@ routes:
             "copilot",
             "claude-typo-not-in-catalog",
         ));
-        let discovered = vec![(
-            "copilot".to_string(),
-            vec!["claude-sonnet-4-5".to_string()],
-        )];
+        let discovered = vec![("copilot".to_string(), vec!["claude-sonnet-4-5".to_string()])];
         let err = validate_with_index(&cfg, &discovered).unwrap_err();
         assert!(matches!(
             err,

@@ -156,8 +156,8 @@ impl StaticRouter {
                 //
                 // Pass-through is only meaningful in the singular form; the
                 // array form specifies per-element model strings explicitly.
-                let upstream_model_passthrough = entry.upstreams.is_empty()
-                    && entry.upstream_model.as_deref() == Some("*");
+                let upstream_model_passthrough =
+                    entry.upstreams.is_empty() && entry.upstream_model.as_deref() == Some("*");
                 let route = PrefixRoute {
                     prefix: prefix.to_string(),
                     chain: targets,
