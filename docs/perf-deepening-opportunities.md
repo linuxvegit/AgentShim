@@ -91,6 +91,8 @@ The success path is allocation-clean, but the helper closes over a `snapshot: &A
 
 **Confidence** High — the `to_string()` is unconditional and on the hot path; `ModelIndex` already stores the canonical form as a shared resource.
 
+**Investigated 2026-06-04 — deferred.** The local site (`apply_fuzzy_upgrades` L77-91) is already optimal given its types: it only allocates when `canonical != target.model`, which is precisely when the alloc is genuinely needed to mutate the owned `String`. Eliminating the alloc requires changing `BackendTarget::model: String -> Arc<str>` (with `provider` for symmetry), which has a 27-file blast radius (64 construction sites, 25 collateral `.model.clone()` sites that would become Arc bumps). Direct per-request savings: ~150 ns / ~90 bytes for a 3-element fallback chain — 1-3 orders of magnitude smaller than the wins from #1 (~50 KB / passthrough request) and #7/#8/Theme B (~30 lock acquires / stream). Deferred until either (i) a separate `BackendTarget` interning refactor is justified by another use case, or (ii) a criterion micro-bench shows route resolution is significantly hotter than predicted. Local fixes (`String::clear()` + `push_str`, `OnceLock` model-name cache) were considered and rejected — the first doesn't save the alloc when capacity grows, the second adds unbounded global state.
+
 #### 4. Three `match frontend { FrontendKind::AnthropicMessages => "anthropic_messages", … }` formatters per request
 
 **Where**
@@ -300,6 +302,18 @@ candidates.
 | 3 | **#5** | Admission clones (`chain.clone()`, `route_label.to_string()`, per-skip metric labels) | `M` effort, `High` confidence. Hot on every request that hits admission (all canonical, all passthrough). **Representative for Theme A** — fixing this is the wedge that opens up the broader String-keyed-maps story. |
 | 4 | **#3** | `apply_fuzzy_upgrades` per-element `to_string()` | `M` effort, `High` confidence. Standard `String` → `Cow<'static, str>` or `Arc<str>` refactor; the canonical strings already live in `ModelIndex` forever, so this is "stop allocating what you already own". Affects every request that resolves a route, which is all of them. |
 | 5 | **#9** | SSE event `to_string` → `format!` → `Bytes::from` chain | `M` effort, `High` confidence. Per-event multiplier (100-300 allocs per response on chatty streams) makes the absolute cost reasonable to chase. Standard `BytesMut` rewrite pattern; affects all three encoders. |
+
+### Status (updated 2026-06-04)
+
+| # | Status | Commit / decision |
+|---|---|---|
+| #7 | **Done** | `4ed36a8` — replaced Arc<Mutex<ParserState>> with hand-rolled Stream; 5 lock acquires / 4 SSE events → 0. |
+| #8 | **Done** (Theme B follow-up to #7) | `c6441f8` — Anthropic encoder; 5 lock + 4 Arc::clone + 2 atomic ops → 0 per request. |
+| Theme B fanout (4 more sites) | **Done** | `4a8fe5f` (openai_chat + openai_responses encoders) + `0017261` (deepseek + gemini parsers) + `7a4ccfb` (fmt drift cleanup). Cumulative: **34 lock acquires + 20+ Arc::clone + 7 atomic ops** eliminated per stream across 6 sites. |
+| #1 | **Done** | `053c139` — `rewrite_model` fast-path scanner skips the full JSON round-trip; per-request alloc drops from ~80 KB to ~30 KB on typical Anthropic-passthrough requests. |
+| #5 | **Done** | `bb0d968` — 4 of 6 admission clones eliminated on the happy path (`route_label`, `chain`, `identity`, `open_breakers`); remaining 2 (`BackendTarget::clone` × N survivors, per-skip metric labels) documented as structurally required. |
+| #3 | **Deferred** (2026-06-04) | Local site already optimal given current types. Requires `BackendTarget::model: String → Arc<str>` system change (27 files, 64 construction sites) for ~150 ns / ~90 bytes per request — 1-3 orders of magnitude below other Top picks' wins. Documented inline at the candidate above. Revisit triggers: (i) another use case justifies `BackendTarget` interning, or (ii) a criterion bench shows route resolution is hotter than predicted. |
+| #9 | Not yet attempted | Next pick (M effort, High confidence; per-event multiplier on chatty streams). |
 
 ### Cut from Top, kept in the candidate list
 
