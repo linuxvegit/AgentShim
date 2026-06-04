@@ -11,7 +11,7 @@ use agent_shim_frontends::{
     openai_responses::OpenAiResponses,
 };
 use agent_shim_providers::{
-    anthropic, deepseek, gemini,
+    anthropic, deepseek, gemini, glm,
     github_copilot::{self, credential_store},
     openai_compatible::{self},
     BackendProvider, ProviderRegistry,
@@ -277,6 +277,10 @@ impl AppState {
                 UpstreamConfig::Gemini(cfg) => match gemini::from_config(name, cfg) {
                     Ok(p) => registry.register(name.clone(), Arc::new(p)),
                     Err(e) => tracing::error!("failed to build Gemini provider {name}: {e}"),
+                },
+                UpstreamConfig::Glm(cfg) => match glm::from_config(name, cfg) {
+                    Ok(p) => registry.register(name.clone(), Arc::new(p)),
+                    Err(e) => tracing::error!("failed to build GLM provider {name}: {e}"),
                 },
             }
         }
