@@ -61,7 +61,7 @@ pub async fn run(name: &str, config_path: &Path, format: &str) -> Result<()> {
 /// error string stays accurate.
 fn provider_kind_label(cfg: &UpstreamConfig) -> &'static str {
     match cfg {
-        UpstreamConfig::OpenAiCompatible(_) => "openai_compatible",
+        UpstreamConfig::OpenAiCompatible(_) => "open_ai_compatible",
         UpstreamConfig::GithubCopilot(_) => "github_copilot",
         UpstreamConfig::Anthropic(_) => "anthropic",
         UpstreamConfig::Deepseek(_) => "deepseek",
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn provider_kind_label_covers_every_variant() {
-        assert_eq!(provider_kind_label(&openai_compat()), "openai_compatible");
+        assert_eq!(provider_kind_label(&openai_compat()), "open_ai_compatible");
         assert_eq!(
             provider_kind_label(&UpstreamConfig::GithubCopilot(GithubCopilotUpstream {
                 tier: Tier::Standard,
