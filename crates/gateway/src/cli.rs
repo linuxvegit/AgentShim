@@ -41,6 +41,27 @@ pub enum Commands {
         #[arg(long)]
         strict: bool,
     },
+    /// Print the model catalog for a single upstream named in the
+    /// config file. Mirrors `copilot models` but works for every
+    /// upstream type (`<name>` is the key under `cfg.upstreams`, not
+    /// the provider type — so multi-upstream configs with two `glm`
+    /// entries can disambiguate by `glm-prod` vs `glm-staging`).
+    Models {
+        /// Name of the upstream to query (must appear as a key under
+        /// `upstreams` in the config file).
+        name: String,
+        /// Path to the config file
+        #[arg(
+            short,
+            long,
+            env = "AGENT_SHIM_CONFIG",
+            default_value = "config/gateway.yaml"
+        )]
+        config: PathBuf,
+        /// Output format: `table` (default) or `json`.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// GitHub Copilot authentication commands
     Copilot {
         #[command(subcommand)]

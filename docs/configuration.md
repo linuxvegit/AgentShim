@@ -135,20 +135,60 @@ routes:
     reasoning_mapping:             # optional: per-route effort rewrite table
       - match: max                 # canonical inbound effort
         set:   xhigh               # canonical outbound effort
+
+  # Prefix-wildcard example: every claude-* alias maps to Copilot.
+  - frontend: anthropic_messages
+    model: claude-*                # trailing '*' = prefix pattern
+    upstream: copilot
+    upstream_model: "*"            # pass the inbound model through verbatim
+
+  # Full catch-all (at most one per frontend).
+  - frontend: anthropic_messages
+    model: "*"
+    upstream: copilot
+    upstream_model: "*"
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `frontend` | enum | — | `anthropic_messages`, `openai_chat`, or `openai_responses` |
-| `model` | string | — | The alias the agent asks for. `*` is a wildcard catch-all. |
+| `model` | string | — | What the agent asks for. Three forms: **exact** (`claude-sonnet-4-5`), **prefix wildcard** (`claude-*` — a literal followed by a single trailing `*`), or **full catch-all** (`*`). |
 | `upstream` | string | — | A key under `upstreams:` |
-| `upstream_model` | string | — | Model name sent to the upstream. `*` (in a wildcard route) means pass-through. |
+| `upstream_model` | string | — | Model name sent to the upstream. `"*"` (in any wildcard route) means pass the inbound model through verbatim. |
 | `reasoning_effort` | enum | — | Default thinking effort applied when the request omits one. One of `minimal/low/medium/high/xhigh/max`. |
 | `anthropic_beta` | string | — | Default `anthropic-beta` header value applied when the request omits one |
 | `reasoning_mapping` | array | `[]` | Ordered list of `{ match, set }` rules that rewrite the inbound canonical effort before forwarding to the upstream. First match wins; unmatched passes through. Both `match` and `set` must be canonical effort strings (`minimal/low/medium/high/xhigh/max`); unknown values fail validation at config-load. |
 
-The route table is consulted by `agent_shim_router::StaticRouter`. Wildcards
-(`model: "*"`) are matched only when no exact route exists.
+### Match priority
+
+The route table is consulted by `agent_shim_router::StaticRouter` in this order:
+
+1. **Exact match** — `(frontend, model)` equal to the inbound pair.
+2. **Longest-prefix match** — among prefix-wildcard routes on the same frontend whose literal prefix is a `starts_with` match against the inbound model, the route with the **longest literal prefix** wins. Ties between same-length prefixes on the same frontend are broken by YAML appearance order (first wins).
+3. **Full catch-all** — `model: "*"` for the frontend, if present.
+4. **`NoRoute` error** if none of the above match.
+
+`*` is allowed in `model` only as the sole character (the full catch-all) or as the **last** character (a prefix pattern like `claude-*`). Any other position fails config validation at startup.
+
+### Duplicate routes
+
+Identical `(frontend, model)` entries — exact, prefix, or full catch-all — silently overwrite. The later YAML entry wins, mirroring `HashMap`-insertion semantics for exact and catch-all routes; prefix routes get the same behavior via an explicit dedup pass in `StaticRouter::from_config`. Validation does not flag duplicates.
+
+### `strict_upstream_models` under wildcard routes
+
+`validation.strict_upstream_models: true` enforces that every literal
+`upstream_model` referenced by a route appears in the upstream's
+discovered catalog. The check looks **only at `upstream_model`** and is
+independent of the `model` field's shape:
+
+- `upstream_model: "*"` (pass-through) is always skipped — the runtime
+  value is not known until a request arrives.
+- A literal `upstream_model` is always checked, whether `model` is
+  exact, a prefix wildcard, or the catch-all `*`.
+
+So a route like `model: claude-*` + `upstream_model: claude-typo` will
+still fail to start under strict mode if `claude-typo` is not in the
+upstream's catalog — the prefix wildcard does not exempt it.
 
 ## Logging
 

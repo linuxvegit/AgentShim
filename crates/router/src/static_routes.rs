@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::{collections::HashMap, sync::Arc};
 
 use agent_shim_config::{BreakerConfig, GatewayConfig, RetryConfig, RouteEntry};
@@ -26,27 +27,52 @@ struct WildcardTarget {
 
 /// A static router built from `GatewayConfig.routes`.
 pub struct StaticRouter {
-    /// Route table keyed by `(frontend, model)`. Each entry holds the FULL
-    /// fallback chain — singular config produces a 1-element vec, array-form
-    /// config produces N elements in configured order. `Router::resolve`
-    /// returns `Vec<BackendTarget>` so `ResilientCaller` (Plan 02 T4) can
-    /// walk the chain head-to-tail.
-    routes: HashMap<RouteKey, Vec<BackendTarget>>,
+    /// Exact route table keyed by `(frontend, model)`. O(1) lookup; the hot
+    /// path for well-tuned configs. Each entry holds the full fallback chain
+    /// (`Vec<BackendTarget>` len 1 for singular config, len N for array).
+    exact: HashMap<RouteKey, Vec<BackendTarget>>,
+    /// Source `RouteEntry` for each exact route so resolution can recover
+    /// per-route resilience policy (retry, breaker).
+    exact_entries: HashMap<RouteKey, RouteEntry>,
+
+    /// Prefix-wildcard route table, partitioned by frontend. Each per-frontend
+    /// `Vec<PrefixRoute>` is sorted at startup by `prefix.len()` descending,
+    /// so a linear scan's first hit IS the longest prefix match. Real-world
+    /// per-frontend prefix counts are < 10; the linear scan is effectively
+    /// O(1) at production scale.
+    prefixes: HashMap<FrontendKind, Vec<PrefixRoute>>,
+
+    /// Catch-all wildcard (`model: "*"`), at most one per frontend.
     wildcards: HashMap<FrontendKind, WildcardTarget>,
-    /// Source `RouteEntry` indexed by `(frontend, model)` so route resolution
-    /// can recover the startup-frozen per-route resilience policy (`retry`,
-    /// `breaker`) alongside the fallback chain.
-    route_entries: HashMap<RouteKey, RouteEntry>,
-    /// Wildcard variant of `route_entries`. Keyed by frontend only because
-    /// wildcards match any model for a frontend.
+    /// `RouteEntry` source for wildcard routes, mirroring `exact_entries`.
     wildcard_entries: HashMap<FrontendKind, RouteEntry>,
+}
+
+/// A prefix-wildcard route (`model: "claude-*"`). Stored separately from both
+/// exact and full-wildcard routes so:
+///   - `list_routes()` ignores them structurally (catalog excludes prefix).
+///   - The hot exact-lookup path is not touched.
+///   - Longest-prefix-wins is a simple sorted-Vec scan.
+struct PrefixRoute {
+    /// `model` field with the trailing `*` stripped. Non-empty by validation.
+    prefix: String,
+    /// Same `Vec<BackendTarget>` shape exact routes produce.
+    chain: Vec<BackendTarget>,
+    /// True when the source `upstream_model` was `"*"` (singular form only);
+    /// at lookup time the router overwrites `chain[0].model` with the
+    /// inbound model string.
+    upstream_model_passthrough: bool,
+    /// Source `RouteEntry` so per-route retry/breaker propagate the same way
+    /// they do for exact routes.
+    entry: RouteEntry,
 }
 
 impl StaticRouter {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
-        let mut routes = HashMap::new();
+        let mut exact = HashMap::new();
+        let mut exact_entries = HashMap::new();
+        let mut prefixes: HashMap<FrontendKind, Vec<PrefixRoute>> = HashMap::new();
         let mut wildcards = HashMap::new();
-        let mut route_entries = HashMap::new();
         let mut wildcard_entries = HashMap::new();
         for entry in &cfg.routes {
             let frontend = match entry.frontend.as_str() {
@@ -68,12 +94,6 @@ impl StaticRouter {
                     "ignoring unknown reasoning_effort in route config (expected minimal/low/medium/high/xhigh)"
                 );
             }
-            // Translate config-shape `MappingRuleConfig { match: String, set: String }`
-            // into core-shape `MappingRule { match: ReasoningEffort, set: ReasoningEffort }`.
-            // Unknown effort strings are silently dropped here as a belt-and-braces
-            // — `validate_routes` rejects them at config-load (Task 14), so any
-            // bad row reaching this point came from a hand-built `GatewayConfig`
-            // fixture that bypassed validation.
             let reasoning_mapping: Vec<MappingRule> = entry
                 .reasoning_mapping
                 .iter()
@@ -89,11 +109,6 @@ impl StaticRouter {
                 reasoning_mapping,
             };
 
-            // Build the full fallback chain from either the singular (v0.3)
-            // or array (v0.4) form. `validate_routes` enforces exactly one
-            // shape per route, so an empty `upstreams` vec is the unambiguous
-            // marker for the singular shape. Plan 02 T1: singular produces a
-            // 1-element chain; array produces N elements in configured order.
             let targets: Vec<BackendTarget> = if !entry.upstreams.is_empty() {
                 entry
                     .upstreams
@@ -105,12 +120,6 @@ impl StaticRouter {
                     })
                     .collect()
             } else {
-                // Singular form: `validate_routes` enforces these are
-                // populated when `upstreams` is empty. `.expect()` (not
-                // `unwrap_or_default()`) so a config that bypassed
-                // validation panics with a pointer to the invariant
-                // instead of silently routing to `provider = ""` and
-                // failing later with a confusing `UnknownProvider("")`.
                 let provider = entry
                     .upstream
                     .clone()
@@ -126,10 +135,11 @@ impl StaticRouter {
                 }]
             };
 
+            // Partition by `model` field shape into exactly one of three
+            // buckets. `validate_routes` rule 8 guarantees `*` is either
+            // absent, the sole character, or the final character; this
+            // matches that grammar.
             if entry.model == "*" {
-                // Wildcards stay single-target — exactly one wildcard per
-                // frontend, and chain walking under wildcards isn't part of
-                // Plan 02. Pick the chain head as the wildcard primary.
                 let head = &targets[0];
                 wildcards.insert(
                     frontend,
@@ -140,19 +150,51 @@ impl StaticRouter {
                     },
                 );
                 wildcard_entries.insert(frontend, entry.clone());
-                continue;
+            } else if let Some(prefix) = entry.model.strip_suffix('*') {
+                // Prefix wildcard. validate_routes ensures `prefix` is
+                // non-empty and contains no other `*`.
+                //
+                // Pass-through is only meaningful in the singular form; the
+                // array form specifies per-element model strings explicitly.
+                let upstream_model_passthrough =
+                    entry.upstreams.is_empty() && entry.upstream_model.as_deref() == Some("*");
+                let route = PrefixRoute {
+                    prefix: prefix.to_string(),
+                    chain: targets,
+                    upstream_model_passthrough,
+                    entry: entry.clone(),
+                };
+                let bucket = prefixes.entry(frontend).or_default();
+                // Spec §2.4: identical (frontend, model) entries silently
+                // overwrite — later wins, mirroring HashMap-replacement
+                // semantics for exact routes. For the Vec-based prefix
+                // bucket, achieve this by removing any earlier entry with
+                // the same literal prefix before pushing.
+                bucket.retain(|existing| existing.prefix != route.prefix);
+                bucket.push(route);
+            } else {
+                let key = RouteKey {
+                    frontend,
+                    model: entry.model.clone(),
+                };
+                exact.insert(key.clone(), targets);
+                exact_entries.insert(key, entry.clone());
             }
-            let key = RouteKey {
-                frontend,
-                model: entry.model.clone(),
-            };
-            routes.insert(key.clone(), targets);
-            route_entries.insert(key, entry.clone());
         }
+
+        // Sort each frontend's prefix bucket by literal-prefix length
+        // descending. `sort_by_key` is stable (MUST stay stable — tie-break
+        // preserves YAML appearance order when two distinct prefixes have
+        // the same length; do NOT switch to `sort_unstable_by_key`).
+        for routes in prefixes.values_mut() {
+            routes.sort_by_key(|r| Reverse(r.prefix.len()));
+        }
+
         Self {
-            routes,
+            exact,
+            exact_entries,
+            prefixes,
             wildcards,
-            route_entries,
             wildcard_entries,
         }
     }
@@ -166,14 +208,49 @@ impl StaticRouter {
             frontend,
             model: model.to_string(),
         };
-        if let Some(targets) = self.routes.get(&key) {
+
+        // Tier 1: exact lookup. O(1) hot path; unchanged from pre-prefix.
+        if let Some(targets) = self.exact.get(&key) {
             return Ok(ResolvedRoute {
                 chain: targets.clone(),
-                retry: self.retry_config_for(frontend, &key, model),
-                breaker: self.breaker_config_for(frontend, &key, model),
+                retry: self.retry_config_for_exact(&key, model),
+                breaker: self.breaker_config_for_exact(&key, model),
                 route_label: route_label(frontend, model),
             });
         }
+
+        // Tier 2: prefix lookup. Sorted longest-first at startup, so the
+        // first `starts_with` hit IS the longest-prefix match. Linear scan
+        // over a per-frontend bucket (real-world size < 10).
+        if let Some(bucket) = self.prefixes.get(&frontend) {
+            for pr in bucket {
+                if model.starts_with(&pr.prefix) {
+                    tracing::debug!(
+                        frontend = ?frontend,
+                        inbound_model = %model,
+                        matched_prefix = %pr.prefix,
+                        provider = %pr.chain[0].provider,
+                        "prefix route hit"
+                    );
+                    let mut chain = pr.chain.clone();
+                    if pr.upstream_model_passthrough {
+                        // Singular-form pass-through: rewrite chain head to
+                        // the inbound model. Fuzzy upgrade (in ModelResolver)
+                        // canonicalizes this against the upstream's
+                        // discovered catalog.
+                        chain[0].model = model.to_string();
+                    }
+                    return Ok(ResolvedRoute {
+                        chain,
+                        retry: pr.entry.retry.clone(),
+                        breaker: pr.entry.breaker.clone(),
+                        route_label: route_label(frontend, model),
+                    });
+                }
+            }
+        }
+
+        // Tier 3: catch-all wildcard. Unchanged from pre-prefix.
         if let Some(wc) = self.wildcards.get(&frontend) {
             let upstream_model = if wc.upstream_model == "*" {
                 model.to_string()
@@ -186,50 +263,64 @@ impl StaticRouter {
                     model: upstream_model,
                     policy: wc.policy.clone(),
                 }],
-                retry: self.retry_config_for(frontend, &key, model),
-                breaker: self.breaker_config_for(frontend, &key, model),
+                retry: self.retry_config_for_wildcard(frontend, model),
+                breaker: self.breaker_config_for_wildcard(frontend, model),
                 route_label: route_label(frontend, model),
             });
         }
+
         Err(RouteError::NoRoute {
             frontend,
             model: model.to_string(),
         })
     }
 
-    fn retry_config_for(&self, frontend: FrontendKind, key: &RouteKey, model: &str) -> RetryConfig {
-        match self
-            .route_entries
-            .get(key)
-            .or_else(|| self.wildcard_entries.get(&frontend))
-        {
+    fn retry_config_for_exact(&self, key: &RouteKey, model: &str) -> RetryConfig {
+        match self.exact_entries.get(key) {
             Some(entry) => entry.retry.clone(),
             None => {
                 tracing::debug!(
                     model = %model,
-                    "no route-specific retry policy; using RetryConfig defaults"
+                    "no exact-route retry policy; using RetryConfig defaults"
                 );
                 RetryConfig::default()
             }
         }
     }
 
-    fn breaker_config_for(
-        &self,
-        frontend: FrontendKind,
-        key: &RouteKey,
-        model: &str,
-    ) -> BreakerConfig {
-        match self
-            .route_entries
-            .get(key)
-            .or_else(|| self.wildcard_entries.get(&frontend))
-        {
+    fn breaker_config_for_exact(&self, key: &RouteKey, model: &str) -> BreakerConfig {
+        match self.exact_entries.get(key) {
             Some(entry) => entry.breaker.clone(),
             None => {
                 tracing::debug!(
                     model = %model,
-                    "no route-specific breaker policy; using BreakerConfig defaults"
+                    "no exact-route breaker policy; using BreakerConfig defaults"
+                );
+                BreakerConfig::default()
+            }
+        }
+    }
+
+    fn retry_config_for_wildcard(&self, frontend: FrontendKind, model: &str) -> RetryConfig {
+        match self.wildcard_entries.get(&frontend) {
+            Some(entry) => entry.retry.clone(),
+            None => {
+                tracing::debug!(
+                    model = %model,
+                    "no wildcard-route retry policy; using RetryConfig defaults"
+                );
+                RetryConfig::default()
+            }
+        }
+    }
+
+    fn breaker_config_for_wildcard(&self, frontend: FrontendKind, model: &str) -> BreakerConfig {
+        match self.wildcard_entries.get(&frontend) {
+            Some(entry) => entry.breaker.clone(),
+            None => {
+                tracing::debug!(
+                    model = %model,
+                    "no wildcard-route breaker policy; using BreakerConfig defaults"
                 );
                 BreakerConfig::default()
             }
@@ -259,9 +350,12 @@ impl Router for StaticRouter {
     }
 
     fn list_routes(&self) -> Vec<(FrontendKind, String)> {
-        // Wildcards are intentionally excluded: catalog surfaces enumerate
-        // concrete aliases, not "any model goes" entries.
-        self.route_entries
+        // Both wildcards (`*`) and prefix wildcards (`claude-*`) are
+        // intentionally excluded: catalog surfaces enumerate concrete
+        // aliases only. Prefix routes live in `self.prefixes` and not in
+        // `self.exact_entries`, so this iteration excludes them
+        // structurally — no `if pattern { skip }` needed.
+        self.exact_entries
             .keys()
             .map(|k| (k.frontend, k.model.clone()))
             .collect()
@@ -557,5 +651,322 @@ mod tests {
         let policy = &chain[0].policy;
         assert_eq!(policy.reasoning_mapping.len(), 1);
         assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max,);
+    }
+
+    #[test]
+    fn prefix_route_passes_inbound_model_through_when_upstream_model_is_star() {
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn prefix_route_overrides_model_when_upstream_model_is_literal() {
+        let cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "claude-3-5-sonnet-20241022",
+        );
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-anything-at-all")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "claude-3-5-sonnet-20241022");
+    }
+
+    #[test]
+    fn exact_route_beats_prefix_route() {
+        let mut cfg = cfg_with_route(
+            "anthropic_messages",
+            "claude-sonnet-4-5",
+            "copilot",
+            "claude-sonnet-4-5",
+        );
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "copilot",
+            "claude-3-5-sonnet-20241022",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        // Exact wins: upstream_model is the literal "claude-sonnet-4-5",
+        // NOT the prefix route's "claude-3-5-sonnet-20241022".
+        assert_eq!(chain[0].model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn longest_prefix_wins() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "short");
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-3-*",
+            "copilot",
+            "mid",
+        ));
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-3-5-*",
+            "copilot",
+            "long",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+
+        let hit_long = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-3-5-sonnet")
+            .unwrap();
+        assert_eq!(hit_long[0].model, "long");
+
+        let hit_mid = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-3-haiku")
+            .unwrap();
+        assert_eq!(hit_mid[0].model, "mid");
+
+        let hit_short = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
+        assert_eq!(hit_short[0].model, "short");
+    }
+
+    #[test]
+    fn prefix_falls_back_to_full_wildcard_on_miss() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "claude-target");
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "*",
+            "copilot",
+            "*",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "gpt-4o")
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "copilot");
+        assert_eq!(chain[0].model, "gpt-4o"); // wildcard pass-through
+    }
+
+    #[test]
+    fn prefix_route_returns_no_route_on_complete_miss() {
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let router = StaticRouter::from_config(&cfg);
+        let err = router
+            .resolve(FrontendKind::AnthropicMessages, "gpt-4o")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RouteError::NoRoute {
+                frontend: FrontendKind::AnthropicMessages,
+                model,
+            } if model == "gpt-4o"
+        ));
+    }
+
+    #[test]
+    fn prefix_route_carries_route_label_with_inbound_model() {
+        let cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        let router = StaticRouter::from_config(&cfg);
+        let resolved = router
+            .resolve_route(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
+        // route_label uses the INBOUND model name (not the prefix pattern),
+        // matching wildcard behavior so per-route metrics slice by real model
+        // identity.
+        assert_eq!(
+            resolved.route_label.as_ref(),
+            "anthropic_messages/claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn prefix_route_uses_route_specific_retry_and_breaker() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        cfg.routes[0].retry.max_attempts = 7;
+        cfg.routes[0].breaker.failure_threshold_pct = 99;
+        let router = StaticRouter::from_config(&cfg);
+        let resolved = router
+            .resolve_route(FrontendKind::AnthropicMessages, "claude-sonnet-4-5")
+            .unwrap();
+        assert_eq!(resolved.retry.max_attempts, 7);
+        assert_eq!(resolved.breaker.failure_threshold_pct, 99);
+    }
+
+    #[test]
+    fn prefix_route_carries_reasoning_mapping_to_policy() {
+        use agent_shim_config::MappingRuleConfig;
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        cfg.routes[0].reasoning_mapping = vec![MappingRuleConfig {
+            r#match: "max".into(),
+            set: "xhigh".into(),
+        }];
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-opus-4-7")
+            .unwrap();
+        let policy = &chain[0].policy;
+        assert_eq!(policy.reasoning_mapping.len(), 1);
+        assert_eq!(policy.reasoning_mapping[0].r#match, ReasoningEffort::Max);
+        assert_eq!(policy.reasoning_mapping[0].set, ReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn duplicate_prefix_uses_last_definition() {
+        // Spec §2.4: identical (frontend, model) entries silently overwrite.
+        // Task 4 Step 2's from_config implements this for the prefix tier
+        // via a `bucket.retain(|e| e.prefix != route.prefix)` call before
+        // pushing — so the SECOND push wins, matching exact/wildcard
+        // HashMap-replacement behavior.
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "first", "first-model");
+        // Add a second upstream so the second route's `upstream: "second"`
+        // passes validation; cfg_with_route only registered "first".
+        cfg.upstreams.insert(
+            "second".to_string(),
+            agent_shim_config::UpstreamConfig::GithubCopilot(
+                agent_shim_config::GithubCopilotUpstream {
+                    tier: agent_shim_config::Tier::Standard,
+                    cost: None,
+                    p95_latency_budget_ms: None,
+                },
+            ),
+        );
+        cfg.upstreams.insert(
+            "first".to_string(),
+            agent_shim_config::UpstreamConfig::GithubCopilot(
+                agent_shim_config::GithubCopilotUpstream {
+                    tier: agent_shim_config::Tier::Standard,
+                    cost: None,
+                    p95_latency_budget_ms: None,
+                },
+            ),
+        );
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "claude-*",
+            "second",
+            "second-model",
+        ));
+        let router = StaticRouter::from_config(&cfg);
+        let chain = router
+            .resolve(FrontendKind::AnthropicMessages, "claude-anything")
+            .unwrap();
+        // Last-wins: the second push overwrites the first.
+        assert_eq!(chain[0].provider, "second");
+        assert_eq!(chain[0].model, "second-model");
+    }
+
+    #[test]
+    fn cross_frontend_prefix_isolation() {
+        let mut cfg = cfg_with_route("anthropic_messages", "claude-*", "copilot", "*");
+        cfg.routes
+            .push(RouteEntry::singular("openai_chat", "gpt-*", "copilot", "*"));
+        let router = StaticRouter::from_config(&cfg);
+
+        // anthropic_messages prefix should NOT capture openai_chat traffic.
+        let err = router
+            .resolve(FrontendKind::OpenAiChat, "claude-foo")
+            .unwrap_err();
+        assert!(matches!(err, RouteError::NoRoute { .. }));
+
+        // And vice-versa.
+        let err = router
+            .resolve(FrontendKind::AnthropicMessages, "gpt-foo")
+            .unwrap_err();
+        assert!(matches!(err, RouteError::NoRoute { .. }));
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use agent_shim_config::{
+        GatewayConfig, GithubCopilotUpstream, RouteEntry, Tier, UpstreamConfig,
+    };
+    use proptest::prelude::*;
+
+    fn cfg_with_prefixes(prefixes: &[&str]) -> GatewayConfig {
+        let mut cfg = GatewayConfig {
+            server: Default::default(),
+            logging: Default::default(),
+            upstreams: Default::default(),
+            routes: vec![],
+            plugins: ::std::collections::BTreeMap::new(),
+            auth: Default::default(),
+            rate_limit: Default::default(),
+            copilot: None,
+            admin: None,
+            metrics: Default::default(),
+            otel: None,
+            shutdown: Default::default(),
+            validation: Default::default(),
+        };
+        cfg.upstreams.insert(
+            "copilot".to_string(),
+            UpstreamConfig::GithubCopilot(GithubCopilotUpstream {
+                tier: Tier::Standard,
+                cost: None,
+                p95_latency_budget_ms: None,
+            }),
+        );
+        for (i, p) in prefixes.iter().enumerate() {
+            cfg.routes.push(RouteEntry::singular(
+                "anthropic_messages",
+                format!("{p}*"),
+                "copilot",
+                format!("mark-{i}"),
+            ));
+        }
+        cfg
+    }
+
+    proptest! {
+        /// For any set of distinct prefixes registered on one frontend, the
+        /// router's choice for a given inbound model is the *longest* prefix
+        /// among those that `starts_with` succeed against the inbound model.
+        /// This guards against an accidental switch to BTreeMap iteration
+        /// order or to unsorted bucket scans.
+        #[test]
+        fn longest_prefix_is_deterministic(
+            prefixes in proptest::collection::btree_set("[a-z]{1,8}", 1..8usize),
+            suffix in "[a-z]{0,8}",
+        ) {
+            let prefixes_vec: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+            let cfg = cfg_with_prefixes(&prefixes_vec);
+            let router = StaticRouter::from_config(&cfg);
+
+            // Build inbound by concatenating the LONGEST prefix with the
+            // random suffix, so at least one prefix is guaranteed to match.
+            let longest = prefixes_vec.iter().max_by_key(|p| p.len()).copied().unwrap();
+            let inbound = format!("{longest}{suffix}");
+
+            let resolved = router
+                .resolve(FrontendKind::AnthropicMessages, &inbound)
+                .expect("at least the longest prefix matches");
+
+            // Compute the expected winner: longest prefix among matchers.
+            // BTreeSet iteration is alphabetic; we sort by length descending,
+            // and break ties by picking the lexicographically earliest (which
+            // matches BTreeSet's natural order for same-length elements).
+            let mut matchers: Vec<&&str> = prefixes_vec
+                .iter()
+                .filter(|p| inbound.starts_with(*p))
+                .collect();
+            matchers.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+            let expected_prefix = *matchers[0];
+            let expected_idx = prefixes_vec.iter().position(|p| *p == expected_prefix).unwrap();
+            let expected_mark = format!("mark-{expected_idx}");
+
+            prop_assert_eq!(&resolved[0].model, &expected_mark);
+        }
     }
 }

@@ -26,7 +26,7 @@ Rename-Item target\release\agent-shim.exe target\release\agent-shim.exe.OLD-by-<
 cargo build --release -p agent-shim
 ```
 
-CLI surface: `serve`, `validate-config`, `show-catalog [--format json|table] [--strict]`, `copilot login|models [--format json|table]`, `service install|...` (Windows).
+CLI surface: `serve`, `validate-config`, `show-catalog [--format json|table] [--strict]`, `models <name> [--format json|table]`, `copilot login|models [--format json|table]`, `service install|...` (Windows).
 
 ## Architecture
 

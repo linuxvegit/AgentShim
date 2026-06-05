@@ -511,11 +511,25 @@ pub struct CopilotConfig {
     pub credential_path: String,
 }
 
-/// A single route mapping. Supports two shapes:
+/// A single route mapping. Supports two upstream-shape forms and three
+/// `model`-field forms:
+///
+/// Upstream shapes (mutually exclusive on the same route; validation enforces it):
 /// - **Singular** (v0.3 compat): `upstream` + `upstream_model`.
 /// - **Array** (v0.4): `upstreams: [{name, model}, ...]` for fallback chains.
 ///
-/// Both shapes are mutually exclusive on the same route; validation enforces it.
+/// `model` field forms:
+/// - **Exact** — e.g. `claude-sonnet-4-5`. Matches inbound model identically.
+/// - **Prefix wildcard** — e.g. `claude-*`, `glm*`. Literal characters followed
+///   by a single `*` at the very end. Matches when the inbound model
+///   `starts_with` the literal prefix. Resolved at lookup time by
+///   longest-prefix-wins (`StaticRouter::resolve_route`).
+/// - **Catch-all wildcard** — `"*"`. Matches any inbound model; at most one
+///   per frontend.
+///
+/// Priority at lookup: exact > longest-prefix > `"*"`. Identical `(frontend,
+/// model)` entries silently overwrite (later wins) — matches today's
+/// `HashMap` insertion semantics for exact routes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteEntry {

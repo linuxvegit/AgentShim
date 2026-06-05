@@ -200,9 +200,51 @@ impl BackendProvider for GeminiProvider {
         }
     }
 
-    // No `list_models` — AI Studio's Models API exists but we don't surface
-    // it today; defaulting to None matches the deepseek/openai-compatible
-    // behaviour and lets the gateway fall back to the configured aliases.
+    async fn list_models(
+        &self,
+    ) -> Result<
+        Option<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>,
+        ProviderError,
+    > {
+        let url = format!("{}/v1beta/models", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .auth
+            .apply(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        // Gemini's shape: { "models": [{ "name": "models/<id>", ... }, ...] }
+        // Strip the "models/" prefix so the IDs match what the route
+        // aliases reference. Entries that don't have the prefix are
+        // skipped rather than passed through bare — see test
+        // list_models_skips_entries_with_no_models_prefix for rationale.
+        let models = body
+            .get("models")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                    .filter_map(|name| name.strip_prefix("models/").map(String::from))
+                    .map(|id| (id, agent_shim_core::ModelMetadata::default()))
+                    .collect::<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>()
+            })
+            .unwrap_or_default();
+
+        if models.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(models))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -774,5 +816,127 @@ mod tests {
         };
         let provider = from_config("my-gemini", &cfg).expect("from_config ok");
         assert_eq!(provider.name(), "my-gemini");
+    }
+}
+
+#[cfg(test)]
+mod list_models_tests {
+    use super::*;
+
+    fn provider(server_url: String) -> GeminiProvider {
+        GeminiProvider::new(
+            "test",
+            server_url,
+            "AIza-test-key",
+            Default::default(),
+            30,
+        )
+        .expect("provider construction must succeed")
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_discovered_models_stripping_prefix() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1beta/models")
+            .match_query(mockito::Matcher::UrlEncoded("key".into(), "AIza-test-key".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "models": [
+                        {"name": "models/gemini-2.5-pro"},
+                        {"name": "models/gemini-2.5-flash"}
+                    ]
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        let map = p.list_models().await.unwrap().unwrap();
+        // The "models/" prefix must be stripped — operators configure
+        // routes against the bare model name.
+        assert!(map.contains_key("gemini-2.5-pro"));
+        assert!(map.contains_key("gemini-2.5-flash"));
+        assert_eq!(map.len(), 2);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1beta/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        assert!(p.list_models().await.unwrap().is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1beta/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        assert!(p.list_models().await.unwrap().is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_empty_returns_none() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1beta/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"models": []}"#)
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        assert!(p.list_models().await.unwrap().is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_skips_entries_with_no_models_prefix() {
+        // Defensive: AI Studio always prefixes with "models/", but if a
+        // future entry ever omits it we don't want to silently produce a
+        // misleading bare ID. Filter those out rather than guessing.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1beta/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "models": [
+                        {"name": "models/gemini-2.5-pro"},
+                        {"name": "weird-no-prefix"}
+                    ]
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        let map = p.list_models().await.unwrap().unwrap();
+        assert!(map.contains_key("gemini-2.5-pro"));
+        assert!(!map.contains_key("weird-no-prefix"));
+        assert_eq!(map.len(), 1);
+        mock.assert_async().await;
     }
 }
