@@ -1,5 +1,6 @@
 pub mod copilot_login;
 pub mod copilot_models;
+pub mod models;
 pub mod render_models;
 pub mod serve;
 pub mod show_catalog;
