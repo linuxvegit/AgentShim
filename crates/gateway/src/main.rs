@@ -25,6 +25,11 @@ async fn main() -> anyhow::Result<()> {
             format,
             strict,
         } => commands::show_catalog::run(&config, &format, strict).await,
+        Commands::Models {
+            name,
+            config,
+            format,
+        } => commands::models::run(&name, &config, &format).await,
         Commands::Copilot { sub } => match sub {
             CopilotCommand::Login { credential_path } => {
                 commands::copilot_login::run(credential_path).await
