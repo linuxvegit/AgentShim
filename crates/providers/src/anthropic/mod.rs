@@ -163,6 +163,48 @@ impl BackendProvider for AnthropicProvider {
         }
     }
 
+    async fn list_models(
+        &self,
+    ) -> Result<
+        Option<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>,
+        ProviderError,
+    > {
+        let url = format!("{}/v1/models", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(&url)
+            .header("x-api-key", self.api_key.as_str())
+            .header("anthropic-version", self.anthropic_version.as_str())
+            .send()
+            .await
+            .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Decode(e.to_string()))?;
+
+        let models = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                    .map(|id| (id, agent_shim_core::ModelMetadata::default()))
+                    .collect::<std::collections::BTreeMap<String, agent_shim_core::ModelMetadata>>()
+            })
+            .unwrap_or_default();
+
+        if models.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(models))
+    }
+
     async fn proxy_raw(
         &self,
         body: bytes::Bytes,
@@ -191,4 +233,95 @@ pub fn from_config(
         cfg.default_headers.clone(),
         cfg.request_timeout_secs,
     )
+}
+
+#[cfg(test)]
+mod list_models_tests {
+    use super::*;
+
+    fn provider(server_url: String) -> AnthropicProvider {
+        AnthropicProvider::new(
+            "test",
+            server_url,
+            "test-key",
+            "2023-06-01",
+            Default::default(),
+            30,
+        )
+        .expect("provider construction must succeed")
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_discovered_models() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .match_header("x-api-key", "test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "data": [
+                        {"id": "claude-opus-4-7", "type": "model"},
+                        {"id": "claude-sonnet-4-7", "type": "model"}
+                    ]
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        let map = p.list_models().await.unwrap().unwrap();
+        assert!(map.contains_key("claude-opus-4-7"));
+        assert!(map.contains_key("claude-sonnet-4-7"));
+        assert_eq!(map.len(), 2);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(404)
+            .with_body("not found")
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        assert!(p.list_models().await.unwrap().is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_none_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(401)
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        assert!(p.list_models().await.unwrap().is_none());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_models_empty_data_returns_none() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data": []}"#)
+            .create_async()
+            .await;
+
+        let p = provider(server.url());
+        assert!(p.list_models().await.unwrap().is_none());
+        mock.assert_async().await;
+    }
 }
