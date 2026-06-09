@@ -13,9 +13,16 @@ use super::wire::{
 
 /// Compress a canonical effort to whatever the OpenAI Chat-shape upstream accepts.
 ///
-/// Pure OpenAI Chat tops out at `"high"`, so canonical `Xhigh` / `Max` get squashed.
-/// Copilot, by contrast, accepts an `"xhigh"` extension on the Chat path — so when
-/// `accepts_xhigh = true` we promote `Max` and pass `Xhigh` through.
+/// This is the **static fallback** used only when the target model has no
+/// discovered `reasoning_effort` catalog (`ResolvedPolicy::supported_efforts`
+/// is `None`). When the catalog *is* present, [`effort_wire_string`] clamps
+/// against the model's advertised list instead and this function isn't
+/// consulted.
+///
+/// Pure OpenAI Chat tops out at `"high"`, so canonical `Xhigh` / `Max` get
+/// squashed. Copilot, by contrast, accepts an `"xhigh"` extension on the Chat
+/// path — so when `accepts_xhigh = true` we promote `Max` and pass `Xhigh`
+/// through.
 fn effort_for_chat(e: ReasoningEffort, accepts_xhigh: bool) -> &'static str {
     use ReasoningEffort::*;
     match e {
@@ -28,6 +35,27 @@ fn effort_for_chat(e: ReasoningEffort, accepts_xhigh: bool) -> &'static str {
         Max if accepts_xhigh => "xhigh",
         Max => "high",
     }
+}
+
+/// Resolve the outbound `reasoning_effort` wire string for a request.
+///
+/// Prefers the per-model catalog: when `ResolvedPolicy::supported_efforts`
+/// lists what the target advertises, clamp the canonical effort against it
+/// (highest advertised tier `<= requested`), preserving the upstream's own
+/// spelling. This is what lets `claude-opus-4.8` receive `"max"` while
+/// `claude-opus-4.6` (max but no xhigh) receives `"max"` for a Max request
+/// yet `"high"` — not `"xhigh"` — for an Xhigh request.
+///
+/// Falls back to the static [`effort_for_chat`] compression when the catalog
+/// carried nothing for this model (undiscovered upstreams, offline tests).
+fn effort_wire_string(req: &CanonicalRequest, accepts_xhigh: bool) -> Option<String> {
+    let effort = req.resolved_policy.reasoning_effort?;
+    if let Some(adv) = req.resolved_policy.supported_efforts.as_deref() {
+        if let Some(clamped) = effort.clamp_to_advertised(adv) {
+            return Some(clamped.to_string());
+        }
+    }
+    Some(effort_for_chat(effort, accepts_xhigh).to_string())
 }
 
 /// Build the outbound OpenAI-Chat-shape request body as a `serde_json::Value`.
@@ -245,10 +273,7 @@ pub(crate) fn build(
         tool_choice,
         stream: req.stream,
         stream_options,
-        reasoning_effort: req
-            .resolved_policy
-            .reasoning_effort
-            .map(|e| effort_for_chat(e, accepts_xhigh).to_string()),
+        reasoning_effort: effort_wire_string(req, accepts_xhigh),
     }
 }
 
@@ -674,5 +699,60 @@ mod tests {
             assert_eq!(body_off.reasoning_effort.as_deref(), Some(want));
             assert_eq!(body_on.reasoning_effort.as_deref(), Some(want));
         }
+    }
+
+    // ── catalog-driven clamping (per-model supported_efforts) ─────────
+
+    fn req_with_effort_and_catalog(
+        effort: ReasoningEffort,
+        advertised: &[&str],
+    ) -> CanonicalRequest {
+        let mut req = req_with_effort(effort);
+        req.resolved_policy.supported_efforts =
+            Some(advertised.iter().map(|s| s.to_string()).collect());
+        req
+    }
+
+    #[test]
+    fn catalog_max_passes_through_when_model_advertises_max() {
+        // claude-opus-4.8: max is advertised → Max reaches upstream as "max",
+        // overriding the static accepts_xhigh compression that would say
+        // "xhigh".
+        let req = req_with_effort_and_catalog(
+            ReasoningEffort::Max,
+            &["low", "medium", "high", "xhigh", "max"],
+        );
+        let body = build(&req, &target("claude-opus-4.8"), true);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn catalog_xhigh_steps_down_when_model_lacks_xhigh() {
+        // claude-opus-4.6: advertises max but NOT xhigh. An Xhigh request must
+        // clamp to "high" (highest advertised <= Xhigh), never the wrongly
+        // promoted "xhigh" the static accepts_xhigh path would emit.
+        let req =
+            req_with_effort_and_catalog(ReasoningEffort::Xhigh, &["low", "medium", "high", "max"]);
+        let body = build(&req, &target("claude-opus-4.6"), true);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn catalog_max_clamps_to_xhigh_when_model_lacks_max() {
+        // gpt-5.5: advertises xhigh, not max. Max clamps to "xhigh".
+        let req = req_with_effort_and_catalog(
+            ReasoningEffort::Max,
+            &["none", "low", "medium", "high", "xhigh"],
+        );
+        let body = build(&req, &target("gpt-5.5"), true);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn catalog_absent_falls_back_to_static_compression() {
+        // No supported_efforts (undiscovered model): Max on a Copilot-capable
+        // target still uses the static accepts_xhigh promotion to "xhigh".
+        let body = build(&req_with_effort(ReasoningEffort::Max), &target("m"), true);
+        assert_eq!(body.reasoning_effort.as_deref(), Some("xhigh"));
     }
 }

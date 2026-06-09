@@ -37,6 +37,7 @@ fn req_with_effort_and_beta(effort: ReasoningEffort, has_effort_beta: bool) -> C
         resolved_policy: ResolvedPolicy {
             reasoning_effort: Some(effort),
             reasoning_budget_tokens: None,
+            supported_efforts: None,
             anthropic_headers: headers,
         },
         extensions: ExtensionMap::new(),

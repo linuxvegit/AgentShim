@@ -113,3 +113,102 @@ fn pure_openai_target_compresses_mapped_xhigh_to_high() {
         "pure-OpenAI target compresses Xhigh → high at the wire boundary"
     );
 }
+
+// ── catalog-driven clamping (per-model supported_efforts) ─────────────
+//
+// These mirror what the gateway pipeline does after route resolution:
+// it copies the discovered model's `reasoning_effort_values` onto
+// `ResolvedPolicy::supported_efforts`, and the encoder clamps against it.
+// No `reasoning_mapping` is configured — the catalog alone drives the tier.
+
+/// Decode a Claude-Code "ultrathink" (effort: max) body and resolve with an
+/// empty policy (no mapping table), then stamp the model's advertised effort
+/// vocabulary on as the pipeline would.
+fn max_request_with_catalog(advertised: &[&str]) -> agent_shim_core::CanonicalRequest {
+    let inbound = serde_json::json!({
+        "model": "claude-opus-4-8",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "thinking": { "type": "adaptive" },
+        "output_config": { "effort": "max" }
+    });
+    let body_bytes = serde_json::to_vec(&inbound).unwrap();
+    let canonical = decode(&body_bytes).expect("anthropic decode succeeds");
+    let target = BackendTarget {
+        provider: "copilot".to_string(),
+        model: "claude-opus-4.8".to_string(),
+        policy: RoutePolicy::default(),
+    };
+    let mut req = canonical;
+    req.resolved_policy = target.policy.resolve(&req);
+    req.resolved_policy.supported_efforts =
+        Some(advertised.iter().map(|s| s.to_string()).collect());
+    req
+}
+
+#[test]
+fn catalog_max_reaches_copilot_when_model_advertises_max() {
+    // claude-opus-4.8 advertises `max`: the outbound body must carry it,
+    // not the `xhigh` that the static accepts_xhigh ceiling would force.
+    let req = max_request_with_catalog(&["low", "medium", "high", "xhigh", "max"]);
+    let target = BackendTarget {
+        provider: "copilot".to_string(),
+        model: "claude-opus-4.8".to_string(),
+        policy: RoutePolicy::default(),
+    };
+    let chat_body = build_json(&req, &target, /* accepts_xhigh */ true);
+    assert_eq!(
+        chat_body["reasoning_effort"], "max",
+        "opus-4.8 advertises max → forward max verbatim"
+    );
+}
+
+#[test]
+fn catalog_xhigh_request_skips_unavailable_tier() {
+    // opus-4.6 advertises max but NOT xhigh. An Xhigh request must land on
+    // "high" (highest advertised <= Xhigh), never get promoted to the
+    // unsupported "xhigh" the provider-wide flag would have sent.
+    let inbound = serde_json::json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "thinking": { "type": "adaptive" },
+        "output_config": { "effort": "xhigh" }
+    });
+    let body_bytes = serde_json::to_vec(&inbound).unwrap();
+    let canonical = decode(&body_bytes).expect("anthropic decode succeeds");
+    let target = BackendTarget {
+        provider: "copilot".to_string(),
+        model: "claude-opus-4.6".to_string(),
+        policy: RoutePolicy::default(),
+    };
+    let mut req = canonical;
+    req.resolved_policy = target.policy.resolve(&req);
+    req.resolved_policy.supported_efforts = Some(
+        ["low", "medium", "high", "max"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    let chat_body = build_json(&req, &target, /* accepts_xhigh */ true);
+    assert_eq!(
+        chat_body["reasoning_effort"], "high",
+        "opus-4.6 lacks xhigh → an Xhigh request clamps down to high, not up to xhigh"
+    );
+}
+
+#[test]
+fn catalog_max_clamps_to_xhigh_when_model_has_no_max() {
+    // gpt-5.5 advertises xhigh but not max. Max clamps to "xhigh".
+    let req = max_request_with_catalog(&["none", "low", "medium", "high", "xhigh"]);
+    let target = BackendTarget {
+        provider: "copilot".to_string(),
+        model: "gpt-5.5".to_string(),
+        policy: RoutePolicy::default(),
+    };
+    let chat_body = build_json(&req, &target, /* accepts_xhigh */ true);
+    assert_eq!(
+        chat_body["reasoning_effort"], "xhigh",
+        "gpt-5.5 tops out at xhigh → Max clamps to xhigh"
+    );
+}

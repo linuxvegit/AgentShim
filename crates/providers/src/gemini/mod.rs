@@ -824,14 +824,8 @@ mod list_models_tests {
     use super::*;
 
     fn provider(server_url: String) -> GeminiProvider {
-        GeminiProvider::new(
-            "test",
-            server_url,
-            "AIza-test-key",
-            Default::default(),
-            30,
-        )
-        .expect("provider construction must succeed")
+        GeminiProvider::new("test", server_url, "AIza-test-key", Default::default(), 30)
+            .expect("provider construction must succeed")
     }
 
     #[tokio::test]
@@ -839,7 +833,10 @@ mod list_models_tests {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/v1beta/models")
-            .match_query(mockito::Matcher::UrlEncoded("key".into(), "AIza-test-key".into()))
+            .match_query(mockito::Matcher::UrlEncoded(
+                "key".into(),
+                "AIza-test-key".into(),
+            ))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(

@@ -644,6 +644,21 @@ async fn dispatch_inner(
     // correct because every chain element shares the same `RoutePolicy`.
     canonical.resolved_policy = first_target.policy.resolve(&canonical);
 
+    // Thread the chain head's advertised `reasoning_effort` vocabulary onto
+    // the resolved policy. `RoutePolicy::resolve` is a pure policy+request
+    // merge with no catalog access; this is the one place the discovered
+    // model metadata is in scope. Providers' effort encoders clamp against
+    // this list so per-model ceilings (opus-4.8 takes `max`; opus-4.6 takes
+    // `max` but not `xhigh`; gpt-5.5 takes `xhigh` but not `max`) are honoured
+    // instead of squashed to one provider-wide tier. Absent metadata leaves
+    // it `None` and encoders fall back to their static compression.
+    canonical.resolved_policy.supported_efforts = state
+        .core
+        .resolver
+        .model_index()
+        .metadata(&first_target.provider, &first_target.model)
+        .and_then(|m| m.supports.reasoning_effort_values.clone());
+
     // ── Plan 07 P04 spec §6.6 anchor 2: H3 (on_resolved) ──────────────
     // After route resolve + policy snapshot, before capability gate.
     // Plugins see the resolved `BackendTarget` (= chain head) so they

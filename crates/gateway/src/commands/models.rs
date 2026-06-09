@@ -36,21 +36,15 @@ pub async fn run(name: &str, config_path: &Path, format: &str) -> Result<()> {
         .get(name)
         .ok_or_else(|| missing_upstream_error(name, &available))?;
 
-    let map = provider
-        .list_models()
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "upstream '{name}' (provider kind '{}') does not support model discovery",
-                kind.unwrap_or("unknown")
-            )
-        })?;
+    let map = provider.list_models().await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "upstream '{name}' (provider kind '{}') does not support model discovery",
+            kind.unwrap_or("unknown")
+        )
+    })?;
 
     let header = RenderHeader {
-        line1: format!(
-            "Upstream '{name}' (type: {})",
-            kind.unwrap_or("unknown")
-        ),
+        line1: format!("Upstream '{name}' (type: {})", kind.unwrap_or("unknown")),
     };
     render_models::render(&map, format, &header)
 }
@@ -70,9 +64,7 @@ fn provider_kind_label(cfg: &UpstreamConfig) -> &'static str {
     }
 }
 
-fn available_names(
-    upstreams: &std::collections::BTreeMap<String, UpstreamConfig>,
-) -> Vec<String> {
+fn available_names(upstreams: &std::collections::BTreeMap<String, UpstreamConfig>) -> Vec<String> {
     // BTreeMap iteration is already sorted; collect into Vec so callers
     // can format the comma-separated list directly.
     upstreams.keys().cloned().collect()

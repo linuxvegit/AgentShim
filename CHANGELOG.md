@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-model reasoning-effort clamping (catalog-driven).** Outbound
+  `reasoning_effort` now respects each model's *advertised* effort
+  vocabulary instead of a single provider-wide ceiling. The gateway
+  pipeline copies the resolved model's discovered `reasoning_effort`
+  list onto the new `ResolvedPolicy::supported_efforts`, and both the
+  OpenAI-Chat and OpenAI-Responses encoders clamp against it via the new
+  `ReasoningEffort::clamp_to_advertised` (highest advertised tier `<=`
+  the request, preserving the upstream's own spelling such as GPT-5's
+  `"none"`). Concretely, on Copilot:
+  - `claude-opus-4.8` / `claude-opus-4.7` (advertise `max`) now receive
+    `reasoning_effort: "max"` for a Max request — previously capped at
+    `"xhigh"`.
+  - `claude-opus-4.6` / `claude-sonnet-4.6` (advertise `max` but **not**
+    `xhigh`) receive `"max"` for Max and correctly step an Xhigh request
+    **down** to `"high"` instead of emitting the unsupported `"xhigh"`.
+  - `gpt-5.5` / `gpt-5.4` (advertise `xhigh`, not `max`) clamp Max to
+    `"xhigh"`.
+  `ReasoningEffort` now derives `Ord` (variant declaration order =
+  intensity). When a model has no discovered catalog metadata, the prior
+  static compression still applies (`xhigh`/`max` → `"high"`; Copilot
+  Chat → `"xhigh"` via `ProviderCapabilities::accepts_xhigh`), so
+  undiscovered upstreams and offline tests are unaffected.
+
+
 ## [0.9.0] — 2026-05-29
 
 Unified admission module + accepted rate-limit reservation asymmetry,

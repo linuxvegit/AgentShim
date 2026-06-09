@@ -67,6 +67,18 @@ pub struct ResolvedPolicy {
     /// any provider that quantizes from a number).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_budget_tokens: Option<u32>,
+    /// The target model's advertised `reasoning_effort` vocabulary, copied
+    /// from discovered catalog metadata at route-resolution time (e.g.
+    /// `["low","medium","high","xhigh","max"]`). Encoders that emit an
+    /// effort string clamp `reasoning_effort` against this list via
+    /// [`ReasoningEffort::clamp_to_advertised`], so per-model differences
+    /// (opus-4.8 takes `max`; opus-4.6 takes `max` but not `xhigh`;
+    /// gpt-5.5 takes `xhigh` but not `max`) are honoured instead of squashed
+    /// to a single provider-wide ceiling. `None` when the catalog had no
+    /// metadata for this model — encoders then fall back to their static
+    /// per-provider compression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_efforts: Option<Vec<String>>,
     /// Final `anthropic-*` headers to attach to the upstream HTTP request.
     /// Order is stable; duplicates are not collapsed (callers may pass
     /// comma-separated values verbatim).
@@ -124,6 +136,10 @@ impl RoutePolicy {
         ResolvedPolicy {
             reasoning_effort: final_effort,
             reasoning_budget_tokens: inbound_budget,
+            // Populated by the gateway pipeline after route resolution, where
+            // the discovered model catalog is in scope. `resolve` is a pure
+            // policy+request merge and has no catalog access.
+            supported_efforts: None,
             anthropic_headers,
         }
     }
@@ -247,9 +263,21 @@ mod tests {
         let rp = ResolvedPolicy {
             reasoning_effort: Some(ReasoningEffort::High),
             reasoning_budget_tokens: Some(8192),
+            supported_efforts: None,
             anthropic_headers: vec![],
         };
         assert_eq!(rp.reasoning_budget_tokens, Some(8192));
+    }
+
+    #[test]
+    fn resolve_leaves_supported_efforts_for_pipeline() {
+        // `resolve` is pure: it never fills supported_efforts (no catalog
+        // access). The gateway populates it post-resolution.
+        let policy = RoutePolicy {
+            default_reasoning_effort: Some(ReasoningEffort::Max),
+            ..Default::default()
+        };
+        assert_eq!(policy.resolve(&req()).supported_efforts, None);
     }
 
     #[test]

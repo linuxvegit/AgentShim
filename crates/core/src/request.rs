@@ -42,7 +42,12 @@ pub struct ReasoningOptions {
 }
 
 /// Qualitative reasoning-effort levels accepted by Copilot / OpenAI / GPT-5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Variant declaration order is **intensity order** — `Minimal` is the
+/// weakest, `Max` the strongest. The derived `Ord`/`PartialOrd` rely on this
+/// ordering, so new tiers must be inserted at the correct intensity position,
+/// never appended for convenience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Minimal,
@@ -75,6 +80,44 @@ impl ReasoningEffort {
             "max" => Some(ReasoningEffort::Max),
             _ => None,
         }
+    }
+
+    /// Pick the wire string for this effort from a model's advertised list.
+    ///
+    /// `advertised` is the upstream's exact `reasoning_effort` vocabulary
+    /// (e.g. `["low","medium","high","xhigh","max"]`, or GPT-5's
+    /// `["none","low","medium","high","xhigh"]`). The returned value is the
+    /// **raw upstream string** for the chosen tier, so provider-specific
+    /// spellings such as `"none"` survive verbatim instead of being
+    /// re-derived (and corrupted) through [`ReasoningEffort::as_str`].
+    ///
+    /// Selection rule: the highest advertised tier `<= self`. When every
+    /// advertised tier is stronger than `self` — i.e. the request asked for
+    /// *less* than the model's floor — the lowest advertised tier is returned
+    /// so we still emit a value the model accepts. Unparseable entries are
+    /// ignored. Returns `None` only when `advertised` carries no recognisable
+    /// tier, signalling the caller to fall back to its static compression.
+    ///
+    /// This is the single place that turns "the model says it supports
+    /// `[..]`" into "this is the effort string we send", so both the
+    /// OpenAI-Chat and OpenAI-Responses encoders agree.
+    pub fn clamp_to_advertised<'a>(self, advertised: &'a [String]) -> Option<&'a str> {
+        // Keep the original spelling alongside the parsed tier.
+        let mut parsed: Vec<(ReasoningEffort, &'a str)> = advertised
+            .iter()
+            .filter_map(|s| Self::parse(s).map(|e| (e, s.as_str())))
+            .collect();
+        if parsed.is_empty() {
+            return None;
+        }
+        // Sort ascending by intensity so `.rev()` walks strongest-first.
+        parsed.sort_by_key(|(e, _)| *e);
+        // Highest advertised tier at or below the request.
+        if let Some((_, raw)) = parsed.iter().rev().find(|(e, _)| *e <= self) {
+            return Some(raw);
+        }
+        // Request is below the model's floor: emit the lowest tier it offers.
+        parsed.first().map(|(_, raw)| *raw)
     }
 }
 
@@ -207,5 +250,71 @@ mod effort_tests {
         ] {
             assert_eq!(ReasoningEffort::parse(e.as_str()), Some(e));
         }
+    }
+
+    #[test]
+    fn effort_ordering_is_intensity() {
+        assert!(ReasoningEffort::Minimal < ReasoningEffort::Low);
+        assert!(ReasoningEffort::High < ReasoningEffort::Xhigh);
+        assert!(ReasoningEffort::Xhigh < ReasoningEffort::Max);
+        assert!(ReasoningEffort::Max > ReasoningEffort::Medium);
+    }
+
+    fn vals(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn clamp_picks_exact_tier_when_advertised() {
+        // claude-opus-4.8: max is advertised, so Max passes through as "max".
+        let adv = vals(&["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(ReasoningEffort::Max.clamp_to_advertised(&adv), Some("max"));
+        assert_eq!(
+            ReasoningEffort::Xhigh.clamp_to_advertised(&adv),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn clamp_steps_down_to_highest_available() {
+        // claude-opus-4.6 / sonnet-4.6: max present but NO xhigh. A request
+        // for Xhigh must drop to "high" (the highest tier <= Xhigh), never
+        // emit "max" (which is stronger) nor "xhigh" (not advertised).
+        let adv = vals(&["low", "medium", "high", "max"]);
+        assert_eq!(
+            ReasoningEffort::Xhigh.clamp_to_advertised(&adv),
+            Some("high")
+        );
+        // Max still lands on "max".
+        assert_eq!(ReasoningEffort::Max.clamp_to_advertised(&adv), Some("max"));
+    }
+
+    #[test]
+    fn clamp_max_falls_to_xhigh_when_no_max() {
+        // gpt-5.5: advertises xhigh but not max. Max clamps to "xhigh".
+        let adv = vals(&["none", "low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            ReasoningEffort::Max.clamp_to_advertised(&adv),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn clamp_preserves_raw_spelling_below_floor() {
+        // gpt-5.x advertises "none" (not "minimal"). A Minimal request must
+        // round-trip the upstream's own spelling, and a below-floor request
+        // falls to the lowest advertised tier verbatim.
+        let adv = vals(&["none", "low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            ReasoningEffort::Minimal.clamp_to_advertised(&adv),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn clamp_returns_none_on_empty_or_unparseable() {
+        assert_eq!(ReasoningEffort::Max.clamp_to_advertised(&[]), None);
+        let junk = vals(&["turbo", "ludicrous"]);
+        assert_eq!(ReasoningEffort::Max.clamp_to_advertised(&junk), None);
     }
 }

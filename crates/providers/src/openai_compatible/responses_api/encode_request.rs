@@ -148,12 +148,25 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
     }
 
     // Reasoning effort (Responses API uses `reasoning: { effort: "..." }`).
-    // Responses tops out at "high" — `Xhigh` and `Max` compress.
+    // Prefer the per-model catalog: when the target advertises a
+    // `reasoning_effort` vocabulary (e.g. Copilot's `claude-opus-4.8` listing
+    // `max`), clamp against it so the strongest supported tier is sent. Only
+    // when the catalog is absent do we fall back to the static rule that pure
+    // OpenAI Responses tops out at "high" (`Xhigh`/`Max` compress).
     if let Some(effort) = req.resolved_policy.reasoning_effort {
-        let effort_str = match effort {
-            ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
-            other => other.as_str(),
-        };
+        let effort_str: String = req
+            .resolved_policy
+            .supported_efforts
+            .as_deref()
+            .and_then(|adv| effort.clamp_to_advertised(adv))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                match effort {
+                    ReasoningEffort::Xhigh | ReasoningEffort::Max => "high",
+                    other => other.as_str(),
+                }
+                .to_string()
+            });
         body["reasoning"] = json!({ "effort": effort_str });
     }
 
@@ -329,5 +342,55 @@ mod tests {
     fn responses_no_effort_means_no_reasoning_field() {
         let body = build(&empty_request(), &target());
         assert!(body.get("reasoning").is_none());
+    }
+
+    // ── catalog-driven clamping (per-model supported_efforts) ─────────
+
+    fn req_with_catalog(effort: ReasoningEffort, advertised: &[&str]) -> CanonicalRequest {
+        let mut req = empty_request();
+        req.resolved_policy.reasoning_effort = Some(effort);
+        req.resolved_policy.supported_efforts =
+            Some(advertised.iter().map(|s| s.to_string()).collect());
+        req
+    }
+
+    #[test]
+    fn responses_max_passes_through_when_model_advertises_max() {
+        // Copilot claude-opus-4.8 via the Responses path: Max must reach
+        // upstream as "max", not the static "high" compression.
+        let req = req_with_catalog(
+            ReasoningEffort::Max,
+            &["low", "medium", "high", "xhigh", "max"],
+        );
+        let body = build(&req, &target());
+        assert_eq!(body["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn responses_xhigh_steps_down_when_model_lacks_xhigh() {
+        // opus-4.6: max but no xhigh → Xhigh clamps to "high".
+        let req = req_with_catalog(ReasoningEffort::Xhigh, &["low", "medium", "high", "max"]);
+        let body = build(&req, &target());
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn responses_max_clamps_to_xhigh_when_model_lacks_max() {
+        // gpt-5.5: xhigh but no max → Max clamps to "xhigh".
+        let req = req_with_catalog(
+            ReasoningEffort::Max,
+            &["none", "low", "medium", "high", "xhigh"],
+        );
+        let body = build(&req, &target());
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn responses_absent_catalog_falls_back_to_compression() {
+        // No supported_efforts: static rule still compresses Max → "high".
+        let mut req = empty_request();
+        req.resolved_policy.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = build(&req, &target());
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 }

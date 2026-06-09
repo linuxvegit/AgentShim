@@ -49,8 +49,17 @@ Qualitative thinking-effort level drawn from the six-value canonical vocabulary 
 - OpenAI Chat inbound `reasoning_effort` (`minimal/low/medium/high`) → `ReasoningOptions.effort`
 - OpenAI Responses inbound `reasoning.effort` → `ReasoningOptions.effort`
 - Outbound Anthropic: `Minimal → "low"` (no minimal upstream); else identity
-- Outbound OpenAI Chat (non-Copilot) and Responses API: `Xhigh|Max → "high"`
-- Outbound Copilot Chat (`accepts_xhigh = true`): `Xhigh|Max → "xhigh"`
+- **Catalog-driven (preferred):** when the target model's discovered metadata
+  advertises a `reasoning_effort` list (`ResolvedPolicy::supported_efforts`,
+  populated by the gateway pipeline after route resolution), encoders clamp via
+  `ReasoningEffort::clamp_to_advertised` — the highest advertised tier `<=`
+  requested, preserving the upstream's own spelling. So `claude-opus-4.8`
+  (advertises `max`) gets `"max"`; `claude-opus-4.6` (advertises `max`, no
+  `xhigh`) gets `"max"` for a Max request but `"high"` — not `"xhigh"` — for an
+  Xhigh one; `gpt-5.5` (advertises `xhigh`, no `max`) clamps Max to `"xhigh"`.
+- **Static fallback** (no catalog metadata for the model):
+  - Outbound OpenAI Chat (non-Copilot) and Responses API: `Xhigh|Max → "high"`
+  - Outbound Copilot Chat (`accepts_xhigh = true`): `Xhigh|Max → "xhigh"`
 
 **Reasoning mapping table** *(`reasoning_mapping`)*
 Optional per-route ordered list of `{ match, set }` rules over canonical effort. First rule whose `match` equals the post-default inbound effort fires its `set`; unmatched passes through. Both fields are canonical-vocabulary effort strings (`minimal/low/medium/high/xhigh/max`), NOT raw inbound or outbound dialect strings. Lives in `agent-shim-core::policy::RoutePolicy`.
