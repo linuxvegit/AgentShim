@@ -335,13 +335,19 @@ fn build_system_instruction(req: &CanonicalRequest) -> Option<Content> {
 
     for msg in &req.messages {
         if msg.role == MessageRole::System {
+            let has_text = msg
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text(_)));
+            if has_text {
+                tracing::debug!(
+                    source = ?msg.source,
+                    "gemini provider: mid-conversation system message \
+                     collapsed to systemInstruction (position lost)"
+                );
+            }
             for block in &msg.content {
                 if let ContentBlock::Text(t) = block {
-                    tracing::debug!(
-                        source = ?msg.source,
-                        "gemini provider: mid-conversation system message \
-                         collapsed to systemInstruction (position lost)"
-                    );
                     parts.push(Part {
                         text: Some(t.text.clone()),
                         ..Default::default()
