@@ -101,6 +101,12 @@ pub(crate) fn build(
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
             MessageRole::Tool => "tool",
+            MessageRole::System => match msg.source {
+                Some(SystemSource::OpenAiDeveloper) => "developer",
+                // Defaults to "system" for OpenAiSystem, AnthropicSystem,
+                // and the documented None fallback (spec §2.6 invariant I1).
+                _ => "system",
+            },
         };
 
         // Collect tool calls from assistant messages.
@@ -426,7 +432,7 @@ mod tests {
     use super::*;
     use agent_shim_core::{
         request::ReasoningEffort, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
-        GenerationOptions, Message, RequestId, ToolCallId, ToolResultBlock,
+        GenerationOptions, Message, RequestId, SystemInstruction, ToolCallId, ToolResultBlock,
     };
 
     fn target(model: &str) -> BackendTarget {
@@ -700,6 +706,73 @@ mod tests {
             assert_eq!(body_off.reasoning_effort.as_deref(), Some(want));
             assert_eq!(body_on.reasoning_effort.as_deref(), Some(want));
         }
+    }
+
+    // ── positional MessageRole::System (spec §4.2 / Task 9) ──────────
+
+    #[test]
+    fn chat_system_message_emits_in_position() {
+        let req = request_with_messages(vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message::system(SystemSource::OpenAiSystem, vec![ContentBlock::text("mid")]),
+            Message::user(vec![ContentBlock::text("b")]),
+        ]);
+        let body = build(&req, &target("m"), false);
+        assert_eq!(body.messages.len(), 3);
+        assert_eq!(body.messages[0].role, "user");
+        assert_eq!(body.messages[1].role, "system");
+        assert_eq!(body.messages[1].content, Some(serde_json::json!("mid")));
+        assert_eq!(body.messages[2].role, "user");
+    }
+
+    #[test]
+    fn chat_system_message_with_developer_source_emits_role_developer() {
+        let req = request_with_messages(vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message::system(
+                SystemSource::OpenAiDeveloper,
+                vec![ContentBlock::text("hint")],
+            ),
+        ]);
+        let body = build(&req, &target("m"), false);
+        assert_eq!(body.messages[1].role, "developer");
+    }
+
+    #[test]
+    fn chat_top_level_system_first_then_messages_system_preserves_order() {
+        let mut req = request_with_messages(vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message::system(SystemSource::OpenAiSystem, vec![ContentBlock::text("mid")]),
+            Message::user(vec![ContentBlock::text("b")]),
+        ]);
+        req.system.push(SystemInstruction {
+            source: SystemSource::OpenAiSystem,
+            content: vec![ContentBlock::text("standing")],
+        });
+        let body = build(&req, &target("m"), false);
+        assert_eq!(body.messages.len(), 4);
+        assert_eq!(body.messages[0].role, "system");
+        assert_eq!(body.messages[0].content, Some(serde_json::json!("standing")));
+        assert_eq!(body.messages[1].role, "user");
+        assert_eq!(body.messages[2].role, "system");
+        assert_eq!(body.messages[2].content, Some(serde_json::json!("mid")));
+        assert_eq!(body.messages[3].role, "user");
+    }
+
+    #[test]
+    fn chat_system_message_with_none_source_defaults_to_system_role() {
+        let req = request_with_messages(vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message {
+                role: MessageRole::System,
+                content: vec![ContentBlock::text("orphan")],
+                name: None,
+                source: None,
+                extensions: ExtensionMap::new(),
+            },
+        ]);
+        let body = build(&req, &target("m"), false);
+        assert_eq!(body.messages[1].role, "system");
     }
 
     // ── catalog-driven clamping (per-model supported_efforts) ─────────
