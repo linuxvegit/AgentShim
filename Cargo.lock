@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-shim"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-config"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-core",
  "figment",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-core"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-frontends"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-core",
  "agent-shim-protocol-tests",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-observability"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-observability-derive",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-observability-derive"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-observability",
  "proc-macro2",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-plugins"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-protocol-tests"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-core",
  "agent-shim-frontends",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-providers"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-router"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "agent-shim-config",
  "agent-shim-core",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "agent-shim-tokens"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "tiktoken-rs",
 ]

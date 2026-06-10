@@ -33,6 +33,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undiscovered upstreams and offline tests are unaffected.
 
 
+## [0.10.0] - 2026-06-10
+
+### Added
+
+- Canonical `MessageRole::System` variant authorising positional system
+  instructions inside the `messages` array. Authorised by ADR-0011 (iv).
+- Canonical `Message.source: Option<SystemSource>` field tagging the
+  origin of a `MessageRole::System` message so outbound encoders can
+  choose between OpenAI `"system"` and `"developer"` wire roles.
+  Authorised by ADR-0011 (v).
+- `Message::system(source, content)` constructor.
+- ADR-0011 (`docs/adr/0011-canonical-message-additive-discipline.md`)
+  amending ADR-0007 with categories (iv) and (v) and clarifying that
+  (iii) covers `#[cfg(test)]` item modification.
+
+### Changed (BREAKING — semantic)
+
+- `anthropic_messages` frontend no longer rejects `messages` array
+  entries with `role:"system"`. Leading-run system entries fold into
+  the session-level `system` vec (after any top-level `system` field
+  entries); later entries become positional
+  `Message{role: System, source: Some(AnthropicSystem)}`.
+- `openai_chat` and `openai_responses` frontends preserve
+  mid-conversation `system` / `developer` messages instead of folding
+  ALL of them to top-level system. Only the leading run is folded;
+  later entries are positional
+  `Message{role: System, source: Some(...)}`.
+- `anthropic` and `oai_chat_wire` providers emit positional
+  `Message{role: System}` at the original index inside the outbound
+  `messages` array (`role:"system"` or `role:"developer"` per
+  `source`).
+- `openai_compatible` Responses provider and `gemini` provider collapse
+  positional system messages into top-level `instructions` /
+  `systemInstruction` with a `tracing::debug` log noting the position
+  loss.
+
+### Fixed
+
+- Claude Code → `claude-opus-4-8` requests with SessionStart hook
+  injection (a tail-positioned `role:"system"` message in the
+  `messages` array) now decode successfully. Previously the
+  `anthropic_messages` frontend rejected the request with HTTP 400
+  `unknown role: system`.
+
+### Frozen-core hunk classification (per ADR-0007 §(b) + ADR-0011)
+
+| Hunk | File | Category |
+|------|------|----------|
+| `MessageRole` adds `System` variant | `crates/core/src/message.rs` | (iv) |
+| `Message` adds `source: Option<SystemSource>` + `Message::system(...)` constructor | `crates/core/src/message.rs` | (v) |
+| `role_to_anthropic` adds `System => "system"` arm | `crates/core/src/mapping/anthropic_wire.rs` | (iv) — atomic dispatch update per ADR-0011 (iv) invariant 3 |
+| `role_from_anthropic` adds `"system" => Some(System)` arm | `crates/core/src/mapping/anthropic_wire.rs` | (iv) — atomic dispatch update per ADR-0011 (iv) invariant 3 |
+| `role_unknown_returns_none` test renamed & flipped (now `role_system_string_decodes_to_system_variant`); new `role_unknown_returns_none` against `"human"` | `crates/core/src/mapping/anthropic_wire.rs` | (iii) per ADR-0011 scope clarification |
+| `proptest_roundtrip.rs` extends `arb_message_role` to cover `System` + adds `arb_system_source` | `crates/core/tests/proptest_roundtrip.rs` | (iii) |
+
+### Rollback
+
+Revert to v0.9.x. No data layer migration, no config changes — safe.
+
 ## [0.9.0] — 2026-05-29
 
 Unified admission module + accepted rate-limit reservation asymmetry,

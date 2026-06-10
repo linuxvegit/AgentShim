@@ -421,7 +421,10 @@ mod tests {
         let mut req = empty_request();
         req.messages = vec![
             Message::user(vec![ContentBlock::text("a")]),
-            Message::system(SystemSource::OpenAiSystem, vec![ContentBlock::text("mid hint")]),
+            Message::system(
+                SystemSource::OpenAiSystem,
+                vec![ContentBlock::text("mid hint")],
+            ),
             Message::user(vec![ContentBlock::text("b")]),
         ];
         let body = build(&req, &target());
@@ -430,7 +433,10 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         for item in input {
             let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            assert!(role != "system" && role != "developer", "input contained system: {item}");
+            assert!(
+                role != "system" && role != "developer",
+                "input contained system: {item}"
+            );
         }
     }
 
@@ -443,7 +449,10 @@ mod tests {
         });
         req.messages = vec![
             Message::user(vec![ContentBlock::text("a")]),
-            Message::system(SystemSource::OpenAiSystem, vec![ContentBlock::text("mid hint")]),
+            Message::system(
+                SystemSource::OpenAiSystem,
+                vec![ContentBlock::text("mid hint")],
+            ),
             Message::user(vec![ContentBlock::text("b")]),
         ];
         let body = build(&req, &target());

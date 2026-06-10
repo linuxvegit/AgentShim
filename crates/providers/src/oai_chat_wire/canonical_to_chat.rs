@@ -752,7 +752,10 @@ mod tests {
         let body = build(&req, &target("m"), false);
         assert_eq!(body.messages.len(), 4);
         assert_eq!(body.messages[0].role, "system");
-        assert_eq!(body.messages[0].content, Some(serde_json::json!("standing")));
+        assert_eq!(
+            body.messages[0].content,
+            Some(serde_json::json!("standing"))
+        );
         assert_eq!(body.messages[1].role, "user");
         assert_eq!(body.messages[2].role, "system");
         assert_eq!(body.messages[2].content, Some(serde_json::json!("mid")));
