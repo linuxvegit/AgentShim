@@ -63,6 +63,12 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
     let mut system: Vec<SystemInstruction> = Vec::new();
     let mut messages: Vec<Message> = Vec::new();
 
+    // Prelude-fold rule (2026-06-10 spec §3.2): the contiguous leading run of
+    // role:"system" / "developer" messages folds into the session-level
+    // `system` vec. The first non-system message ends the prelude; any later
+    // system/developer message becomes a positional `Message{role:System}`
+    // with `source` preserved (OpenAiSystem vs OpenAiDeveloper).
+    let mut prelude_phase = true;
     for inbound in req.messages {
         let role_class = role_to_canonical(&inbound.role)
             .ok_or_else(|| FrontendError::InvalidBody(format!("unknown role: {}", inbound.role)))?;
@@ -94,14 +100,24 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
         };
 
         match role_class {
-            RoleClass::System(source) => {
+            RoleClass::System(source) if prelude_phase => {
                 system.push(SystemInstruction {
                     source,
                     content: text_content,
                 });
             }
+            RoleClass::System(source) => {
+                messages.push(Message {
+                    role: MessageRole::System,
+                    content: text_content,
+                    name: inbound.name,
+                    source: Some(source),
+                    extensions: ExtensionMap::new(),
+                });
+            }
 
             RoleClass::Message(MessageRole::Tool) => {
+                prelude_phase = false;
                 // Tool result message — wrap in ToolResult content block
                 let tool_call_id = inbound.tool_call_id.ok_or_else(|| {
                     FrontendError::InvalidBody("tool message missing tool_call_id".into())
@@ -126,6 +142,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
             }
 
             RoleClass::Message(role) => {
+                prelude_phase = false;
                 // Build content from text parts plus any tool_calls on assistant turns
                 let mut content = text_content;
 
@@ -246,6 +263,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_shim_core::message::SystemSource;
     use agent_shim_core::tool::ToolChoice;
 
     fn minimal(extra: &str) -> Vec<u8> {
@@ -504,5 +522,100 @@ mod tests {
         let req = decode(body).expect("decodes");
         let r = req.generation.reasoning.expect("reasoning set");
         assert_eq!(r.effort, Some(ReasoningEffort::Max));
+    }
+
+    // ── prelude_phase fold (2026-06-10 spec §3.2) ──────────────────────
+
+    #[test]
+    fn openai_decode_first_system_folds_to_top_level() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"system","content":"You are concise."},
+                {"role":"user","content":"hi"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 1);
+        assert_eq!(req.system[0].source, SystemSource::OpenAiSystem);
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn openai_decode_developer_at_start_folds_with_source() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"developer","content":"Be terse."},
+                {"role":"user","content":"hi"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 1);
+        assert_eq!(req.system[0].source, SystemSource::OpenAiDeveloper);
+    }
+
+    #[test]
+    fn openai_decode_consecutive_prelude_systems_all_in_top_level() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"system","content":"A"},
+                {"role":"system","content":"B"},
+                {"role":"user","content":"go"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 2);
+        assert!(req.messages.iter().all(|m| m.role != MessageRole::System));
+    }
+
+    #[test]
+    fn openai_decode_mid_system_preserved_in_messages() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"user","content":"a"},
+                {"role":"system","content":"shift"},
+                {"role":"user","content":"b"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert!(req.system.is_empty());
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[1].role, MessageRole::System);
+        assert_eq!(req.messages[1].source, Some(SystemSource::OpenAiSystem));
+    }
+
+    #[test]
+    fn openai_decode_developer_in_middle_preserved_with_source() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"user","content":"a"},
+                {"role":"developer","content":"hint"},
+                {"role":"user","content":"b"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages[1].role, MessageRole::System);
+        assert_eq!(req.messages[1].source, Some(SystemSource::OpenAiDeveloper));
+    }
+
+    #[test]
+    fn openai_decode_system_after_assistant_preserved() {
+        let body = br#"{
+            "model":"gpt-4o",
+            "messages":[
+                {"role":"user","content":"a"},
+                {"role":"assistant","content":"b"},
+                {"role":"system","content":"continue politely"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert!(req.system.is_empty());
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[2].role, MessageRole::System);
     }
 }
