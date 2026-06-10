@@ -14,18 +14,17 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
         "stream": req.stream,
     });
 
-    // Instructions from system messages
-    let instructions: Vec<String> = req
+    // Instructions (collected from req.system; mid-conv System messages
+    // appended after the loop — spec §4.3).
+    let mut instructions: Vec<String> = req
         .system
         .iter()
         .map(|s| extract_text(&s.content))
         .collect();
-    if !instructions.is_empty() {
-        body["instructions"] = Value::String(instructions.join("\n"));
-    }
 
     // Input items
     let mut input: Vec<Value> = Vec::new();
+    let mut mid_conv_systems: Vec<String> = Vec::new();
 
     for msg in &req.messages {
         let role = match msg.role {
@@ -45,6 +44,21 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
                             "output": output,
                         }));
                     }
+                }
+                continue;
+            }
+            MessageRole::System => {
+                // Responses API has no in-position system message shape.
+                // Downgrade: collect text and append to top-level
+                // instructions after the message loop (spec §4.3).
+                let text = extract_text(&msg.content);
+                if !text.is_empty() {
+                    tracing::debug!(
+                        source = ?msg.source,
+                        "openai_responses provider: mid-conversation system message \
+                         collapsed to top-level instructions (position lost)"
+                    );
+                    mid_conv_systems.push(text);
                 }
                 continue;
             }
@@ -97,6 +111,12 @@ pub fn build(req: &CanonicalRequest, target: &BackendTarget) -> Value {
     }
 
     body["input"] = Value::Array(input);
+
+    // Assemble final instructions field (after collecting mid-conv).
+    instructions.extend(mid_conv_systems);
+    if !instructions.is_empty() {
+        body["instructions"] = Value::String(instructions.join("\n"));
+    }
 
     // Tools — both function tools and built-in tools
     let mut tools_arr: Vec<Value> = req
@@ -274,7 +294,7 @@ mod tests {
     use super::*;
     use agent_shim_core::{
         request::ReasoningEffort, ExtensionMap, FrontendInfo, FrontendKind, FrontendModel,
-        GenerationOptions, Message, RequestId,
+        GenerationOptions, Message, RequestId, SystemInstruction, SystemSource,
     };
 
     fn target() -> BackendTarget {
@@ -392,5 +412,54 @@ mod tests {
         req.resolved_policy.reasoning_effort = Some(ReasoningEffort::Max);
         let body = build(&req, &target());
         assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    // ── positional MessageRole::System collapse (spec §4.3) ───────────
+
+    #[test]
+    fn responses_mid_conv_system_collapses_to_instructions() {
+        let mut req = empty_request();
+        req.messages = vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message::system(SystemSource::OpenAiSystem, vec![ContentBlock::text("mid hint")]),
+            Message::user(vec![ContentBlock::text("b")]),
+        ];
+        let body = build(&req, &target());
+        assert_eq!(body["instructions"], "mid hint");
+        // Input array MUST NOT contain a system/developer item.
+        let input = body["input"].as_array().unwrap();
+        for item in input {
+            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(role != "system" && role != "developer", "input contained system: {item}");
+        }
+    }
+
+    #[test]
+    fn responses_top_level_and_mid_conv_systems_concatenate_in_order() {
+        let mut req = empty_request();
+        req.system.push(SystemInstruction {
+            source: SystemSource::OpenAiSystem,
+            content: vec![ContentBlock::text("standing")],
+        });
+        req.messages = vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message::system(SystemSource::OpenAiSystem, vec![ContentBlock::text("mid hint")]),
+            Message::user(vec![ContentBlock::text("b")]),
+        ];
+        let body = build(&req, &target());
+        // Top-level system vec entries first, then positional in message order.
+        assert_eq!(body["instructions"], "standing\nmid hint");
+    }
+
+    #[test]
+    fn responses_empty_system_message_text_skipped_in_collapse() {
+        let mut req = empty_request();
+        req.messages = vec![
+            Message::user(vec![ContentBlock::text("a")]),
+            Message::system(SystemSource::OpenAiSystem, vec![]),
+        ];
+        let body = build(&req, &target());
+        // Nothing collapsed; instructions absent or empty.
+        assert!(body.get("instructions").is_none() || body["instructions"] == "");
     }
 }
