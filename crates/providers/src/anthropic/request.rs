@@ -513,6 +513,45 @@ mod tests {
     }
 
     #[test]
+    fn system_role_message_emits_role_system_in_messages() {
+        let mut req = empty_request(false);
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("hi")]));
+        req.messages.push(Message::system(
+            SystemSource::AnthropicSystem,
+            vec![ContentBlock::text("hook")],
+        ));
+        let body = build(&req, &target());
+        assert_eq!(body["messages"][1]["role"], "system");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][1]["content"][0]["text"], "hook");
+    }
+
+    #[test]
+    fn top_level_system_and_messages_system_both_emit() {
+        let mut req = empty_request(false);
+        req.system.push(SystemInstruction {
+            source: SystemSource::AnthropicSystem,
+            content: vec![ContentBlock::text("Standing X")],
+        });
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("a")]));
+        req.messages.push(Message::system(
+            SystemSource::AnthropicSystem,
+            vec![ContentBlock::text("Mid Y")],
+        ));
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("b")]));
+        let body = build(&req, &target());
+
+        assert_eq!(body["system"], "Standing X");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][1]["role"], "system");
+        assert_eq!(body["messages"][1]["content"][0]["text"], "Mid Y");
+        assert_eq!(body["messages"][2]["role"], "user");
+    }
+
+    #[test]
     fn tool_use_and_tool_result_round_trip() {
         let mut req = empty_request(false);
         req.messages
