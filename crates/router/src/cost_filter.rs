@@ -288,6 +288,7 @@ mod tests {
                     extensions: ExtensionMap::new(),
                 })],
                 name: None,
+                source: None,
                 extensions: ExtensionMap::new(),
             }],
             tools: vec![],

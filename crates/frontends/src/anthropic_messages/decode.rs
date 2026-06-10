@@ -75,6 +75,7 @@ pub fn decode_request(req: MessagesRequest) -> Result<CanonicalRequest, Frontend
                 role,
                 content,
                 name: None,
+                source: None,
                 extensions: ExtensionMap::new(),
             })
         })

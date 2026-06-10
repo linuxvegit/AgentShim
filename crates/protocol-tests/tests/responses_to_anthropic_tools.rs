@@ -96,6 +96,7 @@ fn make_tool_history_request() -> CanonicalRequest {
                     extensions: ExtensionMap::new(),
                 })],
                 name: None,
+                source: None,
                 extensions: ExtensionMap::new(),
             },
             // 3. Tool returned a result for the prior call.
@@ -108,6 +109,7 @@ fn make_tool_history_request() -> CanonicalRequest {
                     extensions: ExtensionMap::new(),
                 })],
                 name: None,
+                source: None,
                 extensions: ExtensionMap::new(),
             },
         ],

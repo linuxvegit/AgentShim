@@ -540,6 +540,7 @@ mod tests {
             role: MessageRole::User,
             content: vec![block],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         };
         let mut req = make_base_request();
@@ -556,6 +557,7 @@ mod tests {
             role: MessageRole::Assistant,
             content: vec![block],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         };
         let mut req = make_base_request();
@@ -622,6 +624,7 @@ mod tests {
             role: MessageRole::User,
             content: vec![image_block.clone()],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         }];
 

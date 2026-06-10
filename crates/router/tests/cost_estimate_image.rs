@@ -44,6 +44,7 @@ fn req_with_text_and_image(text: &str) -> CanonicalRequest {
                 }),
             ],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         }],
         tools: vec![],

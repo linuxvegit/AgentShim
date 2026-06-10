@@ -528,6 +528,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         req.messages.push(Message {
@@ -539,6 +540,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -651,6 +653,7 @@ mod tests {
                 extensions: ext,
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -676,6 +679,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -702,6 +706,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -729,6 +734,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -756,6 +762,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -787,6 +794,7 @@ mod tests {
                 }),
             ],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -808,6 +816,7 @@ mod tests {
                 extensions: ext,
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -849,6 +858,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());
@@ -869,6 +879,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let body = build(&req, &target());

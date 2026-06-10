@@ -120,6 +120,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
                         extensions: ExtensionMap::new(),
                     })],
                     name: inbound.name,
+                    source: None,
                     extensions: ExtensionMap::new(),
                 });
             }
@@ -143,6 +144,7 @@ pub fn decode(body: &[u8]) -> Result<CanonicalRequest, FrontendError> {
                     role,
                     content,
                     name: inbound.name,
+                    source: None,
                     extensions: ExtensionMap::new(),
                 });
             }

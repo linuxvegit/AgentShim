@@ -145,6 +145,7 @@ fn decode_input(
                 role: MessageRole::User,
                 content: vec![ContentBlock::text(text)],
                 name: None,
+                source: None,
                 extensions: ExtensionMap::new(),
             }],
         )),
@@ -183,6 +184,7 @@ fn decode_messages(
                     role,
                     content,
                     name: None,
+                    source: None,
                     extensions: ExtensionMap::new(),
                 });
             }
@@ -227,6 +229,7 @@ fn decode_items(
                         role: msg_role,
                         content: blocks,
                         name: None,
+                        source: None,
                         extensions: ExtensionMap::new(),
                     });
                 }
@@ -262,6 +265,7 @@ fn decode_items(
                         extensions: ExtensionMap::new(),
                     })],
                     name: None,
+                    source: None,
                     extensions: ExtensionMap::new(),
                 });
             }
@@ -278,6 +282,7 @@ fn decode_items(
                         extensions: ExtensionMap::new(),
                     })],
                     name: None,
+                    source: None,
                     extensions: ExtensionMap::new(),
                 });
             }
@@ -305,6 +310,7 @@ fn decode_items(
                             role: MessageRole::Assistant,
                             content: vec![block],
                             name: None,
+                            source: None,
                             extensions: ExtensionMap::new(),
                         });
                     }

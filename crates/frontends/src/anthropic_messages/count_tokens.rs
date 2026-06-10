@@ -153,6 +153,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         }
     }
@@ -222,6 +223,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let serialized = serde_json::to_string(&args).unwrap();
@@ -243,6 +245,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let serialized = serde_json::to_string(&content).unwrap();
@@ -261,6 +264,7 @@ mod tests {
                 extensions: ExtensionMap::new(), // signature lives here, must NOT be counted
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let expected = count_text("thinking aloud") + PER_REASONING + PER_MESSAGE;
@@ -279,6 +283,7 @@ mod tests {
                 extensions: ExtensionMap::new(),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let expected = (blob.len() as u32 / 4) + PER_REASONING + PER_MESSAGE;
@@ -296,6 +301,7 @@ mod tests {
                 raw: serde_json::json!({"type":"image","source":{"type":"base64","data":"aGVsbG8="}}),
             })],
             name: None,
+            source: None,
             extensions: ExtensionMap::new(),
         });
         let expected = PER_IMAGE + PER_MESSAGE;

@@ -24,6 +24,7 @@ fn arb_message() -> impl Strategy<Value = Message> {
         role,
         content,
         name: None,
+        source: None,
         extensions: ExtensionMap::new(),
     })
 }

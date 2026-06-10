@@ -122,6 +122,7 @@ mod tests {
                 extensions: Default::default(),
             })],
             name: None,
+            source: None,
             extensions: Default::default(),
         };
         let messages = vec![
