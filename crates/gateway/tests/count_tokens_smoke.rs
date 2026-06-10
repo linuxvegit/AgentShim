@@ -117,7 +117,11 @@ async fn unknown_role_returns_400() {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "model": "m",
-        "messages": [{"role":"system","content":"hi"}]  // 'system' is not a valid Anthropic role
+        // 'human' is not a valid Anthropic role (cf. 'user'/'assistant'/
+        // 'system'). Note: 'system' became valid in the 2026-06-10 spec
+        // when positional system messages were authorised, so this test
+        // now uses 'human' to keep the unknown-role regression intact.
+        "messages": [{"role":"human","content":"hi"}]
     });
     let resp = client
         .post(format!("{}/v1/messages/count_tokens", base))
