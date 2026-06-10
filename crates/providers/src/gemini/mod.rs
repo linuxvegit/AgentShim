@@ -16,7 +16,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod endpoint;
-pub(crate) mod request;
+pub mod request;
 pub(crate) mod response;
 pub(crate) mod stream;
 pub(crate) mod wire;

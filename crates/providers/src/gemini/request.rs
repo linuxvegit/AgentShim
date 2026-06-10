@@ -93,6 +93,15 @@ use super::wire::{
     GenerationConfig, InlineData, Part, ThinkingConfig, Tool,
 };
 
+/// Build the outbound Gemini request body as a `serde_json::Value`.
+///
+/// Public wrapper around [`build`] for callers outside the providers crate
+/// (e.g. integration tests in `crates/protocol-tests/`). Returns JSON so the
+/// crate's internal wire types stay `pub(crate)`.
+pub fn build_json(req: &CanonicalRequest, target: &BackendTarget) -> serde_json::Value {
+    serde_json::to_value(build(req, target)).unwrap_or_default()
+}
+
 /// Build a Gemini `:generateContent` / `:streamGenerateContent` request body
 /// from a canonical request.
 pub(crate) fn build(req: &CanonicalRequest, _target: &BackendTarget) -> GenerateContentRequest {

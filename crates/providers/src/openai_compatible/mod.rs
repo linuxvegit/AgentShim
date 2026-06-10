@@ -1,4 +1,4 @@
-pub(crate) mod responses_api;
+pub mod responses_api;
 
 use std::time::Duration;
 
