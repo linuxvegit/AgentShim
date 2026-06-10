@@ -159,21 +159,49 @@ fn decode_messages(
 ) -> Result<(Vec<SystemInstruction>, Vec<Message>), FrontendError> {
     let mut system = Vec::new();
     let mut out = Vec::new();
+    // Prelude-fold rule (2026-06-10 spec §3.3): the contiguous leading run of
+    // role:"system" / "developer" entries folds into the session-level
+    // `system` vec. The first non-system entry ends the prelude; any later
+    // system/developer entry becomes a positional `Message{role:System}` with
+    // `source` preserved (OpenAiSystem vs OpenAiDeveloper). Note: the
+    // top-level `instructions` field is already pushed to `system` by the
+    // caller before this helper runs; the leading-run append concatenates
+    // after it.
+    let mut prelude_phase = true;
     for msg in msgs {
         match msg.role.as_str() {
-            "system" => {
+            "system" if prelude_phase => {
                 system.push(SystemInstruction {
                     source: SystemSource::OpenAiSystem,
                     content: decode_message_content(msg.content),
                 });
             }
-            "developer" => {
+            "system" => {
+                out.push(Message {
+                    role: MessageRole::System,
+                    content: decode_message_content(msg.content),
+                    name: None,
+                    source: Some(SystemSource::OpenAiSystem),
+                    extensions: ExtensionMap::new(),
+                });
+            }
+            "developer" if prelude_phase => {
                 system.push(SystemInstruction {
                     source: SystemSource::OpenAiDeveloper,
                     content: decode_message_content(msg.content),
                 });
             }
+            "developer" => {
+                out.push(Message {
+                    role: MessageRole::System,
+                    content: decode_message_content(msg.content),
+                    name: None,
+                    source: Some(SystemSource::OpenAiDeveloper),
+                    extensions: ExtensionMap::new(),
+                });
+            }
             "user" | "assistant" => {
+                prelude_phase = false;
                 let role = if msg.role == "user" {
                     MessageRole::User
                 } else {
@@ -203,22 +231,47 @@ fn decode_items(
 ) -> Result<(Vec<SystemInstruction>, Vec<Message>), FrontendError> {
     let mut system = Vec::new();
     let mut out = Vec::new();
+    // Prelude-fold rule (2026-06-10 spec §3.3): mirrors `decode_messages`.
+    // Any non-system input item — message, function_call, function_call_output,
+    // reasoning, or the forward-compat `Other` catch-all — ends the prelude
+    // window. Later system/developer message items become positional
+    // `Message{role:System}` with `source` preserved.
+    let mut prelude_phase = true;
     for item in items {
         match item {
             InputItem::Message { role, content } => match role.as_str() {
-                "system" => {
+                "system" if prelude_phase => {
                     system.push(SystemInstruction {
                         source: SystemSource::OpenAiSystem,
                         content: decode_message_content(content),
                     });
                 }
-                "developer" => {
+                "system" => {
+                    out.push(Message {
+                        role: MessageRole::System,
+                        content: decode_message_content(content),
+                        name: None,
+                        source: Some(SystemSource::OpenAiSystem),
+                        extensions: ExtensionMap::new(),
+                    });
+                }
+                "developer" if prelude_phase => {
                     system.push(SystemInstruction {
                         source: SystemSource::OpenAiDeveloper,
                         content: decode_message_content(content),
                     });
                 }
+                "developer" => {
+                    out.push(Message {
+                        role: MessageRole::System,
+                        content: decode_message_content(content),
+                        name: None,
+                        source: Some(SystemSource::OpenAiDeveloper),
+                        extensions: ExtensionMap::new(),
+                    });
+                }
                 "user" | "assistant" => {
+                    prelude_phase = false;
                     let msg_role = if role == "user" {
                         MessageRole::User
                     } else {
@@ -245,6 +298,7 @@ fn decode_items(
                 name,
                 arguments,
             } => {
+                prelude_phase = false;
                 // `arguments` can arrive as either a JSON-encoded string
                 // (spec-canonical) or as a structured value (codex 0.5+
                 // sometimes emits the object directly). Normalize: if it's
@@ -270,6 +324,7 @@ fn decode_items(
                 });
             }
             InputItem::FunctionCallOutput { call_id, output } => {
+                prelude_phase = false;
                 out.push(Message {
                     role: MessageRole::Tool,
                     content: vec![ContentBlock::ToolResult(ToolResultBlock {
@@ -296,6 +351,7 @@ fn decode_items(
             InputItem::Reasoning {
                 summary, content, ..
             } => {
+                prelude_phase = false;
                 let text = extract_reasoning_text(content, summary);
                 let block = ContentBlock::Reasoning(ReasoningBlock {
                     text,
@@ -319,8 +375,14 @@ fn decode_items(
             // Forward-compatibility catch-all (see `InputItem::Other` doc in
             // wire.rs). The canonical model can't express these items, so
             // we drop them on the canonical chain walk; the byte-passthrough
-            // path still forwards the original body verbatim.
-            InputItem::Other => continue,
+            // path still forwards the original body verbatim. We do still
+            // end the prelude window here: an unknown item might be
+            // content-bearing, so the next system/developer message is
+            // unlikely to be a session-level standing instruction.
+            InputItem::Other => {
+                prelude_phase = false;
+                continue;
+            }
         }
     }
     Ok((system, out))
@@ -1018,5 +1080,77 @@ mod tests {
         let req = decode(body).expect("decodes");
         let r = req.generation.reasoning.expect("reasoning set");
         assert_eq!(r.effort, Some(ReasoningEffort::Max));
+    }
+
+    // ── prelude_phase fold (2026-06-10 spec §3.3) ──────────────────────
+
+    #[test]
+    fn responses_decode_input_first_system_folds_when_no_instructions() {
+        let body = br#"{
+            "model":"gpt-5",
+            "input":[
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"A"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 1);
+        assert!(req.messages.iter().all(|m| m.role != MessageRole::System));
+    }
+
+    #[test]
+    fn responses_decode_instructions_and_leading_input_system_concatenate() {
+        let body = br#"{
+            "model":"gpt-5",
+            "instructions":"Standing X",
+            "input":[
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"Leading Y"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 2);
+        match &req.system[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Standing X"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &req.system[1].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Leading Y"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    #[test]
+    fn responses_decode_input_mid_system_preserved() {
+        let body = br#"{
+            "model":"gpt-5",
+            "instructions":"Standing X",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"a"}]},
+                {"type":"message","role":"system","content":[{"type":"input_text","text":"mid"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"b"}]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 1);
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[1].role, MessageRole::System);
+        assert_eq!(req.messages[1].source, Some(SystemSource::OpenAiSystem));
+    }
+
+    #[test]
+    fn responses_decode_input_developer_round_trips_with_source() {
+        let body = br#"{
+            "model":"gpt-5",
+            "input":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"a"}]},
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"dev"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"b"}]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages[1].role, MessageRole::System);
+        assert_eq!(req.messages[1].source, Some(SystemSource::OpenAiDeveloper));
     }
 }
