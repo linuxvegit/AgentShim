@@ -35,10 +35,36 @@ After this change:
 
 ### Non-Goals
 
-1. Do NOT implement Anthropic's `mid_conv_system` content block form.
-   Anthropic upstream currently accepts both `role:"system"` messages and
-   `mid_conv_system` blocks; we pick the former because Claude Code emits
-   it that way and it minimises translation.
+1. Do NOT implement Anthropic's `mid_conv_system` content block form
+   for outbound encoding.
+
+   Rationale:
+   - Claude Code (Anthropic's own first-party client) emits
+     `role:"system"` messages, not `mid_conv_system` blocks. Following
+     ecosystem behaviour is safer than diverging from it.
+   - Anthropic provider implementation effort is near-zero with
+     `role:"system"` (Section 4.1); switching to `mid_conv_system`
+     blocks would require extending `OutgoingContentBlock`, splitting a
+     positional System message into "a block inserted at the head of
+     the next user/assistant message's content array", AND handling
+     tail-positioned system messages (the actual dump we're fixing) that
+     have no following message to attach to.
+   - The canonical model (`Message{role: System}`) is decoupled from
+     the wire shape. If Anthropic deprecates `role:"system"` later, the
+     switch is localised to `crates/providers/src/anthropic/request.rs`
+     — no canonical, frontend, or other-provider changes needed.
+
+   Future triggers to revisit:
+   1. Anthropic API docs explicitly deprecate `role:"system"` inside
+      the `messages` array.
+   2. Claude Code client switches to emitting `mid_conv_system` content
+      blocks instead of `role:"system"` messages.
+   3. Any production Anthropic upstream begins rejecting `role:"system"`
+      in the `messages` array with a non-tolerance error.
+
+   If any trigger fires, open a follow-up spec that re-encodes
+   `Message{role: System}` to `mid_conv_system` blocks in the Anthropic
+   provider only.
 2. Do NOT expose a canonical-level toggle that lets clients opt out of the
    new semantics. The semantic upgrade ships all at once.
 3. Do NOT change how providers render the existing top-level
@@ -51,6 +77,13 @@ After this change:
    shares the `anthropic_messages` decoder and is naturally covered.
 
 ## 2. Canonical Model Changes
+
+> **Frozen-core authorisation**: changes in this section are governed
+> by [ADR-0011](../../adr/0011-canonical-message-additive-discipline.md),
+> which amends ADR-0007 §(a) by adding categories (iv) "internal-only
+> role-class enum variant" and (v) "safe additive optional field on a
+> conversation/protocol struct". Each hunk's classification appears in
+> the table at the end of this section.
 
 ### 2.1 `MessageRole::System`
 
@@ -192,22 +225,37 @@ the frontend decoder's responsibility (Section 3).
   `source: None`. Pure mechanical fix — exact count is compiler-driven
   after the struct change lands.
 
+### 2.8 Hunk classification (ADR-0007 §(b) requirement)
+
+Every `crates/core/` diff hunk in v0.10.0 is classified below per
+ADR-0007 §(b), using the extended category list from ADR-0011 §(iv) /
+(v) / clarified (iii):
+
+| Hunk | File | Category |
+|------|------|----------|
+| `MessageRole` adds `System` variant | `crates/core/src/message.rs` | (iv) |
+| `Message` adds `source: Option<SystemSource>` + `Message::system(...)` constructor | `crates/core/src/message.rs` | (v) |
+| `role_to_anthropic` adds `MessageRole::System => "system"` arm | `crates/core/src/mapping/anthropic_wire.rs` | (iv) — atomic dispatch update per ADR-0011 (iv) invariant 3 |
+| `role_from_anthropic` adds `"system" => Some(MessageRole::System)` arm | `crates/core/src/mapping/anthropic_wire.rs` | (iv) — atomic dispatch update per ADR-0011 (iv) invariant 3 |
+| `role_unknown_returns_none` test renamed and assertion flipped (becomes `role_system_returns_system_role`); a new `role_unknown_returns_none` against `"human"` replaces the lost coverage | `crates/core/src/mapping/anthropic_wire.rs` | (iii) per ADR-0011 scope clarification |
+| `proptest_roundtrip.rs` extends `arb_message_role` to cover `System` | `crates/core/tests/proptest_roundtrip.rs` | (iii) |
+
+The same table will appear in `CHANGELOG.md` under `[0.10.0]`.
+
 ## 3. Frontend Decoder Rules
 
-Shared principle:
+Shared principle (all three frontends):
 
-> For frontends whose protocol uses **only** the `messages` array to carry
-> system instructions (OpenAI Chat, OpenAI Responses without
-> `instructions`), a leading run of `system` / `developer` messages folds
-> into `Vec<SystemInstruction>` (session-level standing). The first
+> A leading run of `system` / `developer` messages folds into
+> `Vec<SystemInstruction>` (session-level standing). The first
 > message that is NOT system/developer ends the prelude. Any later
 > system/developer becomes `Message{role: System}` in place.
 >
-> For frontends that have a **dedicated top-level system field**
-> (Anthropic `system`, OpenAI Responses `instructions`), that field
-> alone fills the session-level slot. Any system message inside the
-> `messages` array is positional from the start — no leading-run
-> folding.
+> Frontends that also carry a top-level system field (Anthropic
+> `system`, OpenAI Responses `instructions`) first push that field's
+> content into the session-level vec, then run the prelude_phase
+> walk over the messages/input array. Top-level field entries come
+> first; leading-run messages append after.
 
 "Leading run" definition: the contiguous prefix of system/developer
 messages at the start of the `messages` array, before any user / assistant
@@ -226,17 +274,30 @@ New rule:
 
 1. Top-level `system` field, if present, becomes
    `Vec<SystemInstruction>{source: AnthropicSystem}` (current behaviour).
-2. Iterate `messages`:
-   - `"system"` → `Message{role: System, source: Some(AnthropicSystem),
-     content: decode_content(...)}`.
-   - `"user"` / `"assistant"` → existing path.
+2. Iterate `messages` with `prelude_phase` logic identical to
+   `openai_chat`:
+   - A leading run of `role:"system"` messages folds into
+     `Vec<SystemInstruction>{source: AnthropicSystem}` and joins any
+     entries already produced by step 1. The first non-system message
+     ends the prelude.
+   - Any later `role:"system"` becomes
+     `Message{role: System, source: Some(AnthropicSystem), content: ...}`.
+   - `"user"` / `"assistant"` follow the existing path.
    - Anything else → `FrontendError::InvalidBody(format!("unknown role:
      {}", role))`.
 
-Note: There is no prelude_phase logic here because the top-level `system`
-field already occupies the "session-level" role; a `role:"system"` in the
-`messages` array is always positional. If a client puts the standing
-instruction in both places, both are faithfully preserved.
+Rationale for prelude folding: "leading run = session-level standing"
+captures client intent, not protocol convention. A client that puts the
+opening instruction in `messages[0]` instead of the top-level `system`
+field still means it as session-level; the canonical model should
+represent it that way. A client that fills both — top-level
+`system:"X"` plus `messages[0] role:"system",content:"Y"` — gets both
+entries appended to the session-level vec in that order
+(see OQ4: no dedup).
+
+This matches the rule applied by `openai_chat` and `openai_responses`
+frontends in Sections 3.2 and 3.3 — all three inbound paths produce the
+same canonical shape for the same wire shape.
 
 `InboundMessageContent` decoding is unchanged — `Text` and `Blocks` both
 work; `inbound_block_to_canonical` handles `cache_control` extensions and
@@ -306,14 +367,19 @@ Input shape: OpenAI Responses has two system entry points:
 
 New rule:
 
-1. Top-level `instructions`, if present, becomes
+1. Top-level `instructions`, if present, is pushed first into
    `Vec<SystemInstruction>{source: OpenAiSystem}` (current behaviour).
-2. Iterate `input` with prelude_phase logic identical to `openai_chat`,
-   with one twist:
-   - **If `req.instructions` is present, prelude_phase starts as
-     `false`** — top-level instructions already filled the session-level
-     slot, so any `system` in `input` is positional.
-   - Otherwise prelude_phase starts as `true` (leading run folds).
+2. Iterate `input` with prelude_phase logic identical to `openai_chat` /
+   `anthropic_messages`:
+   - Leading run of system/developer appends to the same session-level
+     vec, after the entry from step 1.
+   - First non-system message ends the prelude; later system/developer
+     becomes `Message{role: System}` in place.
+
+This matches Section 3.1 and 3.2 exactly — three frontends, one rule:
+top-level system fields and a leading run of `messages`-array system
+messages both fold into the session-level vec; everything after the
+first non-system message stays positional.
 
 ### 3.4 `anthropic_messages::count_tokens`
 
@@ -324,12 +390,13 @@ decoder upgrade carries through.
 
 | Input | Result |
 |---|---|
-| Empty system content (`content: []`) | Preserved as `Message{role: System, content: vec![]}`. Provider decides wire shape. |
-| Adjacent system messages `[user, system, system, user]` | Each preserved independently; no merging. |
-| `[system, system, user]` | Both fold into prelude vec. |
-| `[user, system]` (tail system) | `user` into messages, `system` into messages tail. |
-| `[system, user, system, user]` | First into prelude vec, second into messages. |
-| Anthropic top-level `system` + messages-array `system` | Both preserved; no dedup. |
+| Empty system content (`content: []`) | Preserved as `Message{role: System, content: vec![]}` if positional, or `SystemInstruction` with empty content if prelude. Provider decides wire shape. |
+| Adjacent system messages mid-conversation `[user, system, system, user]` | Both system entries preserved independently as `Message{role: System}`; no merging. |
+| `[system, system, user]` | Both fold into prelude vec (leading run). |
+| `[user, system]` (tail system) | `user` ends the prelude on the first iteration; trailing `system` becomes `Message{role: System}`. |
+| `[system, user, system, user]` | First `system` folds into prelude vec; second is positional. |
+| Anthropic top-level `system:"X"` + `messages: [{role:"system",content:"Y"}, {role:"user",...}]` | Both `X` and `Y` fold into the session-level vec, in that order (top-level field first, then leading-run entries). |
+| OpenAI Responses `instructions:"X"` + input prefix `[{role:"system",content:"Y"}, {role:"user",...}]` | Both `X` and `Y` fold into the session-level vec. |
 
 ### 3.6 Impact
 
@@ -588,11 +655,19 @@ Combined: ~200–250 lines across the four providers (tests included).
 
 `anthropic_messages/decode.rs`:
 
-- `decode_system_role_in_messages_yields_system_message`.
-- `decode_system_role_at_start_of_messages` — Anthropic frontend does NOT
-  fold to top vec; the entry stays at `messages[0]`.
+- `decode_system_role_in_messages_yields_system_message` — middle/tail
+  position remains as `Message{role: System}`.
+- `decode_leading_system_in_messages_folds_to_top_level` — leading run
+  in `messages` array appends to the session-level vec just like
+  `openai_chat`.
+- `decode_top_level_system_and_leading_messages_system_concatenate` —
+  top-level `system:"X"` plus `messages:[{role:"system",content:"Y"},
+  {role:"user",...}]` yields `system: [SI("X"), SI("Y")]`, messages
+  starts at the user.
 - `decode_system_with_blocks_content_yields_text_blocks`.
-- `decode_top_level_system_and_messages_system_coexist`.
+- `decode_top_level_system_and_mid_messages_system_coexist` — top-level
+  `system:"X"` plus `messages:[user, system, user]` yields `system:
+  [SI("X")]` and `messages[1].role == System`.
 - Delete existing `decode_bad_role_is_rejected` (which asserts `"system"`
   is rejected); add `decode_truly_unknown_role_is_rejected` against
   `"human"`.
@@ -609,9 +684,13 @@ Combined: ~200–250 lines across the four providers (tests included).
 `openai_responses/decode.rs`:
 
 - `decode_input_first_system_folds_to_top_level_when_no_instructions`.
-- `decode_input_system_preserved_when_instructions_set` — verifies the
-  prelude_phase = false start when `req.instructions` is present.
-- `decode_input_mid_system_preserved`.
+- `decode_instructions_and_leading_input_system_concatenate` — top-level
+  `instructions:"X"` plus input prefix
+  `[{role:"system",content:"Y"}, {role:"user",...}]` yields `system:
+  [SI("X"), SI("Y")]`, messages starts at the user.
+- `decode_input_mid_system_preserved` — `instructions:"X"` plus
+  `[user, system, user]` yields `system: [SI("X")]` and `messages[1].role
+  == System`.
 - `decode_input_developer_round_trips_with_source`.
 
 ### 5.3 Provider encode tests
@@ -715,6 +794,12 @@ After the change, reproduce the original failure scenario:
 - **R5**: `prelude_phase` rule changes behaviour for OpenAI Chat clients
   emitting `[system_A, user, system_B, user]` — previously both folded,
   now `B` stays positional. Section 3.2 explicitly covers this.
+- **R5b**: Anthropic frontend leading-run folding behaves differently
+  from v0.9.x: a client emitting top-level `system:"X"` plus
+  `messages:[{role:"system",content:"Y"}, {role:"user",...}]` now sees
+  both `X` and `Y` in the session-level vec. Previously v0.9.x rejected
+  the request entirely with `unknown role: system`, so this is a
+  bug-fix-shaped behaviour change rather than a regression.
 - **R6**: `count_tokens` totals shift slightly because the System
   message's text now counts within `messages` rather than the top vec.
   Text is the same; counts should be effectively unchanged.
@@ -723,13 +808,26 @@ After the change, reproduce the original failure scenario:
 
 - **Version**: v0.10.0 (minor bump). CHANGELOG entry marked
   `BREAKING (semantic)`.
+- **Artifacts** (single PR, single release):
+  - `docs/adr/0011-canonical-message-additive-discipline.md` — amends
+    ADR-0007 by adding categories (iv) and (v); see Section 2's
+    citations.
+  - `docs/superpowers/specs/2026-06-10-positional-system-messages-design.md`
+    — this spec.
+  - Code: canonical changes (`crates/core/src/message.rs`,
+    `crates/core/src/mapping/anthropic_wire.rs`), three frontend
+    decoders, four provider request builders, ~30 test sites updated.
+  - `CHANGELOG.md` — entries listed below plus a per-hunk category
+    table classifying every `crates/core/` diff entry against ADR-0007
+    (b) and ADR-0011's extended categories.
 - **Steps**:
-  1. Single PR implements canonical + three frontends + four providers +
-     all tests + CLAUDE.md doc updates.
+  1. Single PR lands ADR-0011 + spec + canonical + three frontends +
+     four providers + all tests + CLAUDE.md doc updates + CHANGELOG.
   2. Merge → release v0.10.0.
   3. CHANGELOG entries:
      - `BREAKING (semantic)`: messages array `role:"system"` no longer
-       rejected by Anthropic frontend; preserved as positional
+       rejected by Anthropic frontend; leading-run system entries fold
+       into the session-level vec, later entries preserved as positional
        `Message{role: System}`.
      - `BREAKING (semantic)`: OpenAI Chat / Responses frontends preserve
        mid-conversation `system` / `developer` messages instead of
@@ -738,6 +836,13 @@ After the change, reproduce the original failure scenario:
      - `feat`: outbound providers route positional system messages back
        to upstream-native shape; OpenAI Responses / Gemini collapse with
        debug logging.
+     - `docs(adr)`: ADR-0011 amends ADR-0007 to authorize the canonical
+       `Message` and `MessageRole` additions (categories iv and v).
+- **Rationale for single-PR rollout**: ADR-0011's rule shape is designed
+  for this spec; reviewing the rules independently of their first
+  application provides little marginal safety. The bug is also customer-
+  facing (Claude Code → opus-4.8 currently fails with 400), so latency
+  cost of splitting is real.
 - **Rollback**: revert to v0.9.x. No data layer migration, no config
   changes — safe rollback.
 
@@ -745,15 +850,25 @@ After the change, reproduce the original failure scenario:
 
 - **OQ1**: When top-level system vec and `messages`-array System coexist
   in OpenAI Chat output, which comes first?
-  → **Vec entries first, then positional in original order.**
+  → **Vec entries first, then positional in original order.** Rationale:
+  the canonical-side time order is "vec entries originated as pre-turn
+  standing instructions, positional entries originated mid-conversation."
+  Wall-clock-order projection makes the fewest assumptions about
+  upstream LLM precedence semantics and remains reversibly mappable
+  back to canonical if a future upstream gains native positional
+  support. We deliberately do NOT rely on the folk-rule that
+  "later instructions override earlier" — that rule is empirical, not
+  contractual.
 - **OQ2**: How does the provider handle non-Text content blocks inside a
   System message?
   → **Render only Text; drop others with `tracing::debug`.**
 - **OQ3**: Add a metric for "downgraded mid-conv system" count?
   → **No. `tracing::debug` is sufficient for now.**
-- **OQ4**: Dedup when Anthropic top-level `system` field and
-  `messages[0] role:"system"` carry identical text?
-  → **No. Preserve both faithfully.**
+- **OQ4**: Dedup when Anthropic top-level `system` field and a leading
+  `messages[0] role:"system"` carry identical text (both now fold into
+  the session-level vec)?
+  → **No. Preserve both faithfully in append order — top-level field
+  first, then leading-run entries. Clients that wrote both meant both.**
 - **OQ5**: Should System messages participate in prompt compression?
   → **Treat as regular messages; revisit if operations report
   mis-compression.**
