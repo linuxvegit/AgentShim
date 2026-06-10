@@ -17,15 +17,37 @@ fn arb_content_block() -> impl Strategy<Value = ContentBlock> {
     arb_text_block().prop_map(ContentBlock::Text)
 }
 
+fn arb_system_source() -> impl Strategy<Value = SystemSource> {
+    prop_oneof![
+        Just(SystemSource::AnthropicSystem),
+        Just(SystemSource::OpenAiSystem),
+        Just(SystemSource::OpenAiDeveloper),
+    ]
+}
+
 fn arb_message() -> impl Strategy<Value = Message> {
-    let role = prop_oneof![Just(MessageRole::User), Just(MessageRole::Assistant)];
+    let role = prop_oneof![
+        Just(MessageRole::User),
+        Just(MessageRole::Assistant),
+        Just(MessageRole::System),
+    ];
     let content = prop::collection::vec(arb_content_block(), 0..4);
-    (role, content).prop_map(|(role, content)| Message {
-        role,
-        content,
-        name: None,
-        source: None,
-        extensions: ExtensionMap::new(),
+    let source = prop_oneof![Just(None), arb_system_source().prop_map(Some)];
+    (role, content, source).prop_map(|(role, content, source)| {
+        // Only `System` carries a meaningful source; for User/Assistant
+        // round-trip we still set the field explicitly (None vs Some
+        // both must round-trip).
+        Message {
+            role,
+            content,
+            name: None,
+            source: if role == MessageRole::System {
+                source.or(Some(SystemSource::AnthropicSystem))
+            } else {
+                source
+            },
+            extensions: ExtensionMap::new(),
+        }
     })
 }
 
