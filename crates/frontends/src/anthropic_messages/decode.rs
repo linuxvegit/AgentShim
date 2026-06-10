@@ -3,7 +3,7 @@ use agent_shim_core::{
     extensions::ExtensionMap,
     ids::{RequestId, ToolCallId},
     media::BinarySource,
-    message::{Message, SystemInstruction, SystemSource},
+    message::{Message, MessageRole, SystemInstruction, SystemSource},
     request::{
         CanonicalRequest, GenerationOptions, ReasoningEffort, ReasoningOptions, RequestMetadata,
     },
@@ -39,7 +39,7 @@ pub fn decode_request(req: MessagesRequest) -> Result<CanonicalRequest, Frontend
     let model = FrontendModel(req.model.clone());
 
     // -- system --
-    let system = match req.system {
+    let mut system: Vec<SystemInstruction> = match req.system {
         None => vec![],
         Some(SystemField::Text(text)) => vec![SystemInstruction {
             source: SystemSource::AnthropicSystem,
@@ -57,29 +57,52 @@ pub fn decode_request(req: MessagesRequest) -> Result<CanonicalRequest, Frontend
         }
     };
 
-    // -- messages --
-    let messages = req
-        .messages
-        .into_iter()
-        .map(|m| {
-            let role = role_from_anthropic(&m.role)
-                .ok_or_else(|| FrontendError::InvalidBody(format!("unknown role: {}", m.role)))?;
-            let content = match m.content {
-                InboundMessageContent::Text(text) => vec![ContentBlock::text(text)],
-                InboundMessageContent::Blocks(blocks) => blocks
-                    .into_iter()
-                    .map(inbound_block_to_canonical)
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-            Ok(Message {
-                role,
-                content,
-                name: None,
-                source: None,
-                extensions: ExtensionMap::new(),
-            })
-        })
-        .collect::<Result<Vec<_>, FrontendError>>()?;
+    // -- messages with prelude-fold rule (2026-06-10 spec §3.1) --
+    // Leading-run role:"system" entries fold into the session-level
+    // `system` vec, joining any entries already produced from the
+    // top-level `system` field. The first non-system message ends the
+    // prelude; later role:"system" entries stay positional as
+    // `Message{role:System}`.
+    let mut messages: Vec<Message> = Vec::with_capacity(req.messages.len());
+    let mut prelude_phase = true;
+    for m in req.messages {
+        let role = role_from_anthropic(&m.role)
+            .ok_or_else(|| FrontendError::InvalidBody(format!("unknown role: {}", m.role)))?;
+        let content = match m.content {
+            InboundMessageContent::Text(text) => vec![ContentBlock::text(text)],
+            InboundMessageContent::Blocks(blocks) => blocks
+                .into_iter()
+                .map(inbound_block_to_canonical)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        match role {
+            MessageRole::System if prelude_phase => {
+                system.push(SystemInstruction {
+                    source: SystemSource::AnthropicSystem,
+                    content,
+                });
+            }
+            MessageRole::System => {
+                messages.push(Message {
+                    role: MessageRole::System,
+                    content,
+                    name: None,
+                    source: Some(SystemSource::AnthropicSystem),
+                    extensions: ExtensionMap::new(),
+                });
+            }
+            other => {
+                prelude_phase = false;
+                messages.push(Message {
+                    role: other,
+                    content,
+                    name: None,
+                    source: None,
+                    extensions: ExtensionMap::new(),
+                });
+            }
+        }
+    }
 
     // -- tools --
     let tools = req
@@ -343,10 +366,109 @@ mod tests {
     }
 
     #[test]
-    fn decode_bad_role_is_rejected() {
-        let body = br#"{"model":"m","max_tokens":1,"messages":[{"role":"system","content":"hi"}]}"#;
+    fn decode_truly_unknown_role_is_rejected() {
+        let body = br#"{"model":"m","max_tokens":1,"messages":[{"role":"human","content":"hi"}]}"#;
         let err = decode(body).unwrap_err();
         assert!(matches!(err, FrontendError::InvalidBody(_)));
+    }
+
+    #[test]
+    fn decode_leading_system_in_messages_folds_to_session_vec() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"system","content":"You are a poet."},
+                {"role":"user","content":"go"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 1);
+        assert_eq!(req.system[0].source, SystemSource::AnthropicSystem);
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn decode_tail_system_in_messages_preserved_as_positional() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"system","content":"hook injection"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert!(req.system.is_empty());
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, MessageRole::User);
+        assert_eq!(req.messages[1].role, MessageRole::System);
+        assert_eq!(req.messages[1].source, Some(SystemSource::AnthropicSystem));
+        match &req.messages[1].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "hook injection"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_mid_system_in_messages_preserved_as_positional() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"a"},
+                {"role":"system","content":"shift gears"},
+                {"role":"user","content":"b"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert!(req.system.is_empty());
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[1].role, MessageRole::System);
+    }
+
+    #[test]
+    fn decode_top_level_system_plus_leading_messages_system_concatenate() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "max_tokens":1024,
+            "system":"Standing X",
+            "messages":[
+                {"role":"system","content":"Leading Y"},
+                {"role":"user","content":"hi"}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.system.len(), 2);
+        match &req.system[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Standing X"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &req.system[1].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "Leading Y"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn decode_system_with_blocks_content_yields_text_blocks() {
+        let body = br#"{
+            "model":"claude-opus-4-8",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"a"},
+                {"role":"system","content":[{"type":"text","text":"shift"}]}
+            ]
+        }"#;
+        let req = decode(body).unwrap();
+        assert_eq!(req.messages[1].role, MessageRole::System);
+        match &req.messages[1].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "shift"),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[test]
