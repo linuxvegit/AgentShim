@@ -158,6 +158,11 @@ fn build_contents(
             MessageRole::User => "user",
             MessageRole::Assistant => "model",
             MessageRole::Tool => "function",
+            // System messages are already absorbed by
+            // build_system_instruction (with debug log noting the
+            // positional information loss). Skip here to avoid double
+            // emission.
+            MessageRole::System => continue,
         };
 
         let parts: Vec<Part> = msg
@@ -306,24 +311,36 @@ fn wrap_tool_result_content(content: &serde_json::Value) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 fn build_system_instruction(req: &CanonicalRequest) -> Option<Content> {
-    if req.system.is_empty() {
-        return None;
-    }
-    let parts: Vec<Part> = req
-        .system
-        .iter()
-        .flat_map(|si| si.content.iter())
-        .filter_map(|b| {
-            if let ContentBlock::Text(t) = b {
-                Some(Part {
+    let mut parts: Vec<Part> = Vec::new();
+
+    for si in &req.system {
+        for block in &si.content {
+            if let ContentBlock::Text(t) = block {
+                parts.push(Part {
                     text: Some(t.text.clone()),
                     ..Default::default()
-                })
-            } else {
-                None
+                });
             }
-        })
-        .collect();
+        }
+    }
+
+    for msg in &req.messages {
+        if msg.role == MessageRole::System {
+            for block in &msg.content {
+                if let ContentBlock::Text(t) = block {
+                    tracing::debug!(
+                        source = ?msg.source,
+                        "gemini provider: mid-conversation system message \
+                         collapsed to systemInstruction (position lost)"
+                    );
+                    parts.push(Part {
+                        text: Some(t.text.clone()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
 
     if parts.is_empty() {
         return None;
@@ -1067,6 +1084,77 @@ mod tests {
     #[test]
     fn effort_to_budget_includes_max() {
         assert_eq!(effort_to_budget(ReasoningEffort::Max), 24576);
+    }
+
+    // ---- Positional Message{role:System} (spec §4.4) --------------------
+
+    #[test]
+    fn gemini_mid_conv_system_appended_to_system_instruction() {
+        use agent_shim_core::message::SystemSource;
+
+        let mut req = empty_request();
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("a")]));
+        req.messages.push(Message::system(
+            SystemSource::OpenAiSystem,
+            vec![ContentBlock::text("mid hint")],
+        ));
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("b")]));
+
+        let body = serde_json::to_value(build(&req, &target())).unwrap();
+        let parts = body["systemInstruction"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "mid hint");
+    }
+
+    #[test]
+    fn gemini_mid_conv_system_excluded_from_contents() {
+        use agent_shim_core::message::SystemSource;
+
+        let mut req = empty_request();
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("a")]));
+        req.messages.push(Message::system(
+            SystemSource::AnthropicSystem,
+            vec![ContentBlock::text("mid")],
+        ));
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("b")]));
+
+        let body = serde_json::to_value(build(&req, &target())).unwrap();
+        let contents = body["contents"].as_array().unwrap();
+        for item in contents {
+            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            assert_ne!(role, "system");
+            assert_ne!(role, "developer");
+        }
+        assert_eq!(contents.len(), 2);
+    }
+
+    #[test]
+    fn gemini_top_level_and_mid_conv_systems_concatenate_in_order() {
+        use agent_shim_core::message::{SystemInstruction, SystemSource};
+
+        let mut req = empty_request();
+        req.system.push(SystemInstruction {
+            source: SystemSource::AnthropicSystem,
+            content: vec![ContentBlock::text("standing")],
+        });
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("a")]));
+        req.messages.push(Message::system(
+            SystemSource::OpenAiSystem,
+            vec![ContentBlock::text("mid")],
+        ));
+        req.messages
+            .push(Message::user(vec![ContentBlock::text("b")]));
+
+        let body = serde_json::to_value(build(&req, &target())).unwrap();
+        let parts = body["systemInstruction"]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "standing");
+        assert_eq!(parts[1]["text"], "mid");
     }
 
     // ---- Defensive drops -------------------------------------------------

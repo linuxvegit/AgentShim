@@ -166,6 +166,11 @@ pub(super) fn serialize_groups_to_text(messages: &[Message]) -> String {
             MessageRole::User => "User",
             MessageRole::Assistant => "Assistant",
             MessageRole::Tool => "Tool",
+            // Positional Message{role:System} entries are rendered as
+            // "System" in the summarization transcript — they carry
+            // mid-conversation instructions originally from
+            // OpenAI-style `system`/`developer` roles.
+            MessageRole::System => "System",
         };
         let mut text_parts: Vec<String> = Vec::new();
         let mut other_lines: Vec<String> = Vec::new();
