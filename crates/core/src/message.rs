@@ -11,6 +11,11 @@ pub enum MessageRole {
     Assistant,
     /// Used for tool result turns (OpenAI "tool" role).
     Tool,
+    /// A system instruction whose position within the conversation
+    /// matters. Distinct from the top-level
+    /// `CanonicalRequest::system` vec, which expresses session-level
+    /// standing instructions with no temporal anchor.
+    System,
 }
 
 /// A single conversation turn.
@@ -104,5 +109,17 @@ mod tests {
         let json = serde_json::to_string(&si).unwrap();
         let back: SystemInstruction = serde_json::from_str(&json).unwrap();
         assert_eq!(back, si);
+    }
+
+    #[test]
+    fn message_role_system_serializes_snake_case() {
+        let j = serde_json::to_string(&MessageRole::System).unwrap();
+        assert_eq!(j, "\"system\"");
+    }
+
+    #[test]
+    fn message_role_system_round_trips() {
+        let role: MessageRole = serde_json::from_str("\"system\"").unwrap();
+        assert_eq!(role, MessageRole::System);
     }
 }

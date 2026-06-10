@@ -28,6 +28,7 @@ pub fn role_to_anthropic(role: MessageRole) -> &'static str {
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",
         MessageRole::Tool => "user",
+        MessageRole::System => "user",
     }
 }
 
