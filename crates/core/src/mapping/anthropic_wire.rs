@@ -28,7 +28,7 @@ pub fn role_to_anthropic(role: MessageRole) -> &'static str {
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",
         MessageRole::Tool => "user",
-        MessageRole::System => "user",
+        MessageRole::System => "system",
     }
 }
 
@@ -36,6 +36,7 @@ pub fn role_from_anthropic(s: &str) -> Option<MessageRole> {
     match s {
         "user" => Some(MessageRole::User),
         "assistant" => Some(MessageRole::Assistant),
+        "system" => Some(MessageRole::System),
         _ => None,
     }
 }
@@ -96,7 +97,22 @@ mod tests {
     }
 
     #[test]
+    fn role_round_trip_system() {
+        let s = role_to_anthropic(MessageRole::System);
+        assert_eq!(s, "system");
+        assert_eq!(role_from_anthropic(s), Some(MessageRole::System));
+    }
+
+    #[test]
+    fn role_system_string_decodes_to_system_variant() {
+        // Was previously `role_unknown_returns_none` asserting "system" -> None.
+        // ADR-0011 (iv) + 2026-06-10 spec flip this: "system" is now a valid role.
+        assert_eq!(role_from_anthropic("system"), Some(MessageRole::System));
+    }
+
+    #[test]
     fn role_unknown_returns_none() {
-        assert_eq!(role_from_anthropic("system"), None);
+        assert_eq!(role_from_anthropic("human"), None);
+        assert_eq!(role_from_anthropic("developer"), None);
     }
 }
