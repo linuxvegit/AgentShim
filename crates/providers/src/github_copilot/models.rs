@@ -108,6 +108,20 @@ pub fn parse_models_response(raw: &str) -> Result<BTreeMap<String, ModelMetadata
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32),
             family,
+            // Top-level field (sibling of `capabilities`, `version`), NOT under
+            // `capabilities.supports`. Drives endpoint selection: a responses-only
+            // model like `gpt-5.5` carries `["/responses", "ws:/responses"]`.
+            // Empty / missing collapses to `None` so callers fall back to
+            // frontend-driven selection.
+            supported_endpoints: item
+                .get("supported_endpoints")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                })
+                .filter(|v: &Vec<String>| !v.is_empty()),
             supports: ModelSupports {
                 vision: supports
                     .and_then(|s| s.get("vision"))

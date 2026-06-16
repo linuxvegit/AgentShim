@@ -30,6 +30,51 @@ use headers::{
 };
 use token_manager::{CopilotToken, CopilotTokenManager};
 
+/// Copilot's `supported_endpoints` entry for the OpenAI Chat Completions API.
+const CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
+/// Copilot's `supported_endpoints` entry for the OpenAI Responses API.
+/// Matched by exact equality — `ws:/responses` (a websocket transport this
+/// gateway does not speak) must NOT count as Responses support.
+const RESPONSES_ENDPOINT: &str = "/responses";
+
+fn endpoints_contain(eps: &[String], needle: &str) -> bool {
+    eps.iter().any(|e| e == needle)
+}
+
+/// Decide whether to drive this request through Copilot's Responses API.
+///
+/// Principle: use the endpoint the inbound frontend naturally maps to, unless
+/// the target model doesn't support it — then use the only endpoint it does
+/// support. Unknown capabilities (`None`) preserve the historical
+/// frontend-driven behaviour, so older models without a `supported_endpoints`
+/// field don't regress.
+///
+/// This is the fix for responses-only models (e.g. `gpt-5.5`, whose endpoints
+/// are `["/responses", "ws:/responses"]`): an Anthropic-Messages frontend
+/// would naturally pick `/chat/completions`, which `gpt-5.5` rejects, so we
+/// override to the Responses API.
+fn decide_use_responses_api(
+    frontend: agent_shim_core::FrontendKind,
+    endpoints: Option<&[String]>,
+) -> bool {
+    let natural_responses = frontend == agent_shim_core::FrontendKind::OpenAiResponses;
+    let Some(eps) = endpoints else {
+        return natural_responses;
+    };
+    let supports_chat = endpoints_contain(eps, CHAT_COMPLETIONS_ENDPOINT);
+    let supports_responses = endpoints_contain(eps, RESPONSES_ENDPOINT);
+    if natural_responses {
+        // Frontend wants Responses; honour it unless the model is chat-only
+        // (i.e. supports chat but not responses).
+        supports_responses || !supports_chat
+    } else {
+        // Frontend wants Chat; override to Responses only when the model is
+        // responses-only (i.e. supports responses but not chat). This is the
+        // gpt-5.5 fix.
+        !supports_chat && supports_responses
+    }
+}
+
 pub struct CopilotProvider {
     manager: CopilotTokenManager,
     http: crate::ProviderHttpClient,
@@ -202,11 +247,25 @@ impl BackendProvider for CopilotProvider {
         let request_id = Uuid::new_v4().to_string();
         let is_stream = req.stream;
 
-        let use_responses_api = req.frontend.kind == agent_shim_core::FrontendKind::OpenAiResponses;
+        let use_responses_api = decide_use_responses_api(
+            req.frontend.kind,
+            req.resolved_policy.supported_endpoints.as_deref(),
+        );
 
         let (url, body_value) = if use_responses_api {
             let url = format!("{}/v1/responses", api_base.trim_end_matches('/'));
-            let body = responses_api::encode_request::build(&req, &target);
+            let mut body = responses_api::encode_request::build(&req, &target);
+            // Force streaming on the Responses path. Copilot's `/v1/responses`
+            // always SSE-frames its output and `complete()` always parses via
+            // `parse_stream`, regardless of the inbound `stream` flag; for a
+            // non-stream client the gateway's `collect_stream` folds the
+            // canonical stream into one unary response. Forcing `stream: true`
+            // here removes any dependency on Copilot honouring `stream: false`.
+            // Done in the provider (not the shared `encode_request::build`) so a
+            // future real OpenAI Responses non-stream path stays unconstrained.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+            }
             (url, body)
         } else {
             let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
@@ -396,4 +455,59 @@ fn rewrite_responses_model(
     serde_json::to_vec(&value)
         .map(bytes::Bytes::from)
         .map_err(|e| ProviderError::Encode(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decide_use_responses_api;
+    use agent_shim_core::FrontendKind;
+
+    fn eps(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn endpoint_decision_table() {
+        let responses_only = eps(&["/responses", "ws:/responses"]);
+        let chat_only = eps(&["/v1/messages", "/chat/completions"]);
+        let both = eps(&["/responses", "/chat/completions", "ws:/responses"]);
+
+        // (frontend, endpoints, expected use_responses_api)
+        let cases: &[(FrontendKind, Option<&[String]>, bool)] = &[
+            // gpt-5.5 responses-only — THE FIX: Anthropic frontend → responses.
+            (FrontendKind::AnthropicMessages, Some(&responses_only), true),
+            (FrontendKind::OpenAiChat, Some(&responses_only), true),
+            (FrontendKind::OpenAiResponses, Some(&responses_only), true),
+            // claude-opus chat-only — unchanged + inverse bonus.
+            (FrontendKind::AnthropicMessages, Some(&chat_only), false),
+            (FrontendKind::OpenAiResponses, Some(&chat_only), false),
+            // gpt-5.4 dual-support — honour the frontend's natural endpoint.
+            (FrontendKind::AnthropicMessages, Some(&both), false),
+            (FrontendKind::OpenAiChat, Some(&both), false),
+            (FrontendKind::OpenAiResponses, Some(&both), true),
+            // Unknown capabilities — preserve frontend-driven behaviour.
+            (FrontendKind::AnthropicMessages, None, false),
+            (FrontendKind::OpenAiChat, None, false),
+            (FrontendKind::OpenAiResponses, None, true),
+        ];
+
+        for (i, (frontend, endpoints, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                decide_use_responses_api(*frontend, *endpoints),
+                *expected,
+                "case {i}: frontend={frontend:?} endpoints={endpoints:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ws_responses_alone_does_not_count_as_responses_support() {
+        // A model advertising only the websocket transport is neither chat nor
+        // HTTP-responses capable; a chat frontend keeps its natural choice.
+        let ws_only = eps(&["ws:/responses"]);
+        assert!(!decide_use_responses_api(
+            FrontendKind::AnthropicMessages,
+            Some(&ws_only)
+        ));
+    }
 }

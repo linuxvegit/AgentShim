@@ -659,6 +659,20 @@ async fn dispatch_inner(
         .metadata(&first_target.provider, &first_target.model)
         .and_then(|m| m.supports.reasoning_effort_values.clone());
 
+    // Thread the chain head's advertised upstream API endpoints onto the
+    // resolved policy, same channel as `supported_efforts` above. The Copilot
+    // provider reads this to pick `/v1/responses` vs `/chat/completions` by
+    // model capability instead of inbound frontend dialect, so a responses-only
+    // model (e.g. `gpt-5.5`) is reachable from an Anthropic frontend. Absent
+    // metadata leaves it `None` and the provider falls back to frontend-driven
+    // selection.
+    canonical.resolved_policy.supported_endpoints = state
+        .core
+        .resolver
+        .model_index()
+        .metadata(&first_target.provider, &first_target.model)
+        .and_then(|m| m.supported_endpoints.clone());
+
     // ── Plan 07 P04 spec §6.6 anchor 2: H3 (on_resolved) ──────────────
     // After route resolve + policy snapshot, before capability gate.
     // Plugins see the resolved `BackendTarget` (= chain head) so they

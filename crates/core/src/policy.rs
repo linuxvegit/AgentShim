@@ -79,6 +79,16 @@ pub struct ResolvedPolicy {
     /// per-provider compression.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_efforts: Option<Vec<String>>,
+    /// The target model's advertised upstream API endpoints, copied from
+    /// discovered catalog metadata at route-resolution time (e.g. Copilot's
+    /// `["/responses", "ws:/responses"]` for a responses-only model). The
+    /// Copilot provider reads this to pick `/v1/responses` vs
+    /// `/chat/completions` by capability rather than by inbound frontend
+    /// dialect, so a responses-only model (e.g. `gpt-5.5`) works from any
+    /// frontend. `None` when the catalog had no metadata for this model —
+    /// providers then fall back to frontend-driven selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_endpoints: Option<Vec<String>>,
     /// Final `anthropic-*` headers to attach to the upstream HTTP request.
     /// Order is stable; duplicates are not collapsed (callers may pass
     /// comma-separated values verbatim).
@@ -140,6 +150,7 @@ impl RoutePolicy {
             // the discovered model catalog is in scope. `resolve` is a pure
             // policy+request merge and has no catalog access.
             supported_efforts: None,
+            supported_endpoints: None,
             anthropic_headers,
         }
     }
@@ -264,6 +275,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::High),
             reasoning_budget_tokens: Some(8192),
             supported_efforts: None,
+            supported_endpoints: None,
             anthropic_headers: vec![],
         };
         assert_eq!(rp.reasoning_budget_tokens, Some(8192));

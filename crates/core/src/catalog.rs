@@ -48,6 +48,16 @@ pub struct ModelMetadata {
     pub family: Option<String>,
     #[serde(default)]
     pub supports: ModelSupports,
+    /// The upstream API endpoints this model accepts, copied verbatim from
+    /// the provider catalog (e.g. Copilot's per-model `supported_endpoints`:
+    /// `["/responses", "ws:/responses"]` for responses-only models,
+    /// `["/v1/messages", "/chat/completions"]` for chat-only). Drives the
+    /// Copilot provider's endpoint selection so a responses-only model
+    /// (e.g. `gpt-5.5`) is reached via `/v1/responses` regardless of the
+    /// inbound frontend dialect. `None` when the provider doesn't surface
+    /// the field — callers then fall back to frontend-driven selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_endpoints: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// Whether the upstream's "adaptive thinking" mode is available
@@ -123,6 +133,7 @@ mod tests {
             context_window_tokens: Some(200000),
             max_output_tokens: Some(32000),
             family: Some("claude-opus-4.7".into()),
+            supported_endpoints: Some(vec!["/v1/messages".into(), "/chat/completions".into()]),
             supports: ModelSupports {
                 vision: Some(true),
                 tool_calls: Some(true),

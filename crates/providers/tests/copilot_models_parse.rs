@@ -125,3 +125,48 @@ fn entries_without_reasoning_keep_none() {
     assert_eq!(m.thinking_budget_min, None);
     assert_eq!(m.thinking_budget_max, None);
 }
+
+#[test]
+fn parses_supported_endpoints_responses_only_for_gpt_5_5() {
+    // gpt-5.5 is responses-only: it carries `/responses` + the websocket
+    // transport but NOT `/chat/completions`. This is the field that drives
+    // the capability-based endpoint fix.
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    let m = parsed.get("gpt-5.5").expect("entry for gpt-5.5");
+    assert_eq!(
+        m.supported_endpoints.as_deref(),
+        Some(&["/responses".to_string(), "ws:/responses".to_string()][..])
+    );
+}
+
+#[test]
+fn parses_supported_endpoints_dual_for_gpt_5_4() {
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    let m = parsed.get("gpt-5.4").expect("entry for gpt-5.4");
+    let eps = m.supported_endpoints.as_deref().expect("endpoints present");
+    assert!(eps.iter().any(|e| e == "/chat/completions"));
+    assert!(eps.iter().any(|e| e == "/responses"));
+}
+
+#[test]
+fn parses_supported_endpoints_chat_only_for_claude_opus_4_7() {
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    let m = parsed
+        .get("claude-opus-4.7")
+        .expect("entry for claude-opus-4.7");
+    let eps = m.supported_endpoints.as_deref().expect("endpoints present");
+    assert!(eps.iter().any(|e| e == "/chat/completions"));
+    assert!(!eps.iter().any(|e| e == "/responses"));
+}
+
+#[test]
+fn missing_supported_endpoints_is_none() {
+    let raw = load_fixture();
+    let parsed = parse_models_response(&raw).expect("parse ok");
+    // gpt-4o has no `supported_endpoints` key in the captured response.
+    let m = parsed.get("gpt-4o").expect("entry for gpt-4o");
+    assert_eq!(m.supported_endpoints, None);
+}
