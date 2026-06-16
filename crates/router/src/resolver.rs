@@ -93,25 +93,43 @@ impl ModelResolver {
     /// Build the public model catalog from the static route table plus the
     /// discovered upstream metadata.
     ///
-    /// The result has one [`ModelRecord`] per explicit alias (`routes[].model`
-    /// where `model != "*"`). When the same alias appears on multiple
-    /// frontends, those frontends collapse into the record's `frontends`
-    /// list. Wildcards are excluded because they don't enumerate a concrete
-    /// alias.
+    /// The result combines two sources:
     ///
-    /// `long_context_variant` is computed by scanning the rest of the
-    /// catalog for entries on the same `metadata.family` with a strictly
-    /// larger `context_window_tokens`; the largest match wins. Records
-    /// whose metadata lacks a family (or that have no larger sibling) leave
-    /// the field `None`.
+    /// 1. **Configured aliases** — one [`ModelRecord`] per explicit alias
+    ///    (`routes[].model` where `model != "*"`). When the same alias appears
+    ///    on multiple frontends, those frontends collapse into the record's
+    ///    `frontends` list. Wildcards are excluded because they don't enumerate
+    ///    a concrete alias.
+    /// 2. **Upstream-discovered models** — every `(provider, model)` the
+    ///    provider published in its catalog that is NOT already covered by an
+    ///    alias's fallback chain. These surface with the upstream's original
+    ///    model id as `id`, an empty `frontends` list (no explicit front-end
+    ///    route reaches them), and the discovering provider in
+    ///    `upstream_provider`. This lets clients discover the full set of
+    ///    models the gateway can reach, not just the ones with hand-written
+    ///    aliases.
+    ///
+    /// Dedup is keyed on `(provider, upstream_model)` across the whole
+    /// fallback chain (not just its head), so a model reachable via an alias
+    /// never also appears as a bare upstream-only record.
+    ///
+    /// `long_context_variant` is computed (over the combined set) by scanning
+    /// the rest of the catalog for entries on the same `metadata.family` with
+    /// a strictly larger `context_window_tokens`; the largest match wins.
+    /// Records whose metadata lacks a family (or that have no larger sibling)
+    /// leave the field `None`. The final list is sorted by `id` for stable,
+    /// assertable output.
     pub fn list_catalog(&self) -> agent_shim_core::ModelCatalog {
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, BTreeSet};
 
         use agent_shim_core::{ModelRecord, UpstreamRef};
 
         // Pass 1: walk routes, build a map keyed by alias-id. Multiple
-        // frontends for the same alias collapse into one record.
+        // frontends for the same alias collapse into one record. Alongside,
+        // record every (provider, model) the alias chains cover so the
+        // upstream-enumeration pass can skip them.
         let mut by_alias: BTreeMap<String, ModelRecord> = BTreeMap::new();
+        let mut covered: BTreeSet<(String, String)> = BTreeSet::new();
         for (frontend, alias) in self.static_router.list_routes() {
             // Defensive: list_routes already excludes wildcards, but skip
             // here too in case a future Router impl returns them.
@@ -138,6 +156,12 @@ impl ModelResolver {
                     model: t.model.clone(),
                 })
                 .collect();
+            // Every element of the chain counts as "covered" — a model
+            // reachable as a fallback target should not resurface as a bare
+            // upstream-only record.
+            for t in &chain {
+                covered.insert((t.provider.clone(), t.model.clone()));
+            }
             let entry = by_alias
                 .entry(alias.clone())
                 .or_insert_with(|| ModelRecord {
@@ -154,10 +178,32 @@ impl ModelResolver {
             }
         }
 
+        // Collect the alias records, then append one upstream-only record per
+        // discovered (provider, model) that no alias chain already covers.
+        let mut records: Vec<ModelRecord> = by_alias.into_values().collect();
+        for provider in self.model_index.providers() {
+            for (model_id, metadata) in self.model_index.provider_models(provider) {
+                if covered.contains(&(provider.to_string(), model_id.to_string())) {
+                    continue;
+                }
+                records.push(ModelRecord {
+                    id: model_id.to_string(),
+                    frontends: Vec::new(),
+                    upstream_provider: provider.to_string(),
+                    upstream_model: model_id.to_string(),
+                    upstreams_chain: vec![UpstreamRef {
+                        provider: provider.to_string(),
+                        model: model_id.to_string(),
+                    }],
+                    metadata: Some(metadata.clone()),
+                    long_context_variant: None,
+                });
+            }
+        }
+
         // Pass 2: long-context sibling lookup. For each record, scan all
         // other records on the same family and pick the one with the
         // strictly larger context window; the largest such sibling wins.
-        let records: Vec<ModelRecord> = by_alias.into_values().collect();
         let mut out: Vec<ModelRecord> = Vec::with_capacity(records.len());
         for r in &records {
             let my_family = r.metadata.as_ref().and_then(|m| m.family.clone());
@@ -201,6 +247,10 @@ impl ModelResolver {
             rec.long_context_variant = variant.map(|v| v.id.clone());
             out.push(rec);
         }
+        // Alias records (BTreeMap order) and upstream-only records (appended
+        // afterwards) are interleaved by source; sort by id so the public
+        // catalog has a stable, assertable order.
+        out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
 }
@@ -564,5 +614,204 @@ mod tests {
         assert_eq!(catalog[0].id, "claude-sonnet-4-5");
         // And the prefix-pattern id must NOT appear.
         assert!(catalog.iter().all(|r| r.id != "claude-*"));
+    }
+
+    // ── upstream model enumeration (list every discovered model) ───────
+
+    /// The catalog must surface upstream-discovered models that have NO
+    /// configured route alias, alongside the explicit aliases. Such records
+    /// carry the upstream's original model id as `id`, an empty `frontends`
+    /// list (no explicit front-end route reaches them), and the discovering
+    /// provider in `upstream_provider`.
+    #[test]
+    fn list_catalog_includes_upstream_only_models() {
+        let cfg = cfg_with_route("openai_chat", "gpt-5.5", "copilot", "gpt-5.5");
+        // copilot's discovered catalog has three models; only gpt-5.5 is aliased.
+        let resolver = resolver_with(cfg, "copilot", &["gpt-5.5", "gpt-4o", "o3-mini"]);
+        let catalog = resolver.list_catalog();
+        assert_eq!(catalog.len(), 3, "alias + 2 upstream-only models");
+
+        let aliased = catalog
+            .iter()
+            .find(|r| r.id == "gpt-5.5")
+            .expect("aliased record present");
+        assert!(
+            !aliased.frontends.is_empty(),
+            "the configured alias keeps its frontends"
+        );
+
+        for upstream_only in ["gpt-4o", "o3-mini"] {
+            let r = catalog
+                .iter()
+                .find(|r| r.id == upstream_only)
+                .unwrap_or_else(|| panic!("upstream-only {upstream_only} present"));
+            assert!(
+                r.frontends.is_empty(),
+                "upstream-only model has no explicit front-end route"
+            );
+            assert_eq!(r.upstream_provider, "copilot");
+            assert_eq!(r.upstream_model, upstream_only);
+            assert_eq!(r.upstreams_chain.len(), 1);
+            assert_eq!(r.upstreams_chain[0].provider, "copilot");
+            assert_eq!(r.upstreams_chain[0].model, upstream_only);
+        }
+    }
+
+    /// A `(provider, model)` already covered by a configured alias's chain
+    /// must NOT also appear as a separate upstream-only record. The aliased
+    /// record (with its richer id / frontends) wins; dedup is keyed on
+    /// `(provider, upstream_model)`, not on the alias id.
+    #[test]
+    fn list_catalog_dedups_alias_covered_upstream_model() {
+        let cfg = cfg_with_route("openai_chat", "g5", "copilot", "gpt-5.5");
+        let resolver = resolver_with(cfg, "copilot", &["gpt-5.5", "gpt-4o"]);
+        let catalog = resolver.list_catalog();
+        // g5 (alias for copilot:gpt-5.5) + gpt-4o (upstream-only). NOT a
+        // duplicate id=gpt-5.5 upstream-only record.
+        assert_eq!(catalog.len(), 2);
+
+        let g5 = catalog
+            .iter()
+            .find(|r| r.id == "g5")
+            .expect("alias present");
+        assert_eq!(g5.upstream_model, "gpt-5.5");
+        assert!(!g5.frontends.is_empty());
+
+        // No upstream-only record for the already-covered (copilot, gpt-5.5).
+        assert!(
+            catalog
+                .iter()
+                .all(|r| !(r.id == "gpt-5.5" && r.frontends.is_empty())),
+            "covered upstream model must not duplicate as upstream-only"
+        );
+        // gpt-4o is the only upstream-only record.
+        let upstream_only: Vec<_> = catalog.iter().filter(|r| r.frontends.is_empty()).collect();
+        assert_eq!(upstream_only.len(), 1);
+        assert_eq!(upstream_only[0].id, "gpt-4o");
+    }
+
+    /// Dedup considers the FULL fallback chain, not just the head: a
+    /// multi-upstream route covers `(provider, model)` for every element, so
+    /// none of them resurface as upstream-only records.
+    #[test]
+    fn list_catalog_dedups_against_full_chain_not_just_head() {
+        use std::collections::{BTreeSet, HashMap};
+
+        use agent_shim_config::UpstreamRef;
+
+        let cfg = GatewayConfig {
+            server: Default::default(),
+            logging: Default::default(),
+            upstreams: Default::default(),
+            routes: vec![RouteEntry {
+                frontend: "openai_chat".into(),
+                model: "m".into(),
+                upstream: None,
+                upstream_model: None,
+                upstreams: vec![
+                    UpstreamRef {
+                        name: "openai".into(),
+                        model: "gpt-5.5".into(),
+                    },
+                    UpstreamRef {
+                        name: "copilot".into(),
+                        model: "gpt-5.5".into(),
+                    },
+                ],
+                reasoning_effort: None,
+                anthropic_beta: None,
+                retry: RetryConfig::default(),
+                breaker: BreakerConfig::default(),
+                min_tier: None,
+                max_cost_usd: None,
+                plugins: None,
+                reasoning_mapping: vec![],
+            }],
+            plugins: ::std::collections::BTreeMap::new(),
+            auth: Default::default(),
+            rate_limit: Default::default(),
+            copilot: None,
+            admin: None,
+            metrics: Default::default(),
+            otel: None,
+            shutdown: Default::default(),
+            validation: Default::default(),
+        };
+        let router = Arc::new(StaticRouter::from_config(&cfg));
+        let mut map = HashMap::new();
+        for provider in ["openai", "copilot"] {
+            let mut s = BTreeSet::new();
+            s.insert("gpt-5.5".to_string());
+            map.insert(provider.to_string(), s);
+        }
+        let index = Arc::new(ModelIndex::new(map));
+        let resolver = ModelResolver::new(router, index);
+
+        let catalog = resolver.list_catalog();
+        // Only the single alias `m`; both (openai, gpt-5.5) and
+        // (copilot, gpt-5.5) are chain-covered, so no upstream-only records.
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "m");
+        assert!(catalog.iter().all(|r| !r.frontends.is_empty()));
+    }
+
+    /// Upstream-only records carry the upstream-reported metadata so clients
+    /// can filter by capability (`?capability=vision`) on models that have no
+    /// configured alias.
+    #[test]
+    fn list_catalog_upstream_only_carries_metadata() {
+        use std::collections::BTreeMap;
+
+        use agent_shim_core::{ModelMetadata, ModelSupports};
+
+        // One aliased model + one upstream-only model, both with metadata.
+        let cfg = cfg_with_route("openai_chat", "gpt-5.5", "copilot", "gpt-5.5");
+        let router = Arc::new(StaticRouter::from_config(&cfg));
+        let mut all = HashMap::new();
+        let mut map = BTreeMap::new();
+        map.insert(
+            "gpt-5.5".to_string(),
+            ModelMetadata {
+                context_window_tokens: Some(1_050_000),
+                ..Default::default()
+            },
+        );
+        map.insert(
+            "vision-only-model".to_string(),
+            ModelMetadata {
+                context_window_tokens: Some(128_000),
+                supports: ModelSupports {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        all.insert("copilot".to_string(), map);
+        let index = Arc::new(ModelIndex::with_metadata(all));
+        let resolver = ModelResolver::new(router, index);
+
+        let catalog = resolver.list_catalog();
+        let v = catalog
+            .iter()
+            .find(|r| r.id == "vision-only-model")
+            .expect("upstream-only model present");
+        assert!(v.frontends.is_empty());
+        let m = v.metadata.as_ref().expect("upstream metadata carried over");
+        assert_eq!(m.context_window_tokens, Some(128_000));
+        assert_eq!(m.supports.vision, Some(true));
+    }
+
+    /// Regression: with an empty model index the catalog is unchanged from
+    /// the pre-enumeration behaviour — only the configured aliases appear.
+    #[test]
+    fn list_catalog_empty_index_unchanged() {
+        let cfg = cfg_with_route("openai_chat", "gpt-4o", "openai", "gpt-4o");
+        let router = Arc::new(StaticRouter::from_config(&cfg));
+        let resolver = ModelResolver::new(router, Arc::new(ModelIndex::empty()));
+        let catalog = resolver.list_catalog();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "gpt-4o");
+        assert!(!catalog[0].frontends.is_empty());
     }
 }
