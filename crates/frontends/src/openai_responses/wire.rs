@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 // ── Inbound (request) wire types ─────────────────────────────────────────────
@@ -44,12 +44,67 @@ pub struct ReasoningConfig {
 
 /// The `input` field accepts a plain string, a message array, or a typed item
 /// array.
+///
+/// The `Items` variant carries a custom deserializer (`deserialize_input_items`)
+/// rather than serde's default. The OpenAI Responses spec makes the `type`
+/// field *optional* on input message items (a bare `{role, content}` defaults
+/// to `type:"message"`), and real-world clients (codex / Hermes on gpt-5.5)
+/// freely interleave such type-less messages with typed items
+/// (`reasoning` / `function_call` / `function_call_output`) in one array. Serde's
+/// internally-tagged `InputItem` derive rejects a *missing* tag outright —
+/// `#[serde(other)]` only catches *unknown* tag *values* — so without the
+/// pre-processing pass both untagged variants fail (the typed items have no
+/// `role` for `Messages`; the type-less messages have no `type` for `Items`),
+/// and the request 400s with "data did not match any variant of untagged enum
+/// InputField".
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum InputField {
     Text(String),
     Messages(Vec<InputMessage>),
-    Items(Vec<InputItem>),
+    Items(#[serde(deserialize_with = "deserialize_input_items")] Vec<InputItem>),
+}
+
+/// Deserialize the typed-item array, normalizing each element so a type-less
+/// message item (`{role, content}`, spec default `type:"message"`) decodes as
+/// `InputItem::Message` instead of failing the internally-tagged derive. The
+/// rules, applied per element:
+///
+///   * object already has a `type`  → decode as-is (typed item or, for an
+///     unknown `type`, the `#[serde(other)]` `Other` catch-all)
+///   * object has no `type` but has `role` → inject `type:"message"` so it
+///     decodes as `InputItem::Message`
+///   * object has neither `type` nor `role` → decode as `Other` (dropped on
+///     the canonical path) rather than 400 the whole request
+///
+/// This keeps the permissive, never-hard-fail posture the rest of the
+/// Responses decoder already follows for forward-compat item/part types.
+fn deserialize_input_items<'de, D>(deserializer: D) -> Result<Vec<InputItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Vec<Value> = Vec::deserialize(deserializer)?;
+    let mut items = Vec::with_capacity(raw.len());
+    for mut value in raw {
+        if let Value::Object(map) = &mut value {
+            if !map.contains_key("type") {
+                // A type-less item with a `role` is a spec-default message;
+                // one without is malformed — route it to the `Other`
+                // catch-all (dropped on the canonical path) via a sentinel
+                // tag rather than letting the internally-tagged derive
+                // hard-fail on the missing `type`.
+                let injected = if map.contains_key("role") {
+                    "message"
+                } else {
+                    "__agent_shim_unknown__"
+                };
+                map.insert("type".to_string(), Value::String(injected.to_string()));
+            }
+        }
+        let item = InputItem::deserialize(value).map_err(serde::de::Error::custom)?;
+        items.push(item);
+    }
+    Ok(items)
 }
 
 #[derive(Debug, Clone, Deserialize)]

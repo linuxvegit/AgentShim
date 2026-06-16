@@ -1153,4 +1153,61 @@ mod tests {
         assert_eq!(req.messages[1].role, MessageRole::System);
         assert_eq!(req.messages[1].source, Some(SystemSource::OpenAiDeveloper));
     }
+
+    /// Regression: openai-responses-5879c5f3.json. codex/Hermes (gpt-5.5)
+    /// mixes message items that OMIT the optional `type` field with typed
+    /// items (reasoning / function_call / function_call_output) in the SAME
+    /// `input` array. The OpenAI Responses spec makes `type` optional on
+    /// input message items (it defaults to "message"), so a real-world array
+    /// looks like `[{role,content}, {type:reasoning,...}, {role,content},
+    /// {type:function_call,...}, {type:function_call_output,...}]`.
+    ///
+    /// Both untagged `InputField` variants failed on this shape: `Messages`
+    /// because the typed items have no `role`, and `Items` because
+    /// `InputItem`'s internally-tagged derive rejected the type-less
+    /// messages (`#[serde(other)]` only catches *unknown* tag values, never
+    /// a *missing* tag). The cascade surfaced as the recurring HTTP 400
+    /// "data did not match any variant of untagged enum InputField".
+    #[test]
+    fn decode_input_array_mixes_typeless_messages_with_typed_items() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"role":"user","content":"hi"},
+                {"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"thinking"}]},
+                {"role":"assistant","content":""},
+                {"type":"function_call","call_id":"c1","name":"search","arguments":"{}"},
+                {"type":"function_call_output","call_id":"c1","output":"results"}
+            ]
+        }"#;
+        let req = decode(body)
+            .expect("type-less messages mixed with typed items must decode, not 400");
+        assert_eq!(req.messages[0].role, MessageRole::User);
+        match &req.messages[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t.text, "hi"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+        let roles: Vec<_> = req.messages.iter().map(|m| m.role).collect();
+        assert!(roles.contains(&MessageRole::User));
+        assert!(roles.contains(&MessageRole::Assistant));
+        assert!(roles.contains(&MessageRole::Tool));
+    }
+
+    /// A type-less item that also lacks `role` is malformed; drop it via the
+    /// `Other` catch-all rather than 400 the whole request. This keeps the
+    /// type-less-message fix from regressing into a new hard-fail surface.
+    #[test]
+    fn decode_typeless_item_without_role_is_dropped_not_rejected() {
+        let body = br#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"role":"user","content":"hi"},
+                {"foo":"bar"}
+            ]
+        }"#;
+        let req =
+            decode(body).expect("type-less role-less item must be dropped, not 400");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, MessageRole::User);
+    }
 }
