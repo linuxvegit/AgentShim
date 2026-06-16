@@ -95,8 +95,8 @@ async fn anthropic_frontend_responses_only_model_hits_responses_api() {
         github_oauth_token: "gho_test".to_string(),
         created_at_unix: 0,
     };
-    let provider = CopilotProvider::spawn_with_creds(creds, server.url())
-        .expect("provider should build");
+    let provider =
+        CopilotProvider::spawn_with_creds(creds, server.url()).expect("provider should build");
 
     let target = BackendTarget {
         provider: "github_copilot".to_string(),
@@ -184,8 +184,8 @@ async fn anthropic_frontend_chat_only_model_hits_chat_api() {
         github_oauth_token: "gho_test".to_string(),
         created_at_unix: 0,
     };
-    let provider = CopilotProvider::spawn_with_creds(creds, server.url())
-        .expect("provider should build");
+    let provider =
+        CopilotProvider::spawn_with_creds(creds, server.url()).expect("provider should build");
 
     let target = BackendTarget {
         provider: "github_copilot".to_string(),

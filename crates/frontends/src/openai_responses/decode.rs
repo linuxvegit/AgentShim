@@ -1180,8 +1180,8 @@ mod tests {
                 {"type":"function_call_output","call_id":"c1","output":"results"}
             ]
         }"#;
-        let req = decode(body)
-            .expect("type-less messages mixed with typed items must decode, not 400");
+        let req =
+            decode(body).expect("type-less messages mixed with typed items must decode, not 400");
         assert_eq!(req.messages[0].role, MessageRole::User);
         match &req.messages[0].content[0] {
             ContentBlock::Text(t) => assert_eq!(t.text, "hi"),
@@ -1205,8 +1205,7 @@ mod tests {
                 {"foo":"bar"}
             ]
         }"#;
-        let req =
-            decode(body).expect("type-less role-less item must be dropped, not 400");
+        let req = decode(body).expect("type-less role-less item must be dropped, not 400");
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, MessageRole::User);
     }
