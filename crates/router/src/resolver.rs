@@ -101,17 +101,23 @@ impl ModelResolver {
     ///    `frontends` list. Wildcards are excluded because they don't enumerate
     ///    a concrete alias.
     /// 2. **Upstream-discovered models** — every `(provider, model)` the
-    ///    provider published in its catalog that is NOT already covered by an
-    ///    alias's fallback chain. These surface with the upstream's original
-    ///    model id as `id`, an empty `frontends` list (no explicit front-end
-    ///    route reaches them), and the discovering provider in
+    ///    provider published in its catalog. These surface with the upstream's
+    ///    original model id as `id`, an empty `frontends` list (no explicit
+    ///    front-end route reaches them), and the discovering provider in
     ///    `upstream_provider`. This lets clients discover the full set of
     ///    models the gateway can reach, not just the ones with hand-written
-    ///    aliases.
+    ///    aliases. A model that is *also* the target of one or more aliases is
+    ///    still listed here as its own bare record — the aliases and the raw
+    ///    upstream model are distinct catalog entries.
     ///
-    /// Dedup is keyed on `(provider, upstream_model)` across the whole
-    /// fallback chain (not just its head), so a model reachable via an alias
-    /// never also appears as a bare upstream-only record.
+    /// Dedup is keyed solely on the catalog entry `id`, which keeps the public
+    /// OpenAI `/v1/models` response id-unique. An alias id always wins over a
+    /// same-named upstream model; among upstream models sharing an id across
+    /// providers, the alphabetically-first provider wins (providers are walked
+    /// in sorted order for deterministic output). Crucially, multiple aliases
+    /// pointing at the *same* upstream model are NOT collapsed — each alias is
+    /// its own id — and the bare upstream model is listed too, as long as no
+    /// entry already claims that id.
     ///
     /// `long_context_variant` is computed (over the combined set) by scanning
     /// the rest of the catalog for entries on the same `metadata.family` with
@@ -126,10 +132,10 @@ impl ModelResolver {
 
         // Pass 1: walk routes, build a map keyed by alias-id. Multiple
         // frontends for the same alias collapse into one record. Alongside,
-        // record every (provider, model) the alias chains cover so the
-        // upstream-enumeration pass can skip them.
+        // collect the set of ids already claimed so the upstream-enumeration
+        // pass can keep the catalog id-unique.
         let mut by_alias: BTreeMap<String, ModelRecord> = BTreeMap::new();
-        let mut covered: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut taken_ids: BTreeSet<String> = BTreeSet::new();
         for (frontend, alias) in self.static_router.list_routes() {
             // Defensive: list_routes already excludes wildcards, but skip
             // here too in case a future Router impl returns them.
@@ -156,12 +162,7 @@ impl ModelResolver {
                     model: t.model.clone(),
                 })
                 .collect();
-            // Every element of the chain counts as "covered" — a model
-            // reachable as a fallback target should not resurface as a bare
-            // upstream-only record.
-            for t in &chain {
-                covered.insert((t.provider.clone(), t.model.clone()));
-            }
+            taken_ids.insert(alias.clone());
             let entry = by_alias
                 .entry(alias.clone())
                 .or_insert_with(|| ModelRecord {
@@ -179,11 +180,16 @@ impl ModelResolver {
         }
 
         // Collect the alias records, then append one upstream-only record per
-        // discovered (provider, model) that no alias chain already covers.
+        // discovered model whose id no existing entry already claims. Walk
+        // providers in sorted order so a model id shared across providers
+        // resolves to the same (alphabetically-first) provider every run.
         let mut records: Vec<ModelRecord> = by_alias.into_values().collect();
-        for provider in self.model_index.providers() {
+        let mut providers: Vec<&str> = self.model_index.providers().collect();
+        providers.sort_unstable();
+        for provider in providers {
             for (model_id, metadata) in self.model_index.provider_models(provider) {
-                if covered.contains(&(provider.to_string(), model_id.to_string())) {
+                if !taken_ids.insert(model_id.to_string()) {
+                    // An alias or an earlier-sorted provider already owns this id.
                     continue;
                 }
                 records.push(ModelRecord {
@@ -442,15 +448,27 @@ mod tests {
         );
         let resolver = resolver_with(cfg, "copilot", &["claude-opus-4.7"]);
         let catalog = resolver.list_catalog();
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].id, "claude-opus-4-7");
-        assert_eq!(catalog[0].frontends, vec![FrontendKind::AnthropicMessages]);
-        assert_eq!(catalog[0].upstream_provider, "copilot");
+        // The alias record is present and fully populated. (The bare upstream
+        // model `claude-opus-4.7` is also listed now — see the assertion
+        // below — but this test pins the alias record's fields.)
+        let alias = catalog
+            .iter()
+            .find(|r| r.id == "claude-opus-4-7")
+            .expect("alias record present");
+        assert_eq!(alias.frontends, vec![FrontendKind::AnthropicMessages]);
+        assert_eq!(alias.upstream_provider, "copilot");
         // Fuzzy resolution converts the configured upstream model to its
         // canonical discovered form (here, the same string after lowercase
         // round-trip).
-        assert_eq!(catalog[0].upstream_model, "claude-opus-4.7");
-        assert_eq!(catalog[0].upstreams_chain.len(), 1);
+        assert_eq!(alias.upstream_model, "claude-opus-4.7");
+        assert_eq!(alias.upstreams_chain.len(), 1);
+        // The bare upstream model has a distinct id, so it is its own entry.
+        assert!(
+            catalog
+                .iter()
+                .any(|r| r.id == "claude-opus-4.7" && r.frontends.is_empty()),
+            "bare upstream model listed alongside its alias"
+        );
     }
 
     #[test]
@@ -657,18 +675,18 @@ mod tests {
         }
     }
 
-    /// A `(provider, model)` already covered by a configured alias's chain
-    /// must NOT also appear as a separate upstream-only record. The aliased
-    /// record (with its richer id / frontends) wins; dedup is keyed on
-    /// `(provider, upstream_model)`, not on the alias id.
+    /// An upstream model that an alias points at is STILL listed as its own
+    /// bare record — the alias id and the raw upstream model id are distinct
+    /// catalog entries. Dedup is keyed only on the entry `id`, so a `g5` alias
+    /// targeting `copilot:gpt-5.5` and the bare `gpt-5.5` upstream model both
+    /// appear.
     #[test]
-    fn list_catalog_dedups_alias_covered_upstream_model() {
+    fn list_catalog_lists_alias_and_its_upstream_model_separately() {
         let cfg = cfg_with_route("openai_chat", "g5", "copilot", "gpt-5.5");
         let resolver = resolver_with(cfg, "copilot", &["gpt-5.5", "gpt-4o"]);
         let catalog = resolver.list_catalog();
-        // g5 (alias for copilot:gpt-5.5) + gpt-4o (upstream-only). NOT a
-        // duplicate id=gpt-5.5 upstream-only record.
-        assert_eq!(catalog.len(), 2);
+        // g5 (alias) + gpt-5.5 (bare upstream, still listed) + gpt-4o (bare).
+        assert_eq!(catalog.len(), 3);
 
         let g5 = catalog
             .iter()
@@ -677,24 +695,56 @@ mod tests {
         assert_eq!(g5.upstream_model, "gpt-5.5");
         assert!(!g5.frontends.is_empty());
 
-        // No upstream-only record for the already-covered (copilot, gpt-5.5).
-        assert!(
-            catalog
-                .iter()
-                .all(|r| !(r.id == "gpt-5.5" && r.frontends.is_empty())),
-            "covered upstream model must not duplicate as upstream-only"
-        );
-        // gpt-4o is the only upstream-only record.
+        // The aliased upstream model still appears as a bare record.
+        let bare = catalog
+            .iter()
+            .find(|r| r.id == "gpt-5.5")
+            .expect("bare upstream gpt-5.5 present even though g5 targets it");
+        assert!(bare.frontends.is_empty());
+        assert_eq!(bare.upstream_provider, "copilot");
+
+        // Both upstream models surface as bare records.
         let upstream_only: Vec<_> = catalog.iter().filter(|r| r.frontends.is_empty()).collect();
-        assert_eq!(upstream_only.len(), 1);
-        assert_eq!(upstream_only[0].id, "gpt-4o");
+        assert_eq!(upstream_only.len(), 2);
     }
 
-    /// Dedup considers the FULL fallback chain, not just the head: a
-    /// multi-upstream route covers `(provider, model)` for every element, so
-    /// none of them resurface as upstream-only records.
+    /// Multiple aliases pointing at the SAME upstream model are each kept as
+    /// their own catalog entry (distinct ids), and the bare upstream model is
+    /// listed too. None of them collapse.
     #[test]
-    fn list_catalog_dedups_against_full_chain_not_just_head() {
+    fn list_catalog_keeps_multiple_aliases_for_same_upstream_model() {
+        let mut cfg = cfg_with_route("openai_chat", "fast", "copilot", "gpt-5.5");
+        cfg.routes.push(RouteEntry::singular(
+            "anthropic_messages",
+            "smart",
+            "copilot",
+            "gpt-5.5",
+        ));
+        let resolver = resolver_with(cfg, "copilot", &["gpt-5.5"]);
+        let catalog = resolver.list_catalog();
+        // fast + smart (both → copilot:gpt-5.5) + bare gpt-5.5 = 3 distinct ids.
+        assert_eq!(catalog.len(), 3);
+        for id in ["fast", "smart", "gpt-5.5"] {
+            assert!(
+                catalog.iter().any(|r| r.id == id),
+                "expected catalog entry id={id}"
+            );
+        }
+        // The two aliases both resolve to the same upstream model.
+        for id in ["fast", "smart"] {
+            let r = catalog.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.upstream_model, "gpt-5.5");
+            assert!(!r.frontends.is_empty());
+        }
+    }
+
+    /// id-only dedup with a model shared across providers: when both `openai`
+    /// and `copilot` publish `gpt-5.5` and an alias `m` targets the chain
+    /// [openai:gpt-5.5, copilot:gpt-5.5], the bare upstream model surfaces
+    /// exactly once (ids must be unique) attributed to the alphabetically-first
+    /// provider, alongside the alias.
+    #[test]
+    fn list_catalog_shared_upstream_id_lists_once_with_first_provider() {
         use std::collections::{BTreeSet, HashMap};
 
         use agent_shim_config::UpstreamRef;
@@ -748,11 +798,21 @@ mod tests {
         let resolver = ModelResolver::new(router, index);
 
         let catalog = resolver.list_catalog();
-        // Only the single alias `m`; both (openai, gpt-5.5) and
-        // (copilot, gpt-5.5) are chain-covered, so no upstream-only records.
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].id, "m");
-        assert!(catalog.iter().all(|r| !r.frontends.is_empty()));
+        // Alias `m` + a single bare gpt-5.5. The id gpt-5.5 is shared by both
+        // providers, but dedup is id-only, so it appears once — attributed to
+        // the alphabetically-first provider (copilot < openai).
+        assert_eq!(catalog.len(), 2);
+        let m = catalog
+            .iter()
+            .find(|r| r.id == "m")
+            .expect("alias m present");
+        assert!(!m.frontends.is_empty());
+        let bare = catalog
+            .iter()
+            .find(|r| r.id == "gpt-5.5")
+            .expect("bare gpt-5.5 present");
+        assert!(bare.frontends.is_empty());
+        assert_eq!(bare.upstream_provider, "copilot");
     }
 
     /// Upstream-only records carry the upstream-reported metadata so clients
